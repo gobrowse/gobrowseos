@@ -1,0 +1,11 @@
+/.env
+/target
+/dist
+/.sqlx
+/.idea
+/.vscode
+/.playwright-mcp
+*.swp
+*.log
+coverage/
+backups/
