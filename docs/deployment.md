@@ -18,7 +18,7 @@ The published port binds to loopback by default. Open `http://localhost:8080` an
 5. Run `gobrowse doctor` and `gobrowse security audit` before accepting traffic.
 6. Use rootless Docker or Podman for the optional sandbox deployment. Never mount a runtime socket into the app.
 
-The example Compose file caps the app and PostgreSQL at 384 MB each so a quiet core installation can run on a 1 GB host with swap. Production sizing depends on connection count, Library indexes, concurrent agents, and embedding workloads; monitor memory and raise limits deliberately rather than removing them.
+The example Compose file caps the app and PostgreSQL at 384 MB each and uses fractional CPU limits so a quiet core installation can run on a single-core, 1 GB host with swap. Production sizing depends on connection count, Library indexes, concurrent agents, and embedding workloads; monitor resources and raise limits deliberately rather than removing them.
 
 ## Update
 
