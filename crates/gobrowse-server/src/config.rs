@@ -13,9 +13,39 @@ pub struct Settings {
     #[serde(default)]
     pub auth: AuthSettings,
     #[serde(default)]
+    pub vault: VaultSettings,
+    #[serde(default)]
     pub features: FeatureSettings,
     #[serde(default)]
     pub observability: ObservabilitySettings,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct VaultSettings {
+    pub master_key_file: Option<PathBuf>,
+    pub master_key_base64: Option<SecretString>,
+    #[serde(default = "default_key_version")]
+    pub key_version: i32,
+    pub previous_master_key_file: Option<PathBuf>,
+    pub previous_master_key_base64: Option<SecretString>,
+    pub previous_key_version: Option<i32>,
+}
+
+impl Default for VaultSettings {
+    fn default() -> Self {
+        Self {
+            master_key_file: None,
+            master_key_base64: None,
+            key_version: default_key_version(),
+            previous_master_key_file: None,
+            previous_master_key_base64: None,
+            previous_key_version: None,
+        }
+    }
+}
+
+const fn default_key_version() -> i32 {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +140,8 @@ pub enum SettingsError {
     InsecureCookieConfiguration,
     #[error("session and Argon2 settings must be positive")]
     InvalidSecuritySetting,
+    #[error("configure at most one vault master-key source and use a positive key version")]
+    InvalidVaultSetting,
 }
 
 impl Settings {
@@ -148,10 +180,37 @@ impl Settings {
         {
             return Err(SettingsError::InvalidSecuritySetting);
         }
+        let current_sources = usize::from(self.vault.master_key_file.is_some())
+            + usize::from(self.vault.master_key_base64.is_some());
+        let previous_sources = usize::from(self.vault.previous_master_key_file.is_some())
+            + usize::from(self.vault.previous_master_key_base64.is_some());
+        if self.vault.key_version <= 0
+            || current_sources > 1
+            || previous_sources > 1
+            || (previous_sources == 1) != self.vault.previous_key_version.is_some()
+            || (previous_sources == 1 && current_sources != 1)
+            || self.vault.previous_key_version == Some(self.vault.key_version)
+            || self
+                .vault
+                .previous_key_version
+                .is_some_and(|version| version <= 0)
+        {
+            return Err(SettingsError::InvalidVaultSetting);
+        }
         Ok(())
     }
 
     pub fn shutdown_timeout() -> Duration {
         Duration::from_secs(20)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vault_defaults_to_first_key_version() {
+        assert_eq!(VaultSettings::default().key_version, 1);
     }
 }

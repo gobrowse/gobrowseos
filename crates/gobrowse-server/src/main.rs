@@ -2,8 +2,9 @@ use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use gobrowse_server::{AppState, config::Settings, db, doctor, router};
+use gobrowse_server::{AppState, config::Settings, db, doctor, embedding, router};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -103,6 +104,16 @@ async fn run() -> anyhow::Result<()> {
             println!("bind={}", settings.http.bind);
             println!("public_origin={}", settings.http.public_origin);
             println!("secure_cookies={}", settings.http.secure_cookies);
+            println!(
+                "vault={}",
+                if settings.vault.master_key_file.is_some()
+                    || settings.vault.master_key_base64.is_some()
+                {
+                    "configured"
+                } else {
+                    "unconfigured"
+                }
+            );
             println!("sandbox={}", settings.features.sandbox);
             Ok(())
         }
@@ -122,10 +133,27 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         .await
         .context("bind HTTP listener")?;
     info!(%bind, "Gobrowse OS listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
+    let cancellation = CancellationToken::new();
+    let worker = tokio::spawn(embedding::run_worker(
+        state.clone(),
+        cancellation.child_token(),
+    ));
+    let shutdown = cancellation.clone();
+    let result = axum::serve(listener, router(state))
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown.cancel();
+        })
         .await
-        .context("serve HTTP")
+        .context("serve HTTP");
+    cancellation.cancel();
+    if tokio::time::timeout(Settings::shutdown_timeout(), worker)
+        .await
+        .is_err()
+    {
+        error!("embedding worker did not stop before the shutdown deadline");
+    }
+    result
 }
 
 async fn shutdown_signal() {
@@ -177,6 +205,18 @@ fn security_checks(settings: &Settings) -> Vec<doctor::Check> {
                 doctor::Status::Fail
             },
             detail: "production origins require HTTPS and Secure cookies".into(),
+            latency_ms: None,
+        },
+        doctor::Check {
+            name: "Credential vault",
+            status: if settings.vault.master_key_file.is_some()
+                || settings.vault.master_key_base64.is_some()
+            {
+                doctor::Status::Pass
+            } else {
+                doctor::Status::Warn
+            },
+            detail: "provider credentials require an external 256-bit master key".into(),
             latency_ms: None,
         },
         doctor::Check {

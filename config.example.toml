@@ -17,6 +17,17 @@ argon2_iterations = 2
 argon2_parallelism = 1
 max_parallel_hashes = 4
 
+[vault]
+# Configure exactly one source before storing provider credentials. The value is
+# standard-base64-encoded 32 random bytes. A root-readable file is preferred.
+# master_key_file = "/run/secrets/gobrowse_vault_key"
+# master_key_base64 = "development-only-example"
+key_version = 1
+# During rotation, configure the immediately previous key until all rows are
+# rewrapped, then remove it.
+# previous_master_key_file = "/run/secrets/gobrowse_vault_key_previous"
+# previous_key_version = 1
+
 [features]
 sandbox = false
 browser = false

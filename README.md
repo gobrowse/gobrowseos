@@ -6,7 +6,7 @@ Gobrowse OS is a Rust-first agent harness for long-running work. The Library sto
 
 ## Status
 
-Gobrowse OS is under active clean-sheet development. The current release establishes the secure modular-monolith foundation, Library domain, provider-neutral agent contracts, policy engine, database schema, API, CLI, Compose deployment, and Rust/WASM operator shell. See [`docs/roadmap.md`](docs/roadmap.md) for the release gate of each subsystem.
+Gobrowse OS is under active clean-sheet development. Milestone 2 provides the secure modular-monolith foundation plus scoped hybrid Library retrieval, durable conversation projections, governed Autobiography revisions, leased embedding workers, OpenAI-compatible/Ollama embedding adapters, and an envelope-encrypted credential vault. See [`docs/roadmap.md`](docs/roadmap.md) for the release gate of each subsystem.
 
 ## Run
 

@@ -108,6 +108,8 @@ pub enum BookValidationError {
     AutobiographyTooLong,
     #[error("workspace scope requires a workspace id")]
     MissingWorkspace,
+    #[error("project scope requires a workspace id")]
+    MissingProjectWorkspace,
     #[error("conversation scope requires a conversation id")]
     MissingConversation,
 }
@@ -128,6 +130,9 @@ impl Book {
         }
         if self.scope == BookScope::Workspace && self.workspace_id.is_none() {
             return Err(BookValidationError::MissingWorkspace);
+        }
+        if self.scope == BookScope::Project && self.workspace_id.is_none() {
+            return Err(BookValidationError::MissingProjectWorkspace);
         }
         if self.scope == BookScope::Conversation && self.conversation_id.is_none() {
             return Err(BookValidationError::MissingConversation);
@@ -197,9 +202,9 @@ impl Default for RankingWeights {
         Self {
             lexical: 1.0,
             semantic: 1.0,
-            recency: 0.12,
-            source: 0.08,
-            workspace: 0.15,
+            recency: 0.004,
+            source: 0.003,
+            workspace: 0.005,
             rrf_k: 60.0,
         }
     }

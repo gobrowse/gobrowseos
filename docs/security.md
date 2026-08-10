@@ -7,3 +7,7 @@ See [`threat-model.md`](threat-model.md). Production requires TLS, an externally
 `deny.toml` narrowly ignores `RUSTSEC-2024-0436` (`paste`) and `RUSTSEC-2026-0173` (`proc-macro-error2`). They are maintenance-status advisories in Leptos 0.8 transitive dependencies, not known exploit advisories, and currently have no compatible safe upgrade. CI still runs both cargo-deny and cargo-audit; remove the exceptions as soon as Leptos removes those dependencies.
 
 `cargo-audit` additionally ignores `RUSTSEC-2023-0071` for `rsa`. SQLx lists its optional MySQL implementation in lockfile metadata, but Gobrowse builds SQLx with default features disabled and PostgreSQL only; `cargo tree --target all -i rsa` confirms that RSA is absent from every selected target graph. Cargo-deny performs graph-aware advisory checks. This exception must be removed if any MySQL feature is introduced.
+
+## Credential Vault
+
+Configure `vault.master_key_file` with a mode-`0600` file containing standard-base64-encoded 32 random bytes. Secrets are envelope-encrypted and API responses contain metadata only. During rotation, set a new `key_version` and key file plus `previous_key_version` and `previous_master_key_file`, call `POST /api/v1/vault/rotate`, verify all rows use the new version, then remove the previous key configuration.

@@ -66,6 +66,34 @@ pub async fn run(settings: &Settings, pool: Option<&PgPool>) -> Vec<Check> {
             ),
             latency_ms: None,
         });
+        let queue = sqlx::query(
+            "SELECT count(*) FILTER (WHERE status IN ('queued','retry','running')) AS active, \
+             count(*) FILTER (WHERE status='failed') AS failed, \
+             count(*) FILTER (WHERE status='running' AND lease_expires_at<now()) AS expired \
+             FROM embedding_jobs",
+        )
+        .fetch_one(pool)
+        .await;
+        checks.push(Check {
+            name: "Embedding queue",
+            status: match &queue {
+                Ok(row) if sqlx::Row::get::<i64, _>(row, "expired") == 0 => Status::Pass,
+                Ok(_) => Status::Warn,
+                Err(_) => Status::Fail,
+            },
+            detail: queue.map_or_else(
+                |error| format!("check failed: {error}"),
+                |row| {
+                    format!(
+                        "active={}, failed={}, expired_leases={}",
+                        sqlx::Row::get::<i64, _>(&row, "active"),
+                        sqlx::Row::get::<i64, _>(&row, "failed"),
+                        sqlx::Row::get::<i64, _>(&row, "expired")
+                    )
+                },
+            ),
+            latency_ms: None,
+        });
     } else {
         checks.push(Check {
             name: "PostgreSQL",
@@ -83,6 +111,30 @@ pub async fn run(settings: &Settings, pool: Option<&PgPool>) -> Vec<Check> {
             Status::Warn
         },
         detail: settings.http.static_dir.display().to_string(),
+        latency_ms: None,
+    });
+    checks.push(Check {
+        name: "Credential vault",
+        status: if settings.vault.master_key_file.is_some()
+            || settings.vault.master_key_base64.is_some()
+        {
+            Status::Pass
+        } else {
+            Status::Warn
+        },
+        detail: if settings.vault.master_key_file.is_some() {
+            format!(
+                "external key file configured; version={}",
+                settings.vault.key_version
+            )
+        } else if settings.vault.master_key_base64.is_some() {
+            format!(
+                "environment key configured; version={}",
+                settings.vault.key_version
+            )
+        } else {
+            "not configured; authenticated providers remain unavailable".into()
+        },
         latency_ms: None,
     });
     checks.push(Check {

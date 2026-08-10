@@ -1,11 +1,17 @@
 pub mod api;
 pub mod auth;
+pub mod autobiography_api;
 pub mod config;
+pub mod conversation_api;
 pub mod db;
 pub mod doctor;
+pub mod embedding;
+pub mod embedding_api;
 pub mod error;
 pub mod library_api;
 pub mod realtime;
+pub mod vault;
+pub mod vault_api;
 
 use std::{sync::Arc, time::Duration};
 
@@ -29,22 +35,25 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{auth::PasswordRuntime, config::Settings, error::AppError};
+use crate::{auth::PasswordRuntime, config::Settings, error::AppError, vault::Vault};
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub settings: Arc<Settings>,
     pub passwords: PasswordRuntime,
+    pub vault: Vault,
 }
 
 impl AppState {
     pub async fn new(pool: PgPool, settings: Settings) -> Result<Self, AppError> {
         let passwords = PasswordRuntime::new(settings.auth.clone()).await?;
+        let vault = Vault::from_settings(&settings.vault).await?;
         Ok(Self {
             pool,
             settings: Arc::new(settings),
             passwords,
+            vault,
         })
     }
 }
@@ -64,10 +73,52 @@ pub fn router(state: AppState) -> Router {
             get(api::list_workspaces).post(api::create_workspace),
         )
         .route(
+            "/conversations",
+            get(conversation_api::list_conversations).post(conversation_api::create_conversation),
+        )
+        .route(
+            "/conversations/search",
+            get(conversation_api::search_conversations),
+        )
+        .route(
+            "/conversations/{id}",
+            get(conversation_api::get_conversation).delete(conversation_api::delete_conversation),
+        )
+        .route(
+            "/conversations/{id}/messages",
+            get(conversation_api::list_messages).post(conversation_api::append_message),
+        )
+        .route(
+            "/conversations/{id}/fork",
+            post(conversation_api::fork_conversation),
+        )
+        .route(
             "/library/books",
             get(library_api::list_books).post(library_api::create_book),
         )
         .route("/library/search", get(library_api::search_books))
+        .route(
+            "/embeddings/configurations",
+            get(embedding_api::list_configurations).post(embedding_api::create_configuration),
+        )
+        .route(
+            "/embeddings/configurations/{id}/activate",
+            post(embedding_api::activate_configuration),
+        )
+        .route("/embeddings/jobs", get(embedding_api::list_jobs))
+        .route(
+            "/embeddings/jobs/{id}/retry",
+            post(embedding_api::retry_job),
+        )
+        .route(
+            "/vault/secrets",
+            get(vault_api::list_secrets).post(vault_api::create_secret),
+        )
+        .route(
+            "/vault/secrets/{id}",
+            axum::routing::put(vault_api::replace_secret).delete(vault_api::delete_secret),
+        )
+        .route("/vault/rotate", post(vault_api::rotate_secrets))
         .route(
             "/library/books/{id}",
             get(library_api::get_book).put(library_api::update_book),
@@ -76,6 +127,24 @@ pub fn router(state: AppState) -> Router {
             "/library/books/{id}/history",
             get(library_api::book_history),
         )
+        .route("/autobiography", get(autobiography_api::get_autobiography))
+        .route(
+            "/autobiography/policy",
+            axum::routing::put(autobiography_api::update_policy),
+        )
+        .route(
+            "/autobiography/manual",
+            axum::routing::put(autobiography_api::manual_update),
+        )
+        .route(
+            "/autobiography/proposals",
+            get(autobiography_api::list_proposals).post(autobiography_api::create_proposal),
+        )
+        .route(
+            "/autobiography/proposals/{id}/review",
+            post(autobiography_api::review_proposal),
+        )
+        .route("/autobiography/rollback", post(autobiography_api::rollback))
         .route("/realtime", get(realtime::upgrade));
 
     Router::new()

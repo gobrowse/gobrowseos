@@ -6,7 +6,7 @@ Each subsystem is marked `foundation`, `usable`, or `release-gated`. A foundatio
 |---|---|---|
 | Config, health, migrations | usable | Compose cold-start and upgrade tests |
 | Owner/password auth | foundation | rate-limit, CSRF, rotation, WebAuthn/OIDC tests |
-| Library | foundation | PostgreSQL hybrid retrieval/access/concurrency suite |
+| Library | usable | PostgreSQL hybrid retrieval/access/concurrency suite passed in Milestone 2 |
 | Agent runtime | foundation | deterministic fake-provider E2E and cancellation suite |
 | Sandbox | release-gated/off | rootless runtime, PTY, egress and boundary tests |
 | MCP | foundation | conformance, OAuth matrix and doctor matrix |

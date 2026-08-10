@@ -15,10 +15,25 @@ pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
     let directory = std::env::var_os("GOBROWSE_MIGRATIONS_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"));
-    sqlx::migrate::Migrator::new(directory)
-        .await?
-        .run(pool)
+    let migrator = sqlx::migrate::Migrator::new(directory).await?;
+    let mut connection = pool
+        .acquire()
         .await
+        .map_err(sqlx::migrate::MigrateError::Execute)?;
+    sqlx::query("SELECT pg_advisory_lock(607629720)")
+        .execute(&mut *connection)
+        .await
+        .map_err(sqlx::migrate::MigrateError::Execute)?;
+    let result = migrator.run(&mut *connection).await;
+    let unlock = sqlx::query("SELECT pg_advisory_unlock(607629720)")
+        .execute(&mut *connection)
+        .await;
+    match result {
+        Err(error) => Err(error),
+        Ok(()) => unlock
+            .map(|_| ())
+            .map_err(sqlx::migrate::MigrateError::Execute),
+    }
 }
 
 pub async fn ready(pool: &PgPool) -> Result<(), AppError> {

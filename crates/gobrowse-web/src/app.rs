@@ -55,6 +55,57 @@ struct ApiError {
     correlation_id: String,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct BookSummary {
+    id: String,
+    title: String,
+    book_type: String,
+    provenance: String,
+    trust: String,
+    retrieval_mode: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConversationSummary {
+    id: String,
+    title: String,
+    status: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateConversationRequest<'a> {
+    title: &'a str,
+    workspace_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EmbeddingConfiguration {
+    id: String,
+    display_name: String,
+    provider_type: String,
+    model_reference: String,
+    dimensions: i32,
+    active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EmbeddingJob {
+    id: String,
+    status: String,
+    last_error_code: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateEmbeddingConfiguration<'a> {
+    display_name: &'a str,
+    provider_type: &'a str,
+    base_url: &'a str,
+    secret_reference: Option<&'a str>,
+    model_reference: &'a str,
+    dimensions: i32,
+    activate: bool,
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let auth = RwSignal::new(AuthStage::Checking);
@@ -213,6 +264,9 @@ fn AuthPanel(
 fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> impl IntoView {
     let page = RwSignal::new(Page::Chat);
     let search_open = RwSignal::new(false);
+    let is_admin = user
+        .get_untracked()
+        .is_some_and(|current| matches!(current.role.as_str(), "OWNER" | "ADMIN"));
     let logout = move |_| {
         spawn_local(async move {
             let _ = Request::post("/api/v1/auth/logout").send().await;
@@ -237,13 +291,15 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
             <nav class="side-nav" aria-label="Primary">
                 <NavGroup title="OPERATE" items=vec![("Chat", Page::Chat), ("Tasks", Page::Tasks), ("Agents", Page::Agents), ("Terminals", Page::Terminals)] page />
                 <NavGroup title="ORGANIZE" items=vec![("Library", Page::Library), ("Workspaces", Page::Workspaces), ("Skills", Page::Skills)] page />
-                <NavGroup title="CONNECT" items=vec![("MCP", Page::Mcp), ("Models", Page::Models)] page />
-                <NavGroup title="INSPECT" items=vec![("Diagnostics", Page::Diagnostics)] page />
+                <NavGroup title="CONNECT" items=if is_admin { vec![("MCP", Page::Mcp), ("Models", Page::Models)] } else { vec![("MCP", Page::Mcp)] } page />
+                {is_admin.then(|| view! { <NavGroup title="INSPECT" items=vec![("Diagnostics", Page::Diagnostics)] page /> })}
             </nav>
             <section id="workspace" class="workspace" tabindex="-1">
                 {move || match page.get() {
                     Page::Chat => view! { <ChatPage /> }.into_any(),
                     Page::Library => view! { <LibraryPage /> }.into_any(),
+                    Page::Models => view! { <ModelsPage /> }.into_any(),
+                    Page::Diagnostics => view! { <DiagnosticsPage /> }.into_any(),
                     current => view! { <EmptyOperationalPage page=current /> }.into_any(),
                 }}
             </section>
@@ -260,7 +316,7 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                 <button on:click=move |_| page.set(Page::Chat)>"Chat"</button>
                 <button on:click=move |_| page.set(Page::Library)>"Library"</button>
                 <button on:click=move |_| page.set(Page::Tasks)>"Tasks"</button>
-                <button on:click=move |_| page.set(Page::Diagnostics)>"More"</button>
+                <button on:click=move |_| page.set(if is_admin { Page::Diagnostics } else { Page::Workspaces })>"More"</button>
             </nav>
         </div>
         {move || search_open.get().then(|| view! {
@@ -293,36 +349,186 @@ fn NavGroup(
 
 #[component]
 fn ChatPage() -> impl IntoView {
+    let conversations = RwSignal::new(Vec::<ConversationSummary>::new());
+    let title = RwSignal::new(String::new());
+    let status = RwSignal::new(String::new());
+    load_conversations(conversations, status);
+    let create = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let value = title.get_untracked();
+        if value.trim().is_empty() {
+            return;
+        }
+        status.set("Creating conversation...".into());
+        spawn_local(async move {
+            let request = Request::post("/api/v1/conversations").json(&CreateConversationRequest {
+                title: value.trim(),
+                workspace_id: None,
+            });
+            match request {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => {
+                        title.set(String::new());
+                        load_conversations(conversations, status);
+                    }
+                    Ok(response) => {
+                        status.set(format!("Create failed: HTTP {}", response.status()))
+                    }
+                    Err(_) => status.set("Conversation service did not answer.".into()),
+                },
+                Err(_) => status.set("Conversation request could not be encoded.".into()),
+            }
+        });
+    };
     view! {
         <div class="page-heading">
-            <div><p class="utility">"CONVERSATION / NEW"</p><h1>"What are we working on?"</h1></div>
+            <div><p class="utility">"CONVERSATIONS / DURABLE"</p><h1>"What are we working on?"</h1></div>
             <button class="secondary">"Model: not configured"</button>
         </div>
-        <div class="conversation-empty">
-            <div class="index-spine">"C-NEW"</div>
-            <div>
-                <h2>"Start with a goal, not a prompt."</h2>
-                <p>"Gobrowse OS will assemble bounded context from this conversation, selected Books, workspace state, and relevant Skills. Sensitive tools still require policy approval."</p>
-            </div>
-        </div>
-        <form class="composer">
-            <textarea rows="4" placeholder="Describe the outcome, constraints, and what the agent may change."></textarea>
-            <div><span>"No workspace · No model · 0 pinned Books"</span><button class="primary" disabled>"Run agent"</button></div>
+        <form class="filter-row" on:submit=create>
+            <input required maxlength="500" placeholder="Name a durable conversation"
+                prop:value=move || title.get()
+                on:input=move |event| title.set(event_target_value(&event)) />
+            <button class="primary" type="submit">"Create"</button>
         </form>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="index-table" role="table">
+            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"STATE"</span><span>"INDEX"</span></div>
+            {move || conversations.get().into_iter().map(|conversation| {
+                let short_id = conversation.id.chars().take(8).collect::<String>();
+                view! { <div class="index-row" role="row">
+                    <span class="spine-cell">{short_id}</span><strong>{conversation.title}</strong>
+                    <span>{conversation.status}</span><span>"MESSAGE + BOOK"</span>
+                </div> }
+            }).collect_view()}
+        </div>
     }
 }
 
 #[component]
 fn LibraryPage() -> impl IntoView {
+    let books = RwSignal::new(Vec::<BookSummary>::new());
+    let query = RwSignal::new(String::new());
+    let status = RwSignal::new(String::new());
+    load_books(books, status, None);
+    let search = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let value = query.get_untracked();
+        let query_value = (!value.trim().is_empty()).then(|| value.trim().to_owned());
+        load_books(books, status, query_value);
+    };
     view! {
         <div class="page-heading">
             <div><p class="utility">"GLOBAL CONTEXT / LIBRARY"</p><h1>"Books"</h1></div>
-            <button class="primary">"Create Book"</button>
+            <span class="utility">{move || format!("{} RESULTS", books.get().len())}</span>
         </div>
-        <div class="filter-row"><input placeholder="Filter this index" /><button>"Scope: all"</button><button>"Trust: all"</button></div>
+        <form class="filter-row" on:submit=search>
+            <input placeholder="Lexical + semantic search" prop:value=move || query.get()
+                on:input=move |event| query.set(event_target_value(&event)) />
+            <button type="submit">"Search"</button>
+            <button type="button" on:click=move |_| { query.set(String::new()); load_books(books, status, None); }>"Reset"</button>
+        </form>
+        <p class="form-note">{move || status.get()}</p>
         <div class="index-table" role="table">
-            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"PROVENANCE"</span><span>"UPDATED"</span></div>
-            <div class="index-row" role="row"><span class="spine-cell">"L-0001"</span><strong>"Autobiography"</strong><span>"USER · VERIFIED"</span><span>"just now"</span></div>
+            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"PROVENANCE"</span><span>"RETRIEVAL"</span></div>
+            {move || books.get().into_iter().map(|book| {
+                let short_id = book.id.chars().take(8).collect::<String>();
+                view! { <div class="index-row" role="row">
+                    <span class="spine-cell">{short_id}</span>
+                    <strong>{format!("{} / {}", book.title, book.book_type)}</strong>
+                    <span>{format!("{} · {}", book.provenance, book.trust)}</span>
+                    <span>{book.retrieval_mode.to_uppercase()}</span>
+                </div> }
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[component]
+fn ModelsPage() -> impl IntoView {
+    let configurations = RwSignal::new(Vec::<EmbeddingConfiguration>::new());
+    let status = RwSignal::new(String::new());
+    let base_url = RwSignal::new("http://127.0.0.1:11434".to_owned());
+    let model = RwSignal::new("nomic-embed-text".to_owned());
+    let dimensions = RwSignal::new("768".to_owned());
+    load_configurations(configurations, status);
+    let create = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let endpoint = base_url.get_untracked();
+        let model_reference = model.get_untracked();
+        let Ok(vector_dimensions) = dimensions.get_untracked().parse::<i32>() else {
+            status.set("Dimensions must be a number.".into());
+            return;
+        };
+        status.set("Validating and activating provider...".into());
+        spawn_local(async move {
+            let request = Request::post("/api/v1/embeddings/configurations").json(
+                &CreateEmbeddingConfiguration {
+                    display_name: "Local Ollama embeddings",
+                    provider_type: "ollama",
+                    base_url: endpoint.trim(),
+                    secret_reference: None,
+                    model_reference: model_reference.trim(),
+                    dimensions: vector_dimensions,
+                    activate: true,
+                },
+            );
+            match request {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => load_configurations(configurations, status),
+                    Ok(response) => {
+                        status.set(format!("Provider rejected: HTTP {}", response.status()))
+                    }
+                    Err(_) => status.set("Provider service did not answer.".into()),
+                },
+                Err(_) => status.set("Provider request could not be encoded.".into()),
+            }
+        });
+    };
+    view! {
+        <div class="page-heading"><div><p class="utility">"MODELS / EMBEDDINGS"</p><h1>"Embedding registry"</h1></div></div>
+        <form class="provider-form" on:submit=create>
+            <label>"Ollama base URL"<input required prop:value=move || base_url.get() on:input=move |event| base_url.set(event_target_value(&event)) /></label>
+            <label>"Model reference"<input required prop:value=move || model.get() on:input=move |event| model.set(event_target_value(&event)) /></label>
+            <label>"Dimensions"<input required inputmode="numeric" prop:value=move || dimensions.get() on:input=move |event| dimensions.set(event_target_value(&event)) /></label>
+            <button class="primary" type="submit">"Add + activate"</button>
+        </form>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="index-table">
+            <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"PROVIDER"</span><span>"VECTOR"</span></div>
+            {move || configurations.get().into_iter().map(|configuration| view! {
+                <div class="index-row"><span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
+                <strong>{format!("{} / {}", configuration.display_name, configuration.model_reference)}</strong>
+                <span>{format!("{} · {}", configuration.provider_type, &configuration.id[..8.min(configuration.id.len())])}</span>
+                <span>{format!("{}D", configuration.dimensions)}</span></div>
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[component]
+fn DiagnosticsPage() -> impl IntoView {
+    let jobs = RwSignal::new(Vec::<EmbeddingJob>::new());
+    let status = RwSignal::new(String::new());
+    load_jobs(jobs, status);
+    view! {
+        <div class="page-heading"><div><p class="utility">"DIAGNOSTICS / INDEXING"</p><h1>"Embedding queue"</h1></div>
+            <button class="secondary" on:click=move |_| load_jobs(jobs, status)>"Refresh"</button></div>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="diagnostic-grid">
+            {move || {
+                let current = jobs.get();
+                let active = current.iter().filter(|job| matches!(job.status.as_str(), "queued" | "retry" | "running")).count();
+                let failed = current.iter().filter(|job| job.status == "failed").count();
+                view! { <><div><span>"ACTIVE"</span><strong>{active}</strong></div><div><span>"FAILED"</span><strong>{failed}</strong></div><div><span>"VISIBLE JOBS"</span><strong>{current.len()}</strong></div></> }
+            }}
+        </div>
+        <div class="index-table">
+            <div class="index-row header"><span>"ID"</span><span>"STATE"</span><span>"ERROR"</span><span>"LEASED"</span></div>
+            {move || jobs.get().into_iter().map(|job| view! { <div class="index-row">
+                <span class="spine-cell">{job.id.chars().take(8).collect::<String>()}</span><strong>{job.status}</strong>
+                <span>{job.last_error_code.unwrap_or_else(|| "NONE".into())}</span><span>"DURABLE"</span>
+            </div> }).collect_view()}
         </div>
     }
 }
@@ -360,20 +566,100 @@ fn EmptyOperationalPage(page: Page) -> impl IntoView {
             "Connect tools, resources, and prompts through versioned transports and credential references.",
             "Add MCP server",
         ),
-        Page::Models => (
-            "Models",
-            "Chat, embedding, reranking, image, and speech providers are configured independently.",
-            "Add provider",
-        ),
-        Page::Diagnostics => (
-            "Diagnostics",
-            "Run focused checks without exposing credentials or raw prompts.",
-            "Run doctor",
-        ),
-        Page::Chat | Page::Library => unreachable!(),
+        Page::Chat | Page::Library | Page::Models | Page::Diagnostics => unreachable!(),
     };
     view! {
         <div class="page-heading"><div><p class="utility">"OPERATOR INDEX"</p><h1>{label}</h1></div></div>
         <div class="operational-empty"><span class="index-spine">"0"</span><h2>"Nothing indexed yet"</h2><p>{description}</p><button class="primary">{action}</button></div>
     }
+}
+
+fn load_books(books: RwSignal<Vec<BookSummary>>, status: RwSignal<String>, query: Option<String>) {
+    status.set("Reading authorized index...".into());
+    spawn_local(async move {
+        let endpoint = query.map_or_else(
+            || "/api/v1/library/books".to_owned(),
+            |query| {
+                let encoded =
+                    url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+                format!("/api/v1/library/search?q={encoded}")
+            },
+        );
+        match Request::get(&endpoint).send().await {
+            Ok(response) if response.ok() => match response.json::<Vec<BookSummary>>().await {
+                Ok(found) => {
+                    let count = found.len();
+                    books.set(found);
+                    status.set(format!("{count} authorized Books loaded."));
+                }
+                Err(_) => status.set("Library response was not valid.".into()),
+            },
+            Ok(response) => status.set(format!(
+                "Library request failed: HTTP {}",
+                response.status()
+            )),
+            Err(_) => status.set("Library service did not answer.".into()),
+        }
+    });
+}
+
+fn load_conversations(conversations: RwSignal<Vec<ConversationSummary>>, status: RwSignal<String>) {
+    spawn_local(async move {
+        match Request::get("/api/v1/conversations").send().await {
+            Ok(response) if response.ok() => match response.json().await {
+                Ok(found) => {
+                    conversations.set(found);
+                    status.set("Durable conversations loaded.".into());
+                }
+                Err(_) => status.set("Conversation response was not valid.".into()),
+            },
+            Ok(response) => status.set(format!(
+                "Conversation request failed: HTTP {}",
+                response.status()
+            )),
+            Err(_) => status.set("Conversation service did not answer.".into()),
+        }
+    });
+}
+
+fn load_configurations(
+    configurations: RwSignal<Vec<EmbeddingConfiguration>>,
+    status: RwSignal<String>,
+) {
+    spawn_local(async move {
+        match Request::get("/api/v1/embeddings/configurations")
+            .send()
+            .await
+        {
+            Ok(response) if response.ok() => match response.json().await {
+                Ok(found) => {
+                    configurations.set(found);
+                    status.set("Embedding registry loaded.".into());
+                }
+                Err(_) => status.set("Embedding registry response was not valid.".into()),
+            },
+            Ok(response) => status.set(format!(
+                "Registry request failed: HTTP {}",
+                response.status()
+            )),
+            Err(_) => status.set("Embedding registry did not answer.".into()),
+        }
+    });
+}
+
+fn load_jobs(jobs: RwSignal<Vec<EmbeddingJob>>, status: RwSignal<String>) {
+    status.set("Reading durable queue...".into());
+    spawn_local(async move {
+        match Request::get("/api/v1/embeddings/jobs").send().await {
+            Ok(response) if response.ok() => match response.json().await {
+                Ok(found) => {
+                    jobs.set(found);
+                    status.set("Queue snapshot loaded.".into());
+                }
+                Err(_) => status.set("Queue response was not valid.".into()),
+            },
+            Ok(response) => status.set(format!("Queue request failed: HTTP {}", response.status())),
+            Err(_) => status.set("Queue service did not answer.".into()),
+        }
+    });
 }

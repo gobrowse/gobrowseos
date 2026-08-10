@@ -1,11 +1,13 @@
+use std::collections::{HashMap, HashSet};
+
 use axum::{
     Json,
     extract::{Path, Query, State},
     http::HeaderMap,
 };
 use gobrowse_core::library::{
-    Book, BookScope, BookType, EmbeddingStatus, Provenance, SecurityClassification, TrustLevel,
-    chunk_text,
+    Book, BookScope, BookType, EmbeddingStatus, Provenance, RankingWeights, SecurityClassification,
+    TrustLevel, chunk_text, rank_fusion,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -14,7 +16,8 @@ use uuid::Uuid;
 
 use crate::{
     AppState,
-    auth::{audit, require_user},
+    auth::{AuthenticatedUser, audit, require_user},
+    embedding,
     error::AppError,
 };
 
@@ -66,7 +69,15 @@ pub struct BookSummary {
     pub trust: String,
     pub revision: i64,
     pub relevance: f32,
+    pub retrieval_mode: String,
+    pub lexical_score: Option<f32>,
+    pub semantic_score: Option<f32>,
     pub updated_at: OffsetDateTime,
+}
+
+struct SearchCandidate {
+    summary: BookSummary,
+    workspace_id: Option<Uuid>,
 }
 
 #[derive(Debug, Serialize)]
@@ -85,6 +96,31 @@ pub async fn create_book(
     Json(input): Json<CreateBookRequest>,
 ) -> Result<Json<Book>, AppError> {
     let user = require_user(&state, &headers).await?;
+    require_book_writer(&user)?;
+    if matches!(
+        input.book_type,
+        BookType::Conversation | BookType::Autobiography
+    ) {
+        return Err(AppError::Validation(
+            "conversation and Autobiography Books use dedicated workflows".into(),
+        ));
+    }
+    if input.scope == BookScope::Agent {
+        return Err(AppError::Validation(
+            "agent-scoped Books require an agent workflow".into(),
+        ));
+    }
+    if input.scope == BookScope::Global && !is_admin(&user) {
+        return Err(AppError::Forbidden);
+    }
+    if input.security_classification == SecurityClassification::Restricted && !is_admin(&user) {
+        return Err(AppError::Forbidden);
+    }
+    if !is_admin(&user)
+        && (input.provenance != Provenance::User || input.trust != TrustLevel::UserProvided)
+    {
+        return Err(AppError::Forbidden);
+    }
     let now = OffsetDateTime::now_utc();
     let book = Book {
         id: Uuid::now_v7(),
@@ -109,12 +145,15 @@ pub async fn create_book(
     book.validate()
         .map_err(|error| AppError::Validation(error.to_string()))?;
     authorize_workspace(&state, user.profile_id, book.workspace_id).await?;
+    authorize_conversation(&state, user.profile_id, book.conversation_id).await?;
+    let owner_user_id =
+        matches!(book.scope, BookScope::User | BookScope::Private).then_some(user.id);
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO books (id, profile_id, title, body, book_type, scope, tags, provenance, trust, author, \
-         workspace_id, conversation_id, security_classification, metadata, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)",
+         workspace_id, conversation_id, security_classification, metadata, owner_user_id, created_by_user_id, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)",
     )
     .bind(book.id)
     .bind(book.profile_id)
@@ -130,10 +169,14 @@ pub async fn create_book(
     .bind(book.conversation_id)
     .bind(enum_db(&book.security_classification))
     .bind(&book.metadata)
+    .bind(owner_user_id)
+    .bind(user.id)
     .bind(now)
     .execute(&mut *tx)
     .await?;
     insert_chunks(&mut tx, book.id, &book.body).await?;
+    insert_revision(&mut tx, &book, Some(user.id), "Initial Book revision").await?;
+    embedding::enqueue_book(&mut tx, book.profile_id, book.id, book.revision).await?;
     audit(
         &mut tx,
         Some(user.id),
@@ -154,12 +197,19 @@ pub async fn get_book(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Book>, AppError> {
     let user = require_user(&state, &headers).await?;
-    let row = sqlx::query("SELECT * FROM books WHERE id = $1 AND profile_id = $2")
-        .bind(id)
-        .bind(user.profile_id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let row = sqlx::query(
+        "SELECT * FROM books WHERE id=$1 AND profile_id=$2 \
+         AND ($3 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
+         AND ($3 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$4)",
+    )
+    .bind(id)
+    .bind(user.profile_id)
+    .bind(&user.role)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
     Ok(Json(row_to_book(&row)?))
 }
 
@@ -177,37 +227,126 @@ pub async fn search_books(
     }
     authorize_workspace(&state, user.profile_id, query.workspace_id).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
-    let rows = sqlx::query(
+    let candidate_limit = (limit * 3).min(300);
+    let lexical_rows = sqlx::query(
         "SELECT id, title, ts_headline('english', body, websearch_to_tsquery('english', $1), \
              'MaxWords=32, MinWords=8, ShortWord=3') AS snippet, book_type, scope, tags, provenance, trust, revision, \
-             ts_rank_cd(search_document, websearch_to_tsquery('english', $1)) AS relevance, updated_at \
-         FROM books WHERE profile_id = $2 AND ($3::uuid IS NULL OR workspace_id = $3) \
+             ts_rank_cd(search_document, websearch_to_tsquery('english', $1)) AS relevance, workspace_id, updated_at \
+         FROM books WHERE profile_id = $2 \
+           AND ($5 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
+           AND ($5 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
+           AND ($5 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$6) \
+           AND ($3::uuid IS NULL OR scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR workspace_id=$3 \
+                OR (scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND c.workspace_id=$3))) \
            AND search_document @@ websearch_to_tsquery('english', $1) \
          ORDER BY relevance DESC, updated_at DESC LIMIT $4",
     )
     .bind(text)
     .bind(user.profile_id)
     .bind(query.workspace_id)
-    .bind(limit)
+    .bind(candidate_limit)
+    .bind(&user.role)
+    .bind(user.id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(
-        rows.into_iter()
-            .map(|row| BookSummary {
-                id: row.get("id"),
-                title: row.get("title"),
-                snippet: row.get("snippet"),
-                book_type: row.get("book_type"),
-                scope: row.get("scope"),
-                tags: row.get("tags"),
-                provenance: row.get("provenance"),
-                trust: row.get("trust"),
-                revision: row.get("revision"),
-                relevance: row.get("relevance"),
-                updated_at: row.get("updated_at"),
+    let mut candidates = HashMap::new();
+    let mut lexical_ids = Vec::with_capacity(lexical_rows.len());
+    for row in lexical_rows {
+        let candidate = search_candidate(&row, "lexical", Some(row.get("relevance")), None);
+        lexical_ids.push(candidate.summary.id);
+        candidates.insert(candidate.summary.id, candidate);
+    }
+
+    let mut semantic_ids = Vec::new();
+    if let Some((model_id, vector)) = embedding::embed_query(&state, user.profile_id, text).await? {
+        let vector = embedding::vector_literal(&vector);
+        let semantic_rows = sqlx::query(
+            "SELECT * FROM (SELECT DISTINCT ON (b.id) b.id,b.title,left(c.text,400) AS snippet,b.book_type,b.scope,b.tags, \
+                 b.provenance,b.trust,b.revision,b.workspace_id,b.updated_at, \
+                 (1-(e.embedding <=> ($1::text)::vector))::real AS relevance, \
+                 e.embedding <=> ($1::text)::vector AS distance \
+             FROM book_chunk_embeddings e JOIN book_chunks c ON c.id=e.chunk_id JOIN books b ON b.id=c.book_id \
+             WHERE e.embedding_model_id=$2 AND e.book_revision=b.revision AND b.profile_id=$3 \
+               AND ($5 IN ('OWNER','ADMIN') OR b.security_classification <> 'RESTRICTED') \
+               AND ($5 IN ('OWNER','ADMIN') OR b.scope <> 'AGENT') \
+               AND ($5 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$6) \
+               AND ($4::uuid IS NULL OR b.scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR b.workspace_id=$4 \
+                    OR (b.scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations conversation \
+                        WHERE conversation.id=b.conversation_id AND conversation.workspace_id=$4))) \
+             ORDER BY b.id, distance) ranked ORDER BY distance,id LIMIT $7",
+        )
+        .bind(vector)
+        .bind(model_id)
+        .bind(user.profile_id)
+        .bind(query.workspace_id)
+        .bind(&user.role)
+        .bind(user.id)
+        .bind(candidate_limit)
+        .fetch_all(&state.pool)
+        .await?;
+        for row in semantic_rows {
+            let id: Uuid = row.get("id");
+            let score = row.get("relevance");
+            semantic_ids.push(id);
+            if let Some(candidate) = candidates.get_mut(&id) {
+                candidate.summary.semantic_score = Some(score);
+                candidate.summary.retrieval_mode = "hybrid".into();
+            } else {
+                candidates.insert(id, search_candidate(&row, "semantic", None, Some(score)));
+            }
+        }
+    }
+    let now = OffsetDateTime::now_utc();
+    let boosts = candidates
+        .iter()
+        .map(|(id, candidate)| {
+            let age_days = (now - candidate.summary.updated_at).whole_days().max(0) as f32;
+            let recency = 1.0 / (1.0 + age_days / 30.0);
+            let source = match candidate.summary.trust.as_str() {
+                "VERIFIED" => 1.0,
+                "USER_PROVIDED" => 0.8,
+                "AGENT_INFERRED" => 0.5,
+                "EXTERNAL" => 0.3,
+                _ => 0.0,
+            };
+            let workspace =
+                if query.workspace_id.is_some() && query.workspace_id == candidate.workspace_id {
+                    1.0
+                } else {
+                    0.0
+                };
+            (*id, (recency, source, workspace))
+        })
+        .collect();
+    let lexical_set: HashSet<_> = lexical_ids.iter().copied().collect();
+    let semantic_set: HashSet<_> = semantic_ids.iter().copied().collect();
+    let ranked = rank_fusion(
+        &lexical_ids,
+        &semantic_ids,
+        &boosts,
+        RankingWeights::default(),
+    );
+    let results = ranked
+        .into_iter()
+        .take(usize::try_from(limit).unwrap_or(100))
+        .filter_map(|ranked| {
+            candidates.remove(&ranked.id).map(|mut candidate| {
+                candidate.summary.relevance = ranked.score;
+                candidate.summary.retrieval_mode = match (
+                    lexical_set.contains(&ranked.id),
+                    semantic_set.contains(&ranked.id),
+                ) {
+                    (true, true) => "hybrid",
+                    (true, false) => "lexical",
+                    (false, true) => "semantic",
+                    (false, false) => "metadata",
+                }
+                .into();
+                candidate.summary
             })
-            .collect(),
-    ))
+        })
+        .collect();
+    Ok(Json(results))
 }
 
 pub async fn list_books(
@@ -217,9 +356,15 @@ pub async fn list_books(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT id, title, left(body, 240) AS snippet, book_type, scope, tags, provenance, trust, revision, \
-         0.0::real AS relevance, updated_at FROM books WHERE profile_id = $1 ORDER BY updated_at DESC LIMIT 100",
+         0.0::real AS relevance, updated_at FROM books WHERE profile_id=$1 \
+         AND ($2 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
+         AND ($2 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
+         AND ($2 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$3) \
+         ORDER BY updated_at DESC LIMIT 100",
     )
     .bind(user.profile_id)
+    .bind(&user.role)
+    .bind(user.id)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(
@@ -235,6 +380,9 @@ pub async fn list_books(
                 trust: row.get("trust"),
                 revision: row.get("revision"),
                 relevance: row.get("relevance"),
+                retrieval_mode: "recent".into(),
+                lexical_score: None,
+                semantic_score: None,
                 updated_at: row.get("updated_at"),
             })
             .collect(),
@@ -248,18 +396,36 @@ pub async fn update_book(
     Json(input): Json<UpdateBookRequest>,
 ) -> Result<Json<Book>, AppError> {
     let user = require_user(&state, &headers).await?;
+    require_book_writer(&user)?;
     if input.reason.trim().is_empty() {
         return Err(AppError::Validation("a revision reason is required".into()));
     }
     let tags = normalize_tags(input.tags)?;
     let mut tx = state.pool.begin().await?;
-    let row = sqlx::query("SELECT * FROM books WHERE id = $1 AND profile_id = $2 FOR UPDATE")
+    let row = sqlx::query(
+        "SELECT * FROM books WHERE id=$1 AND profile_id=$2 \
+         AND ($3 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
+         AND ($3 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$4) \
+         AND ($3 IN ('OWNER','ADMIN') OR (created_by_user_id=$4 AND provenance='USER' AND trust='USER_PROVIDED' AND scope <> 'GLOBAL')) \
+         FOR UPDATE",
+    )
         .bind(id)
         .bind(user.profile_id)
+        .bind(&user.role)
+        .bind(user.id)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(AppError::NotFound)?;
     let mut book = row_to_book(&row)?;
+    if matches!(
+        book.book_type,
+        BookType::Conversation | BookType::Autobiography
+    ) {
+        return Err(AppError::Validation(
+            "managed Books must be changed through their dedicated workflow".into(),
+        ));
+    }
     if book.revision != input.expected_revision {
         return Err(AppError::Conflict("book was changed by another writer"));
     }
@@ -269,14 +435,6 @@ pub async fn update_book(
     book.metadata = input.metadata;
     book.validate()
         .map_err(|error| AppError::Validation(error.to_string()))?;
-    sqlx::query(
-        "INSERT INTO book_revisions (id, book_id, revision, title, body, tags, metadata, changed_by, change_reason) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
-    )
-    .bind(Uuid::now_v7()).bind(id).bind(book.revision).bind(row.get::<String, _>("title"))
-    .bind(row.get::<String, _>("body")).bind(row.get::<Vec<String>, _>("tags"))
-    .bind(row.get::<serde_json::Value, _>("metadata")).bind(user.id).bind(input.reason.trim())
-    .execute(&mut *tx).await?;
     book.revision += 1;
     book.updated_at = OffsetDateTime::now_utc();
     sqlx::query(
@@ -290,6 +448,8 @@ pub async fn update_book(
         .execute(&mut *tx)
         .await?;
     insert_chunks(&mut tx, id, &book.body).await?;
+    insert_revision(&mut tx, &book, Some(user.id), input.reason.trim()).await?;
+    embedding::enqueue_book(&mut tx, book.profile_id, id, book.revision).await?;
     audit(
         &mut tx,
         Some(user.id),
@@ -314,10 +474,16 @@ pub async fn book_history(
     let rows = sqlx::query(
         "SELECT r.revision, r.title, r.body, r.tags, r.change_reason, r.created_at \
          FROM book_revisions r JOIN books b ON b.id = r.book_id \
-         WHERE r.book_id = $1 AND b.profile_id = $2 ORDER BY r.revision DESC",
+         WHERE r.book_id=$1 AND b.profile_id=$2 \
+           AND ($3 IN ('OWNER','ADMIN') OR b.security_classification <> 'RESTRICTED') \
+           AND ($3 IN ('OWNER','ADMIN') OR b.scope <> 'AGENT') \
+           AND ($3 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$4) \
+         ORDER BY r.revision DESC",
     )
     .bind(id)
     .bind(user.profile_id)
+    .bind(&user.role)
+    .bind(user.id)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(
@@ -354,7 +520,27 @@ async fn authorize_workspace(
     Ok(())
 }
 
-async fn insert_chunks(
+async fn authorize_conversation(
+    state: &AppState,
+    profile_id: Uuid,
+    conversation_id: Option<Uuid>,
+) -> Result<(), AppError> {
+    if let Some(conversation_id) = conversation_id {
+        let allowed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=$1 AND profile_id=$2 AND status <> 'deleted')",
+        )
+        .bind(conversation_id)
+        .bind(profile_id)
+        .fetch_one(&state.pool)
+        .await?;
+        if !allowed {
+            return Err(AppError::Forbidden);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn insert_chunks(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     book_id: Uuid,
     body: &str,
@@ -371,6 +557,143 @@ async fn insert_chunks(
         .execute(&mut **tx).await?;
     }
     Ok(())
+}
+
+pub(crate) async fn replace_book_body(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    book_id: Uuid,
+    body: &str,
+    changed_by: Option<Uuid>,
+    reason: &str,
+) -> Result<i64, AppError> {
+    let row = sqlx::query(
+        "SELECT profile_id,title,tags,metadata,revision FROM books WHERE id=$1 FOR UPDATE",
+    )
+    .bind(book_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let profile_id: Uuid = row.get("profile_id");
+    let revision: i64 = row.get::<i64, _>("revision") + 1;
+    sqlx::query(
+        "UPDATE books SET body=$1,revision=$2,embedding_status='stale',updated_at=now() WHERE id=$3",
+    )
+    .bind(body)
+    .bind(revision)
+    .bind(book_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM book_chunks WHERE book_id=$1")
+        .bind(book_id)
+        .execute(&mut **tx)
+        .await?;
+    insert_chunks(tx, book_id, body).await?;
+    sqlx::query(
+        "INSERT INTO book_revisions (id,book_id,revision,title,body,tags,metadata,changed_by,change_reason) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(book_id)
+    .bind(revision)
+    .bind(row.get::<String, _>("title"))
+    .bind(body)
+    .bind(row.get::<Vec<String>, _>("tags"))
+    .bind(row.get::<serde_json::Value, _>("metadata"))
+    .bind(changed_by)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+    embedding::enqueue_book(tx, profile_id, book_id, revision).await?;
+    Ok(revision)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn replace_book_snapshot(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    book_id: Uuid,
+    title: &str,
+    body: &str,
+    tags: &[String],
+    metadata: &serde_json::Value,
+    changed_by: Option<Uuid>,
+    reason: &str,
+) -> Result<i64, AppError> {
+    let row = sqlx::query("SELECT profile_id,revision FROM books WHERE id=$1 FOR UPDATE")
+        .bind(book_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let profile_id: Uuid = row.get("profile_id");
+    let revision: i64 = row.get::<i64, _>("revision") + 1;
+    sqlx::query(
+        "UPDATE books SET title=$1,body=$2,tags=$3,metadata=$4,revision=$5,embedding_status='stale',updated_at=now() WHERE id=$6",
+    )
+    .bind(title)
+    .bind(body)
+    .bind(tags)
+    .bind(metadata)
+    .bind(revision)
+    .bind(book_id)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("DELETE FROM book_chunks WHERE book_id=$1")
+        .bind(book_id)
+        .execute(&mut **tx)
+        .await?;
+    insert_chunks(tx, book_id, body).await?;
+    sqlx::query(
+        "INSERT INTO book_revisions (id,book_id,revision,title,body,tags,metadata,changed_by,change_reason) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(book_id)
+    .bind(revision)
+    .bind(title)
+    .bind(body)
+    .bind(tags)
+    .bind(metadata)
+    .bind(changed_by)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+    embedding::enqueue_book(tx, profile_id, book_id, revision).await?;
+    Ok(revision)
+}
+
+async fn insert_revision(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    book: &Book,
+    changed_by: Option<Uuid>,
+    reason: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        "INSERT INTO book_revisions (id, book_id, revision, title, body, tags, metadata, changed_by, change_reason) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(book.id)
+    .bind(book.revision)
+    .bind(&book.title)
+    .bind(&book.body)
+    .bind(&book.tags)
+    .bind(&book.metadata)
+    .bind(changed_by)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+fn is_admin(user: &AuthenticatedUser) -> bool {
+    matches!(user.role.as_str(), "OWNER" | "ADMIN")
+}
+
+fn require_book_writer(user: &AuthenticatedUser) -> Result<(), AppError> {
+    if user.role == "VIEWER" {
+        Err(AppError::Forbidden)
+    } else {
+        Ok(())
+    }
 }
 
 fn row_to_book(row: &sqlx::postgres::PgRow) -> Result<Book, AppError> {
@@ -448,4 +771,31 @@ fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>, AppError> {
 
 fn empty_object() -> serde_json::Value {
     serde_json::json!({})
+}
+
+fn search_candidate(
+    row: &sqlx::postgres::PgRow,
+    mode: &str,
+    lexical_score: Option<f32>,
+    semantic_score: Option<f32>,
+) -> SearchCandidate {
+    SearchCandidate {
+        summary: BookSummary {
+            id: row.get("id"),
+            title: row.get("title"),
+            snippet: row.get("snippet"),
+            book_type: row.get("book_type"),
+            scope: row.get("scope"),
+            tags: row.get("tags"),
+            provenance: row.get("provenance"),
+            trust: row.get("trust"),
+            revision: row.get("revision"),
+            relevance: 0.0,
+            retrieval_mode: mode.into(),
+            lexical_score,
+            semantic_score,
+            updated_at: row.get("updated_at"),
+        },
+        workspace_id: row.get("workspace_id"),
+    }
 }

@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
-use crate::{AppState, config::AuthSettings, error::AppError};
+use crate::{AppState, config::AuthSettings, embedding, error::AppError};
 
 const SESSION_COOKIE: &str = "__Host-gobrowse_session";
 const DEV_SESSION_COOKIE: &str = "gobrowse_session";
@@ -181,15 +181,27 @@ pub async fn create_owner(
     .bind(profile_id)
     .execute(&mut *tx)
     .await?;
+    let autobiography_id = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO books (id, profile_id, title, body, book_type, scope, provenance, trust, author, security_classification) \
-         VALUES ($1, $2, 'Autobiography', '', 'AUTOBIOGRAPHY', 'PROFILE', 'USER', 'USER_PROVIDED', $3, 'CONFIDENTIAL')",
+        "INSERT INTO books (id, profile_id, title, body, book_type, scope, provenance, trust, author, security_classification, created_by_user_id) \
+         VALUES ($1, $2, 'Autobiography', '', 'AUTOBIOGRAPHY', 'PROFILE', 'USER', 'USER_PROVIDED', $3, 'CONFIDENTIAL', $4)",
     )
-    .bind(Uuid::now_v7())
+    .bind(autobiography_id)
     .bind(profile_id)
     .bind(input.display_name.trim())
+    .bind(user_id)
     .execute(&mut *tx)
     .await?;
+    sqlx::query(
+        "INSERT INTO book_revisions (id,book_id,revision,title,body,tags,metadata,changed_by,change_reason) \
+         VALUES ($1,$2,1,'Autobiography','','{}','{}',$3,'Initial autobiography')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(autobiography_id)
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    embedding::enqueue_book(&mut tx, profile_id, autobiography_id, 1).await?;
     audit(
         &mut tx,
         Some(user_id),
