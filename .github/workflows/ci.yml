@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main, initial-agent-os]
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:0.8.1-pg17
+        env:
+          POSTGRES_DB: gobrowse_test
+          POSTGRES_USER: gobrowse
+          POSTGRES_PASSWORD: test-only-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U gobrowse -d gobrowse_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      DATABASE_URL: postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test
+      GOBROWSE_TEST_DATABASE_URL: postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          components: rustfmt,clippy
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo nextest run --workspace
+      - name: Migrations
+        run: cargo run -p gobrowse-server --bin gobrowse -- migrate
+        env:
+          GOBROWSE__DATABASE__URL: ${{ env.DATABASE_URL }}
+          GOBROWSE__HTTP__BIND: 127.0.0.1:8080
+          GOBROWSE__HTTP__PUBLIC_ORIGIN: http://localhost:8080
+          GOBROWSE__HTTP__SECURE_COOKIES: "false"
+          GOBROWSE__HTTP__STATIC_DIR: dist
+          GOBROWSE__HTTP__REQUEST_BODY_LIMIT_BYTES: "2097152"
+          GOBROWSE__AUTH__SESSION_IDLE_MINUTES: "120"
+          GOBROWSE__AUTH__SESSION_ABSOLUTE_HOURS: "336"
+          GOBROWSE__AUTH__ARGON2_MEMORY_KIB: "19456"
+          GOBROWSE__AUTH__ARGON2_ITERATIONS: "2"
+          GOBROWSE__AUTH__ARGON2_PARALLELISM: "1"
+          GOBROWSE__AUTH__MAX_PARALLEL_HASHES: "2"
+          GOBROWSE__OBSERVABILITY__JSON_LOGS: "false"
+          GOBROWSE__OBSERVABILITY__LOG_FILTER: info
+
+  web:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: trunk@0.21.14
+      - run: trunk build index.html --release --dist ../../dist
+        working-directory: crates/gobrowse-web
+
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: taiki-e/install-action@cargo-deny
+      - uses: taiki-e/install-action@cargo-audit
+      - run: cargo deny check
+      - run: cargo audit
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cp .env.example .env
+      - run: docker compose config --quiet
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: gobrowse-os:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
