@@ -1,0 +1,18 @@
+[package]
+name = "gobrowse-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+gloo-net = { version = "0.6.0", features = ["http", "json"] }
+leptos.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen-futures = "0.4.50"
+web-sys = { version = "0.3.77", features = ["HtmlInputElement", "Window", "Location"] }
+
+[lints]
+workspace = true
