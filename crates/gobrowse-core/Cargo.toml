@@ -17,7 +17,12 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+criterion = { version = "0.7.0", default-features = false }
 tokio.workspace = true
+
+[[bench]]
+name = "core"
+harness = false
 
 [lints]
 workspace = true

@@ -12,7 +12,13 @@ pub async fn connect(settings: &DatabaseSettings) -> Result<PgPool, sqlx::Error>
 }
 
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
-    sqlx::migrate!().run(pool).await
+    let directory = std::env::var_os("GOBROWSE_MIGRATIONS_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"));
+    sqlx::migrate::Migrator::new(directory)
+        .await?
+        .run(pool)
+        .await
 }
 
 pub async fn ready(pool: &PgPool) -> Result<(), AppError> {
