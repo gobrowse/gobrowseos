@@ -1,0 +1,32 @@
+[http]
+bind = "0.0.0.0:8080"
+public_origin = "http://localhost:8080"
+secure_cookies = false
+static_dir = "dist"
+request_body_limit_bytes = 2097152
+
+[database]
+url = "postgres://gobrowse:replace-me@localhost:5432/gobrowse"
+max_connections = 20
+
+[auth]
+session_idle_minutes = 120
+session_absolute_hours = 336
+argon2_memory_kib = 19456
+argon2_iterations = 2
+argon2_parallelism = 1
+max_parallel_hashes = 4
+
+[features]
+sandbox = false
+browser = false
+messaging = false
+voice = false
+media = false
+lsp = false
+otel = false
+local_embeddings = false
+
+[observability]
+json_logs = false
+log_filter = "gobrowse=info,tower_http=info"
