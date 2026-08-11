@@ -144,8 +144,8 @@ pub async fn create_book(
     };
     book.validate()
         .map_err(|error| AppError::Validation(error.to_string()))?;
-    authorize_workspace(&state, user.profile_id, book.workspace_id).await?;
-    authorize_conversation(&state, user.profile_id, book.conversation_id).await?;
+    authorize_workspace(&state, &user, book.workspace_id, true).await?;
+    authorize_conversation(&state, &user, book.conversation_id).await?;
     let owner_user_id =
         matches!(book.scope, BookScope::User | BookScope::Private).then_some(user.id);
 
@@ -201,7 +201,12 @@ pub async fn get_book(
         "SELECT * FROM books WHERE id=$1 AND profile_id=$2 \
          AND ($3 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
          AND ($3 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
-         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$4)",
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$4) \
+         AND (scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
+             $3 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$4) OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$4)))) \
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$4))",
     )
     .bind(id)
     .bind(user.profile_id)
@@ -225,7 +230,7 @@ pub async fn search_books(
             "search query must contain 1 to 1000 characters".into(),
         ));
     }
-    authorize_workspace(&state, user.profile_id, query.workspace_id).await?;
+    authorize_workspace(&state, &user, query.workspace_id, false).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let candidate_limit = (limit * 3).min(300);
     let lexical_rows = sqlx::query(
@@ -235,7 +240,12 @@ pub async fn search_books(
          FROM books WHERE profile_id = $2 \
            AND ($5 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
            AND ($5 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
-           AND ($5 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$6) \
+            AND ($5 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$6) \
+            AND (scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
+                $5 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$6) OR EXISTS( \
+                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$6)))) \
+            AND ($5 IN ('OWNER','ADMIN') OR scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$6)) \
            AND ($3::uuid IS NULL OR scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR workspace_id=$3 \
                 OR (scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND c.workspace_id=$3))) \
            AND search_document @@ websearch_to_tsquery('english', $1) \
@@ -269,7 +279,13 @@ pub async fn search_books(
              WHERE e.embedding_model_id=$2 AND e.book_revision=b.revision AND b.profile_id=$3 \
                AND ($5 IN ('OWNER','ADMIN') OR b.security_classification <> 'RESTRICTED') \
                AND ($5 IN ('OWNER','ADMIN') OR b.scope <> 'AGENT') \
-               AND ($5 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$6) \
+                AND ($5 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$6) \
+                AND (b.scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations authorized_conversation \
+                    WHERE authorized_conversation.id=b.conversation_id AND ($5 IN ('OWNER','ADMIN') OR \
+                    (authorized_conversation.workspace_id IS NULL AND authorized_conversation.created_by_user_id=$6) OR EXISTS( \
+                    SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=authorized_conversation.workspace_id AND member.user_id=$6)))) \
+                AND ($5 IN ('OWNER','ADMIN') OR b.scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+                    SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=b.workspace_id AND member.user_id=$6)) \
                AND ($4::uuid IS NULL OR b.scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR b.workspace_id=$4 \
                     OR (b.scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations conversation \
                         WHERE conversation.id=b.conversation_id AND conversation.workspace_id=$4))) \
@@ -360,6 +376,11 @@ pub async fn list_books(
          AND ($2 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
          AND ($2 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
          AND ($2 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$3) \
+         AND (scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
+             $2 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$3) OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3)))) \
+         AND ($2 IN ('OWNER','ADMIN') OR scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$3)) \
          ORDER BY updated_at DESC LIMIT 100",
     )
     .bind(user.profile_id)
@@ -407,6 +428,13 @@ pub async fn update_book(
          AND ($3 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
          AND ($3 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
          AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$4) \
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id \
+             AND member.user_id=$4 AND member.access IN ('OWNER','EDITOR'))) \
+         AND ($3 IN ('OWNER','ADMIN') OR scope<>'CONVERSATION' OR EXISTS( \
+             SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
+             (c.workspace_id IS NULL AND c.created_by_user_id=$4) OR EXISTS(SELECT 1 FROM workspace_memberships member \
+             WHERE member.workspace_id=c.workspace_id AND member.user_id=$4 AND member.access IN ('OWNER','EDITOR'))))) \
          AND ($3 IN ('OWNER','ADMIN') OR (created_by_user_id=$4 AND provenance='USER' AND trust='USER_PROVIDED' AND scope <> 'GLOBAL')) \
          FOR UPDATE",
     )
@@ -477,7 +505,12 @@ pub async fn book_history(
          WHERE r.book_id=$1 AND b.profile_id=$2 \
            AND ($3 IN ('OWNER','ADMIN') OR b.security_classification <> 'RESTRICTED') \
            AND ($3 IN ('OWNER','ADMIN') OR b.scope <> 'AGENT') \
-           AND ($3 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$4) \
+            AND ($3 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$4) \
+            AND (b.scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=b.conversation_id AND ( \
+                $3 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$4) OR EXISTS( \
+                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$4)))) \
+            AND ($3 IN ('OWNER','ADMIN') OR b.scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=b.workspace_id AND member.user_id=$4)) \
          ORDER BY r.revision DESC",
     )
     .bind(id)
@@ -502,15 +535,22 @@ pub async fn book_history(
 
 async fn authorize_workspace(
     state: &AppState,
-    profile_id: Uuid,
+    user: &AuthenticatedUser,
     workspace_id: Option<Uuid>,
+    require_write: bool,
 ) -> Result<(), AppError> {
     if let Some(workspace_id) = workspace_id {
         let allowed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id = $1 AND profile_id = $2)",
+            "SELECT EXISTS(SELECT 1 FROM workspaces workspace WHERE id=$1 AND profile_id=$2 AND ( \
+             $4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member \
+             WHERE member.workspace_id=workspace.id AND member.user_id=$3 \
+             AND (NOT $5::boolean OR member.access IN ('OWNER','EDITOR')))))",
         )
         .bind(workspace_id)
-        .bind(profile_id)
+        .bind(user.profile_id)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(require_write)
         .fetch_one(&state.pool)
         .await?;
         if !allowed {
@@ -522,15 +562,20 @@ async fn authorize_workspace(
 
 async fn authorize_conversation(
     state: &AppState,
-    profile_id: Uuid,
+    user: &AuthenticatedUser,
     conversation_id: Option<Uuid>,
 ) -> Result<(), AppError> {
     if let Some(conversation_id) = conversation_id {
         let allowed: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=$1 AND profile_id=$2 AND status <> 'deleted')",
+            "SELECT EXISTS(SELECT 1 FROM conversations c WHERE id=$1 AND profile_id=$2 AND status<>'deleted' AND ( \
+             $4 IN ('OWNER','ADMIN') OR (workspace_id IS NULL AND created_by_user_id=$3) OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id \
+             AND member.user_id=$3 AND member.access IN ('OWNER','EDITOR'))))",
         )
         .bind(conversation_id)
-        .bind(profile_id)
+        .bind(user.profile_id)
+        .bind(user.id)
+        .bind(&user.role)
         .fetch_one(&state.pool)
         .await?;
         if !allowed {

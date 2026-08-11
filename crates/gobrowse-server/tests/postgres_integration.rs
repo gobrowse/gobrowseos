@@ -28,7 +28,7 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 2);
+    assert_eq!(row.get::<i64, _>("schema_version"), 3);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
@@ -234,7 +234,7 @@ async fn vault_round_trip_never_persists_plaintext() {
 }
 
 #[tokio::test]
-async fn schema_v2_safely_upgrades_permitted_v1_states() {
+async fn schema_v3_safely_upgrades_permitted_v1_states() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -267,6 +267,9 @@ async fn schema_v2_safely_upgrades_permitted_v1_states() {
     let agent_book = Uuid::now_v7();
     let autobiography = Uuid::now_v7();
     let conversation_id = Uuid::now_v7();
+    let workspace_id = Uuid::now_v7();
+    let agent_id = Uuid::now_v7();
+    let run_id = Uuid::now_v7();
     let chunk_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'upgrade-test')")
         .bind(profile_id)
@@ -283,6 +286,29 @@ async fn schema_v2_safely_upgrades_permitted_v1_states() {
     .execute(&mut connection)
     .await
     .expect("create v1 user");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'Legacy workspace')")
+        .bind(workspace_id)
+        .bind(profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create v1 workspace");
+    sqlx::query("INSERT INTO audit_events (actor_user_id,profile_id,action,resource_type,resource_id,outcome) VALUES ($1,$2,'workspace.created','workspace',$3,'success')")
+        .bind(user_id).bind(profile_id).bind(workspace_id.to_string()).execute(&mut connection).await.expect("audit workspace creator");
+    sqlx::query("INSERT INTO agents (id,workspace_id,name,kind,permissions,status) VALUES ($1,$2,'Legacy agent','coding','{}','paused')")
+        .bind(agent_id).bind(workspace_id).execute(&mut connection).await.expect("create v1 agent");
+    sqlx::query("INSERT INTO agent_runs (id,agent_id,state) VALUES ($1,$2,'paused')")
+        .bind(run_id)
+        .bind(agent_id)
+        .execute(&mut connection)
+        .await
+        .expect("create v1 run");
+    sqlx::query(
+        "INSERT INTO run_events (run_id,event_type,payload) VALUES ($1,'legacy.paused','{}')",
+    )
+    .bind(run_id)
+    .execute(&mut connection)
+    .await
+    .expect("create v1 run event");
     for (id, title, scope, book_type) in [
         (private_book, "Private", "PRIVATE", "NOTE"),
         (agent_book, "Agent", "AGENT", "NOTE"),
@@ -310,10 +336,11 @@ async fn schema_v2_safely_upgrades_permitted_v1_states() {
     .await
     .expect("create v1 provider");
     sqlx::query(
-        "INSERT INTO conversations (id,profile_id,title) VALUES ($1,$2,'Legacy conversation')",
+        "INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'Legacy conversation')",
     )
     .bind(conversation_id)
     .bind(profile_id)
+    .bind(workspace_id)
     .execute(&mut connection)
     .await
     .expect("create v1 conversation");
@@ -457,6 +484,45 @@ async fn schema_v2_safely_upgrades_permitted_v1_states() {
         .await
         .expect("read quarantined Agent Book");
     assert_eq!(agent_scope, "PROFILE");
+    sqlx::raw_sql(include_str!("../migrations/0003_chat_runs.sql"))
+        .execute(&mut connection)
+        .await
+        .expect("upgrade deployed v2 state to v3");
+    let schema_version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read schema v3 version");
+    assert_eq!(schema_version, 3);
+    let conversation_owner: Uuid =
+        sqlx::query_scalar("SELECT created_by_user_id FROM conversations WHERE id=$1")
+            .bind(conversation_id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read conversation owner");
+    assert_eq!(conversation_owner, user_id);
+    let workspace_access: String = sqlx::query_scalar(
+        "SELECT access FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read backfilled workspace owner");
+    assert_eq!(workspace_access, "OWNER");
+    let legacy_run: (Uuid, String) =
+        sqlx::query_as("SELECT profile_id,run_kind FROM agent_runs WHERE id=$1")
+            .bind(run_id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read migrated legacy run");
+    assert_eq!(legacy_run, (profile_id, "agent".into()));
+    let event_profile: Uuid =
+        sqlx::query_scalar("SELECT profile_id FROM run_events WHERE run_id=$1")
+            .bind(run_id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read migrated event profile");
+    assert_eq!(event_profile, profile_id);
     let immutable = sqlx::query("UPDATE book_revisions SET body='rewritten'")
         .execute(&mut connection)
         .await;

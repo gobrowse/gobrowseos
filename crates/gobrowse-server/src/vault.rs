@@ -116,8 +116,34 @@ impl Vault {
         profile_id: Uuid,
         secret_id: &str,
     ) -> Result<SecretString, AppError> {
+        self.resolve_scoped(pool, profile_id, secret_id, None).await
+    }
+
+    pub async fn resolve_for_provider(
+        &self,
+        pool: &PgPool,
+        profile_id: Uuid,
+        secret_id: &str,
+        host: &str,
+    ) -> Result<SecretString, AppError> {
+        self.resolve_scoped(
+            pool,
+            profile_id,
+            secret_id,
+            Some(host.trim_end_matches('.').to_ascii_lowercase()),
+        )
+        .await
+    }
+
+    async fn resolve_scoped(
+        &self,
+        pool: &PgPool,
+        profile_id: Uuid,
+        secret_id: &str,
+        provider_host: Option<String>,
+    ) -> Result<SecretString, AppError> {
         let row = sqlx::query(
-            "SELECT purpose, algorithm, encrypted_value, nonce, wrapped_data_key, wrap_nonce, key_version \
+            "SELECT purpose,allowed_hosts,algorithm,encrypted_value,nonce,wrapped_data_key,wrap_nonce,key_version \
              FROM secret_references WHERE id = $1 AND profile_id = $2 AND backend = 'encrypted_database'",
         )
         .bind(secret_id)
@@ -125,6 +151,12 @@ impl Vault {
         .fetch_optional(pool)
         .await?
         .ok_or(crate::error::AppError::NotFound)?;
+        if let Some(host) = provider_host
+            && (row.get::<String, _>("purpose") != "provider_credential"
+                || !row.get::<Vec<String>, _>("allowed_hosts").contains(&host))
+        {
+            return Err(AppError::Forbidden);
+        }
         if row.get::<String, _>("algorithm") != ALGORITHM {
             return Err(internal(VaultError::InvalidEnvelope));
         }

@@ -400,13 +400,19 @@ async fn process(state: &AppState, job: &Job) -> Result<(), JobFailure> {
         .begin()
         .await
         .map_err(|_| JobFailure::retryable("database", "database operation failed"))?;
+    let current_revision: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM books WHERE id=$1 FOR UPDATE")
+            .bind(job.book_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|_| JobFailure::retryable("database", "database operation failed"))?;
     let valid_lease = sqlx::query(
-        "SELECT j.id FROM embedding_jobs j JOIN books b ON b.id=j.book_id \
-         WHERE j.id=$1 AND j.lease_token=$2 AND j.status='running' AND j.lease_expires_at>now() \
-           AND b.revision=j.target_revision FOR UPDATE OF j,b",
+        "SELECT id FROM embedding_jobs WHERE id=$1 AND lease_token=$2 AND status='running' \
+         AND lease_expires_at>now() AND target_revision=$3 FOR UPDATE",
     )
     .bind(job.id)
     .bind(job.lease_token)
+    .bind(current_revision.unwrap_or(-1))
     .fetch_optional(&mut *tx)
     .await
     .map_err(|_| JobFailure::retryable("database", "database operation failed"))?;
@@ -499,15 +505,15 @@ async fn renew_lease(pool: &PgPool, job: &Job) -> Result<(), JobFailure> {
 
 async fn cancel_stale(pool: &PgPool, job: &Job, current_revision: i64) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let profile_id = sqlx::query_scalar("SELECT profile_id FROM books WHERE id=$1 FOR UPDATE")
+        .bind(job.book_id)
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query(
         "UPDATE embedding_jobs SET status='canceled', lease_owner=NULL, lease_token=NULL, lease_expires_at=NULL, \
          last_error_code='stale_revision', last_error_detail='Book changed before embedding completed', updated_at=now() \
          WHERE id=$1 AND lease_token=$2"
     ).bind(job.id).bind(job.lease_token).execute(&mut *tx).await?;
-    let profile_id = sqlx::query_scalar("SELECT profile_id FROM books WHERE id=$1")
-        .bind(job.book_id)
-        .fetch_one(&mut *tx)
-        .await?;
     enqueue_book(&mut tx, profile_id, job.book_id, current_revision)
         .await
         .map_err(|error| match error {
@@ -528,7 +534,14 @@ async fn load_provider(
         Some(secret_id) => Some(
             state
                 .vault
-                .resolve(&state.pool, profile_id, secret_id)
+                .resolve_for_provider(
+                    &state.pool,
+                    profile_id,
+                    secret_id,
+                    model.base_url.host_str().ok_or_else(|| {
+                        AppError::Validation("embedding provider has no host".into())
+                    })?,
+                )
                 .await?,
         ),
         None => None,
@@ -538,6 +551,7 @@ async fn load_provider(
         &model.provider_type,
         token.is_some(),
         state.settings.features.local_embeddings,
+        Some(Duration::from_secs(30)),
     )
     .await?;
     Ok(Arc::new(HttpEmbeddingProvider {
@@ -596,16 +610,23 @@ pub async fn validate_provider_endpoint(
     authenticated: bool,
     local_embeddings: bool,
 ) -> Result<(), AppError> {
-    provider_http_client(base_url, provider_type, authenticated, local_embeddings)
-        .await
-        .map(|_| ())
+    provider_http_client(
+        base_url,
+        provider_type,
+        authenticated,
+        local_embeddings,
+        Some(Duration::from_secs(30)),
+    )
+    .await
+    .map(|_| ())
 }
 
-async fn provider_http_client(
+pub(crate) async fn provider_http_client(
     base_url: &Url,
     provider_type: &str,
     authenticated: bool,
     local_embeddings: bool,
+    request_timeout: Option<Duration>,
 ) -> Result<reqwest::Client, AppError> {
     let host = base_url
         .host_str()
@@ -653,10 +674,12 @@ async fn provider_http_client(
     let pinned = addresses[0];
     let mut builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .user_agent(concat!("gobrowse-os/", env!("CARGO_PKG_VERSION")));
+    if let Some(timeout) = request_timeout {
+        builder = builder.timeout(timeout);
+    }
     if host.parse::<IpAddr>().is_err() {
         builder = builder.resolve(host, SocketAddr::new(pinned, port));
     }
@@ -684,6 +707,8 @@ fn forbidden_address(address: IpAddr) -> bool {
                 || address.is_broadcast()
                 || address.is_documentation()
                 || address.octets()[0] == 0
+                || address.octets()[0] >= 240
+                || matches!(address.octets(), [192, 0, 0, _])
                 || carrier_grade_nat(address)
                 || benchmark_v4(address)
         }
@@ -692,6 +717,9 @@ fn forbidden_address(address: IpAddr) -> bool {
                 address.is_unspecified()
                     || address.is_multicast()
                     || (address.segments()[0] & 0xffc0) == 0xfe80
+                    || (address.segments()[0] & 0xffc0) == 0xfec0
+                    || (address.segments()[0] == 0x0100
+                        && address.segments()[1..4].iter().all(|segment| *segment == 0))
                     || documentation_v6(address)
             },
             |mapped| forbidden_address(IpAddr::V4(mapped)),
@@ -786,5 +814,8 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(forbidden_address("240.0.0.1".parse().unwrap()));
+        assert!(forbidden_address("fec0::1".parse().unwrap()));
+        assert!(forbidden_address("100::1".parse().unwrap()));
     }
 }

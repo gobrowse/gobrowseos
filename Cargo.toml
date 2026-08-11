@@ -19,6 +19,7 @@ argon2 = "0.5.3"
 async-trait = "0.1.89"
 axum = { version = "0.8.4", features = ["http1", "json", "macros", "tokio", "ws"] }
 base64 = "0.22.1"
+bytes = "1.12.1"
 clap = { version = "4.5.47", features = ["derive", "env"] }
 config = { version = "0.15.17", default-features = false, features = ["toml"] }
 futures-util = "0.3.31"

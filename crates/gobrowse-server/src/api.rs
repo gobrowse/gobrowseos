@@ -69,6 +69,9 @@ pub async fn create_workspace(
     Json(input): Json<CreateWorkspaceRequest>,
 ) -> Result<Json<WorkspaceResponse>, AppError> {
     let user = require_user(&state, &headers).await?;
+    if user.role == "VIEWER" {
+        return Err(AppError::Forbidden);
+    }
     let title = input.title.trim();
     if title.is_empty() || title.chars().count() > 300 {
         return Err(AppError::Validation(
@@ -84,14 +87,22 @@ pub async fn create_workspace(
     let now = OffsetDateTime::now_utc();
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "INSERT INTO workspaces (id, profile_id, title, description, created_at, updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$5)",
+        "INSERT INTO workspaces (id, profile_id, title, description, created_by_user_id, created_at, updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$6)",
     )
     .bind(id)
     .bind(user.profile_id)
     .bind(title)
     .bind(&input.description)
+    .bind(user.id)
     .bind(now)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'OWNER')",
+    )
+    .bind(id)
+    .bind(user.id)
     .execute(&mut *tx)
     .await?;
     audit(
@@ -122,9 +133,13 @@ pub async fn list_workspaces(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT id, title, description, network_policy, created_at, updated_at \
-         FROM workspaces WHERE profile_id = $1 ORDER BY updated_at DESC LIMIT 200",
+         FROM workspaces workspace WHERE profile_id=$1 AND ($3 IN ('OWNER','ADMIN') OR EXISTS( \
+         SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=workspace.id AND member.user_id=$2)) \
+         ORDER BY updated_at DESC LIMIT 200",
     )
     .bind(user.profile_id)
+    .bind(user.id)
+    .bind(&user.role)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(

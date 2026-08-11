@@ -115,6 +115,8 @@ pub struct AuthenticatedUser {
     pub email: String,
     pub display_name: String,
     pub role: String,
+    #[serde(skip)]
+    pub session_hash: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -289,6 +291,7 @@ pub async fn require_user(
 ) -> Result<AuthenticatedUser, AppError> {
     let token =
         session_token(headers, state.settings.http.secure_cookies).ok_or(AppError::Unauthorized)?;
+    let session_hash = token_hash(token.as_bytes());
     let now = OffsetDateTime::now_utc();
     let row = sqlx::query(
         "SELECT u.id, u.primary_profile_id, u.email, u.display_name, u.role \
@@ -296,7 +299,7 @@ pub async fn require_user(
          WHERE s.token_hash = $1 AND s.auth_epoch = u.auth_epoch AND u.disabled_at IS NULL \
            AND s.expires_at > $2 AND s.absolute_expires_at > $2",
     )
-    .bind(token_hash(token.as_bytes()))
+    .bind(&session_hash)
     .bind(now)
     .fetch_optional(&state.pool)
     .await?
@@ -307,6 +310,7 @@ pub async fn require_user(
         email: row.get("email"),
         display_name: row.get("display_name"),
         role: row.get("role"),
+        session_hash: Some(session_hash),
     })
 }
 
@@ -325,11 +329,12 @@ async fn create_session(
     rand::rng().fill_bytes(bytes.as_mut());
     let token = Zeroizing::new(URL_SAFE_NO_PAD.encode(*bytes));
     let now = OffsetDateTime::now_utc();
+    let session_hash = token_hash(token.as_bytes());
     sqlx::query(
         "INSERT INTO sessions (token_hash, user_id, auth_epoch, expires_at, absolute_expires_at) \
          VALUES ($1, $2, $3, $4, $5)",
     )
-    .bind(token_hash(token.as_bytes()))
+    .bind(&session_hash)
     .bind(user_id)
     .bind(row.get::<i64, _>("auth_epoch"))
     .bind(now + Duration::minutes(state.settings.auth.session_idle_minutes))
@@ -345,6 +350,7 @@ async fn create_session(
             email: row.get("email"),
             display_name: row.get("display_name"),
             role: row.get("role"),
+            session_hash: Some(session_hash),
         },
     ))
 }

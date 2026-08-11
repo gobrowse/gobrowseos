@@ -1057,8 +1057,10 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bytes",
  "clap",
  "config",
+ "futures-util",
  "gobrowse-core",
  "http",
  "http-body-util",
@@ -1074,6 +1076,7 @@ dependencies = [
  "thiserror 2.0.20",
  "time",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tower",
  "tower-http",
@@ -1089,10 +1092,12 @@ name = "gobrowse-web"
 version = "0.1.0"
 dependencies = [
  "gloo-net",
+ "js-sys",
  "leptos",
  "serde",
  "serde_json",
  "url",
+ "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
 ]

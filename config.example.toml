@@ -37,6 +37,7 @@ media = false
 lsp = false
 otel = false
 local_embeddings = false
+local_models = false
 
 [observability]
 json_logs = false

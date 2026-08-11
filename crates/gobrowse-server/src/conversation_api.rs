@@ -87,7 +87,7 @@ pub async fn create_conversation(
     let user = require_user(&state, &headers).await?;
     require_writer(&user)?;
     validate_title(&input.title)?;
-    authorize_workspace(&state, user.profile_id, input.workspace_id).await?;
+    authorize_workspace(&state, &user, input.workspace_id, true).await?;
     let mut tx = state.pool.begin().await?;
     let conversation = insert_conversation(
         &mut tx,
@@ -119,9 +119,14 @@ pub async fn list_conversations(
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
         "SELECT id,title,workspace_id,status,forked_from_id,forked_at_message_id,created_at,updated_at \
-         FROM conversations WHERE profile_id=$1 AND status <> 'deleted' ORDER BY updated_at DESC LIMIT 200",
+         FROM conversations c WHERE profile_id=$1 AND status <> 'deleted' AND ( \
+         $3 IN ('OWNER','ADMIN') OR (workspace_id IS NULL AND created_by_user_id=$2) OR EXISTS( \
+         SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$2)) \
+         ORDER BY updated_at DESC LIMIT 200",
     )
     .bind(user.profile_id)
+    .bind(user.id)
+    .bind(&user.role)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(rows.iter().map(row_to_conversation).collect()))
@@ -133,7 +138,7 @@ pub async fn get_conversation(
     Path(id): Path<Uuid>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     let user = require_user(&state, &headers).await?;
-    let row = conversation_row(&state, user.profile_id, id).await?;
+    let row = conversation_row(&state, &user, id).await?;
     Ok(Json(row_to_conversation(&row)))
 }
 
@@ -162,14 +167,30 @@ pub async fn append_message(
     }
     let mut tx = state.pool.begin().await?;
     let conversation = sqlx::query(
-        "SELECT id FROM conversations WHERE id=$1 AND profile_id=$2 AND status='active' FOR UPDATE",
+        "SELECT id FROM conversations c WHERE id=$1 AND profile_id=$2 AND status='active' AND ( \
+         $4 IN ('OWNER','ADMIN') OR (workspace_id IS NULL AND created_by_user_id=$3) OR EXISTS( \
+         SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3 AND member.access IN ('OWNER','EDITOR'))) FOR UPDATE",
     )
     .bind(id)
     .bind(user.profile_id)
+    .bind(user.id)
+    .bind(&user.role)
     .fetch_optional(&mut *tx)
     .await?;
     if conversation.is_none() {
         return Err(AppError::NotFound);
+    }
+    let active_run: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE conversation_id=$1 \
+         AND state NOT IN ('completed','failed','canceled'))",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if active_run {
+        return Err(AppError::Conflict(
+            "wait for the active conversation run to finish",
+        ));
     }
     let ordinal: i64 = sqlx::query_scalar(
         "SELECT coalesce(max(ordinal),0)+1 FROM messages WHERE conversation_id=$1",
@@ -232,7 +253,7 @@ pub async fn list_messages(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<MessageResponse>>, AppError> {
     let user = require_user(&state, &headers).await?;
-    conversation_row(&state, user.profile_id, id).await?;
+    conversation_row(&state, &user, id).await?;
     let rows = sqlx::query(
         "SELECT id,ordinal,role,content->>'text' AS text,provider,model,created_at \
          FROM messages WHERE conversation_id=$1 ORDER BY ordinal LIMIT 10000",
@@ -253,11 +274,15 @@ pub async fn fork_conversation(
     require_writer(&user)?;
     let mut tx = state.pool.begin().await?;
     let source = sqlx::query(
-        "SELECT id,title,workspace_id FROM conversations \
-         WHERE id=$1 AND profile_id=$2 AND status <> 'deleted' FOR UPDATE",
+        "SELECT id,title,workspace_id FROM conversations c \
+         WHERE id=$1 AND profile_id=$2 AND status <> 'deleted' AND ( \
+         $4 IN ('OWNER','ADMIN') OR (workspace_id IS NULL AND created_by_user_id=$3) OR EXISTS( \
+         SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3 AND member.access IN ('OWNER','EDITOR'))) FOR UPDATE",
     )
     .bind(id)
     .bind(user.profile_id)
+    .bind(user.id)
+    .bind(&user.role)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(AppError::NotFound)?;
@@ -327,9 +352,18 @@ pub async fn delete_conversation(
     let user = require_user(&state, &headers).await?;
     require_writer(&user)?;
     let mut tx = state.pool.begin().await?;
-    let result = sqlx::query("DELETE FROM conversations WHERE id=$1 AND profile_id=$2")
+    let result = sqlx::query(
+        "WITH target AS MATERIALIZED (SELECT c.id FROM conversations c WHERE id=$1 AND profile_id=$2 AND ( \
+         $4 IN ('OWNER','ADMIN') OR (workspace_id IS NULL AND created_by_user_id=$3) OR EXISTS( \
+         SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3 AND member.access='OWNER')) FOR UPDATE), \
+         deleted_turns AS (DELETE FROM agent_runs run USING target WHERE run.conversation_id=target.id \
+         AND run.run_kind='conversation_turn' RETURNING run.id) \
+         DELETE FROM conversations c USING target WHERE c.id=target.id",
+    )
         .bind(id)
         .bind(user.profile_id)
+        .bind(user.id)
+        .bind(&user.role)
         .execute(&mut *tx)
         .await?;
     if result.rows_affected() == 0 {
@@ -361,13 +395,15 @@ pub async fn search_conversations(
             "search query must contain 1 to 1000 characters".into(),
         ));
     }
-    authorize_workspace(&state, user.profile_id, query.workspace_id).await?;
+    authorize_workspace(&state, &user, query.workspace_id, false).await?;
     let rows = sqlx::query(
         "SELECT c.id AS conversation_id,m.id AS message_id,c.title,m.role, \
          ts_headline('english',m.content->>'text',websearch_to_tsquery('english',$1),'MaxWords=32,MinWords=8') AS snippet, \
          ts_rank_cd(to_tsvector('english',coalesce(m.content->>'text','')),websearch_to_tsquery('english',$1)) AS relevance,m.created_at \
          FROM messages m JOIN conversations c ON c.id=m.conversation_id \
-         WHERE c.profile_id=$2 AND c.status <> 'deleted' AND ($3::uuid IS NULL OR c.workspace_id=$3) \
+          WHERE c.profile_id=$2 AND c.status <> 'deleted' AND ($3::uuid IS NULL OR c.workspace_id=$3) \
+            AND ($6 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$5) OR EXISTS( \
+                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$5)) \
            AND to_tsvector('english',coalesce(m.content->>'text','')) @@ websearch_to_tsquery('english',$1) \
          ORDER BY relevance DESC,m.created_at DESC LIMIT $4",
     )
@@ -375,6 +411,8 @@ pub async fn search_conversations(
     .bind(user.profile_id)
     .bind(query.workspace_id)
     .bind(query.limit.unwrap_or(50).clamp(1, 200))
+    .bind(user.id)
+    .bind(&user.role)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(
@@ -404,8 +442,8 @@ async fn insert_conversation(
     let book_id = Uuid::now_v7();
     let now = OffsetDateTime::now_utc();
     sqlx::query(
-        "INSERT INTO conversations (id,profile_id,workspace_id,title,forked_from_id,forked_at_message_id,created_at,updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$7)",
+        "INSERT INTO conversations (id,profile_id,workspace_id,title,forked_from_id,forked_at_message_id,created_by_user_id,created_at,updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)",
     )
     .bind(id)
     .bind(user.profile_id)
@@ -413,6 +451,7 @@ async fn insert_conversation(
     .bind(title)
     .bind(forked_from_id)
     .bind(forked_at_message_id)
+    .bind(user.id)
     .bind(now)
     .execute(&mut **tx)
     .await?;
@@ -454,7 +493,7 @@ async fn insert_conversation(
     })
 }
 
-async fn rebuild_projection(
+pub(crate) async fn rebuild_projection(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     conversation_id: Uuid,
     changed_by: Option<Uuid>,
@@ -485,15 +524,19 @@ async fn rebuild_projection(
 
 async fn conversation_row(
     state: &AppState,
-    profile_id: Uuid,
+    user: &AuthenticatedUser,
     id: Uuid,
 ) -> Result<sqlx::postgres::PgRow, AppError> {
     sqlx::query(
         "SELECT id,title,workspace_id,status,forked_from_id,forked_at_message_id,created_at,updated_at \
-         FROM conversations WHERE id=$1 AND profile_id=$2 AND status <> 'deleted'",
+         FROM conversations c WHERE id=$1 AND profile_id=$2 AND status <> 'deleted' AND ( \
+         $4 IN ('OWNER','ADMIN') OR (workspace_id IS NULL AND created_by_user_id=$3) OR EXISTS( \
+         SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3))",
     )
     .bind(id)
-    .bind(profile_id)
+    .bind(user.profile_id)
+    .bind(user.id)
+    .bind(&user.role)
     .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)
@@ -501,15 +544,22 @@ async fn conversation_row(
 
 async fn authorize_workspace(
     state: &AppState,
-    profile_id: Uuid,
+    user: &AuthenticatedUser,
     workspace_id: Option<Uuid>,
+    require_write: bool,
 ) -> Result<(), AppError> {
     if let Some(workspace_id) = workspace_id {
         let exists: bool = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM workspaces WHERE id=$1 AND profile_id=$2)",
+            "SELECT EXISTS(SELECT 1 FROM workspaces workspace WHERE id=$1 AND profile_id=$2 AND ( \
+             $4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member \
+             WHERE member.workspace_id=workspace.id AND member.user_id=$3 \
+             AND (NOT $5::boolean OR member.access IN ('OWNER','EDITOR')))))",
         )
         .bind(workspace_id)
-        .bind(profile_id)
+        .bind(user.profile_id)
+        .bind(user.id)
+        .bind(&user.role)
+        .bind(require_write)
         .fetch_one(&state.pool)
         .await?;
         if !exists {

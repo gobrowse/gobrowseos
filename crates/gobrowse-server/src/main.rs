@@ -2,7 +2,7 @@ use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use gobrowse_server::{AppState, config::Settings, db, doctor, embedding, router};
+use gobrowse_server::{AppState, config::Settings, db, doctor, embedding, router, run_api};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -134,7 +134,11 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         .context("bind HTTP listener")?;
     info!(%bind, "Gobrowse OS listening");
     let cancellation = CancellationToken::new();
-    let worker = tokio::spawn(embedding::run_worker(
+    let embedding_worker = tokio::spawn(embedding::run_worker(
+        state.clone(),
+        cancellation.child_token(),
+    ));
+    let run_worker = tokio::spawn(run_api::run_worker(
         state.clone(),
         cancellation.child_token(),
     ));
@@ -147,11 +151,17 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         .await
         .context("serve HTTP");
     cancellation.cancel();
-    if tokio::time::timeout(Settings::shutdown_timeout(), worker)
+    if tokio::time::timeout(Settings::shutdown_timeout(), embedding_worker)
         .await
         .is_err()
     {
         error!("embedding worker did not stop before the shutdown deadline");
+    }
+    if tokio::time::timeout(Settings::shutdown_timeout(), run_worker)
+        .await
+        .is_err()
+    {
+        error!("run worker did not stop before the shutdown deadline");
     }
     result
 }

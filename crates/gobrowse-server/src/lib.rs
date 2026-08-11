@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod autobiography_api;
+pub mod chat;
 pub mod config;
 pub mod conversation_api;
 pub mod db;
@@ -9,11 +10,13 @@ pub mod embedding;
 pub mod embedding_api;
 pub mod error;
 pub mod library_api;
+pub mod model_api;
 pub mod realtime;
+pub mod run_api;
 pub mod vault;
 pub mod vault_api;
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -25,6 +28,8 @@ use axum::{
     routing::{get, post},
 };
 use sqlx::PgPool;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tower_http::{
     catch_panic::CatchPanicLayer,
     compression::CompressionLayer,
@@ -43,6 +48,7 @@ pub struct AppState {
     pub settings: Arc<Settings>,
     pub passwords: PasswordRuntime,
     pub vault: Vault,
+    pub run_cancellations: Arc<RwLock<HashMap<uuid::Uuid, (uuid::Uuid, CancellationToken)>>>,
 }
 
 impl AppState {
@@ -54,6 +60,7 @@ impl AppState {
             settings: Arc::new(settings),
             passwords,
             vault,
+            run_cancellations: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 }
@@ -111,6 +118,22 @@ pub fn router(state: AppState) -> Router {
             post(embedding_api::retry_job),
         )
         .route(
+            "/models/chat",
+            get(model_api::list_chat_models).post(model_api::create_chat_model),
+        )
+        .route(
+            "/models/chat/{id}/activate",
+            post(model_api::activate_chat_model),
+        )
+        .route(
+            "/conversations/{id}/runs",
+            get(run_api::get_active_run).post(run_api::start_run),
+        )
+        .route("/conversations/{id}/turns", post(run_api::start_turn))
+        .route("/runs/{id}", get(run_api::get_run))
+        .route("/runs/{id}/events", get(run_api::list_run_events))
+        .route("/runs/{id}/cancel", post(run_api::cancel_run))
+        .route(
             "/vault/secrets",
             get(vault_api::list_secrets).post(vault_api::create_secret),
         )
@@ -145,7 +168,7 @@ pub fn router(state: AppState) -> Router {
             post(autobiography_api::review_proposal),
         )
         .route("/autobiography/rollback", post(autobiography_api::rollback))
-        .route("/realtime", get(realtime::upgrade));
+        .route("/runs/{id}/realtime", get(realtime::upgrade));
 
     Router::new()
         .route("/health/live", get(api::live))

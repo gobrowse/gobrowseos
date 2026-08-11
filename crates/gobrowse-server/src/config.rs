@@ -113,6 +113,8 @@ pub struct FeatureSettings {
     pub lsp: bool,
     pub otel: bool,
     pub local_embeddings: bool,
+    #[serde(default)]
+    pub local_models: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -212,5 +214,15 @@ mod tests {
     #[test]
     fn vault_defaults_to_first_key_version() {
         assert_eq!(VaultSettings::default().key_version, 1);
+    }
+
+    #[test]
+    fn milestone2_feature_config_defaults_local_models_off() {
+        let features: FeatureSettings = serde_json::from_value(serde_json::json!({
+            "sandbox":false,"browser":false,"messaging":false,"voice":false,
+            "media":false,"lsp":false,"otel":false,"local_embeddings":true
+        }))
+        .expect("deserialize Milestone 2 feature settings");
+        assert!(!features.local_models);
     }
 }

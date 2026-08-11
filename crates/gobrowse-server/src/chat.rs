@@ -1,0 +1,472 @@
+use std::{
+    collections::{BTreeSet, VecDeque},
+    pin::Pin,
+    sync::Arc,
+};
+
+use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt, stream};
+use gobrowse_core::model::{
+    ContentPart, MessageRole, ModelEvent, ModelIdentity, ModelProvider, ModelRequest, ModelRoute,
+    ModelStream, ProviderError,
+};
+use secrecy::{ExposeSecret, SecretString};
+use serde::Serialize;
+use sqlx::Row;
+use tracing::warn;
+use url::Url;
+use uuid::Uuid;
+
+use crate::{AppState, embedding, error::AppError};
+
+struct HttpChatProvider {
+    id: String,
+    provider_type: String,
+    base_url: Url,
+    token: Option<SecretString>,
+    http: reqwest::Client,
+}
+
+#[derive(Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: &'a [ChatMessage],
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Serialize)]
+struct OllamaOptions {
+    num_predict: u32,
+}
+
+#[derive(Serialize)]
+struct ChatMessage {
+    role: &'static str,
+    content: String,
+}
+
+struct ProviderStreamState {
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    buffer: Vec<u8>,
+    pending: VecDeque<ModelEvent>,
+    provider_type: String,
+    sse_data: String,
+    received_bytes: usize,
+    completed: bool,
+}
+
+#[async_trait]
+impl ModelProvider for HttpChatProvider {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProviderError> {
+        let messages: Vec<_> = request
+            .messages
+            .iter()
+            .map(|message| ChatMessage {
+                role: role_name(message.role),
+                content: content_text(&message.content),
+            })
+            .collect();
+        let path = if self.provider_type == "ollama" {
+            "api/chat"
+        } else {
+            "chat/completions"
+        };
+        let endpoint = endpoint(&self.base_url, path)?;
+        let body = ChatRequest {
+            model: &request.model.model,
+            messages: &messages,
+            stream: true,
+            max_tokens: (self.provider_type != "ollama").then_some(request.max_output_tokens),
+            options: (self.provider_type == "ollama").then_some(OllamaOptions {
+                num_predict: request.max_output_tokens,
+            }),
+        };
+        let mut outgoing = self.http.post(endpoint).json(&body);
+        if let Some(token) = &self.token {
+            outgoing = outgoing.bearer_auth(token.expose_secret());
+        }
+        let response = outgoing.send().await.map_err(map_transport_error)?;
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ) {
+            return Err(ProviderError::InvalidCredentials);
+        }
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let retry_after_seconds = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok());
+            return Err(ProviderError::RateLimited {
+                retry_after_seconds,
+            });
+        }
+        if status.is_server_error() {
+            return Err(ProviderError::TemporaryUnavailable);
+        }
+        if !status.is_success() {
+            return Err(ProviderError::InvalidResponse);
+        }
+        let state = ProviderStreamState {
+            stream: Box::pin(response.bytes_stream()),
+            buffer: Vec::new(),
+            pending: VecDeque::new(),
+            provider_type: self.provider_type.clone(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        Ok(Box::pin(stream::unfold(state, next_provider_event)))
+    }
+}
+
+pub async fn load_routes(
+    state: &AppState,
+    profile_id: Uuid,
+    requested_model_id: Option<&str>,
+) -> Result<Vec<ModelRoute>, AppError> {
+    let rows = sqlx::query(
+        "WITH primary_model AS ( \
+             SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id \
+             JOIN profiles profile ON profile.id=p.profile_id \
+             WHERE p.profile_id=$1 AND p.enabled AND m.enabled AND 'text'=ANY(m.capabilities) \
+               AND ($2::text IS NULL OR m.id=$2) \
+             ORDER BY (m.id=profile.active_chat_model_id) DESC,m.priority DESC,m.id LIMIT 1 \
+         ), route_ids AS ( \
+             SELECT id AS model_id,0 AS position FROM primary_model \
+             UNION ALL \
+             SELECT route.fallback_model_id,route.position+1 FROM model_fallback_routes route \
+             JOIN primary_model ON primary_model.id=route.primary_model_id WHERE route.profile_id=$1 \
+         ) \
+         SELECT m.id,m.model_reference,p.id AS provider_id,p.provider_type,p.base_url,p.secret_reference \
+         FROM route_ids route JOIN models m ON m.id=route.model_id JOIN providers p ON p.id=m.provider_id \
+         WHERE p.profile_id=$1 AND p.enabled AND m.enabled AND 'text'=ANY(m.capabilities) ORDER BY route.position",
+    )
+    .bind(profile_id)
+    .bind(requested_model_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let mut routes = Vec::with_capacity(rows.len());
+    for row in rows {
+        let model_id: String = row.get("id");
+        let provider_type: String = row.get("provider_type");
+        if !matches!(provider_type.as_str(), "openai_compatible" | "ollama") {
+            continue;
+        }
+        let base_url_value: Option<String> = row.try_get("base_url")?;
+        let Some(base_url_value) = base_url_value else {
+            warn!(model_id, "skipping chat route without base URL");
+            continue;
+        };
+        let Ok(base_url) = Url::parse(&base_url_value) else {
+            warn!(model_id, "skipping chat route with invalid base URL");
+            continue;
+        };
+        let secret_reference: Option<String> = row.get("secret_reference");
+        let token = match secret_reference {
+            Some(secret_id) => {
+                let Some(host) = base_url.host_str() else {
+                    warn!(model_id, "skipping chat route without provider host");
+                    continue;
+                };
+                match state
+                    .vault
+                    .resolve_for_provider(&state.pool, profile_id, &secret_id, host)
+                    .await
+                {
+                    Ok(token) => Some(token),
+                    Err(error) => {
+                        warn!(model_id, error=%error, "skipping chat route with unavailable credential");
+                        continue;
+                    }
+                }
+            }
+            None => None,
+        };
+        let http = match embedding::provider_http_client(
+            &base_url,
+            &provider_type,
+            token.is_some(),
+            state.settings.features.local_models,
+            None,
+        )
+        .await
+        {
+            Ok(http) => http,
+            Err(error) => {
+                warn!(model_id, error=%error, "skipping chat route rejected by network policy");
+                continue;
+            }
+        };
+        let provider_id: String = row.get("provider_id");
+        let model_reference: String = row.get("model_reference");
+        routes.push(ModelRoute {
+            provider: Arc::new(HttpChatProvider {
+                id: provider_id.clone(),
+                provider_type,
+                base_url,
+                token,
+                http,
+            }),
+            identity: ModelIdentity {
+                provider: provider_id,
+                model: model_reference,
+            },
+        });
+    }
+    Ok(routes)
+}
+
+pub fn request(
+    messages: Vec<gobrowse_core::model::NeutralMessage>,
+    max_output_tokens: u32,
+) -> ModelRequest {
+    ModelRequest {
+        model: ModelIdentity {
+            provider: String::new(),
+            model: String::new(),
+        },
+        messages,
+        tools: vec![],
+        max_output_tokens,
+        required_capabilities: BTreeSet::new(),
+    }
+}
+
+fn role_name(role: MessageRole) -> &'static str {
+    match role {
+        MessageRole::System => "system",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    }
+}
+
+fn content_text(parts: &[ContentPart]) -> String {
+    parts
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.clone()),
+            ContentPart::ToolResult { output, .. } => Some(output.to_string()),
+            ContentPart::ImageReference { .. } | ContentPart::ToolCall { .. } => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn endpoint(base: &Url, path: &str) -> Result<Url, ProviderError> {
+    let mut base = base.clone();
+    if !base.path().ends_with('/') {
+        base.set_path(&format!("{}/", base.path()));
+    }
+    base.join(path).map_err(|_| ProviderError::InvalidResponse)
+}
+
+fn map_transport_error(error: reqwest::Error) -> ProviderError {
+    if error.is_timeout() {
+        ProviderError::Timeout
+    } else {
+        ProviderError::TemporaryUnavailable
+    }
+}
+
+async fn next_provider_event(
+    mut state: ProviderStreamState,
+) -> Option<(Result<ModelEvent, ProviderError>, ProviderStreamState)> {
+    loop {
+        if let Some(event) = state.pending.pop_front() {
+            return Some((Ok(event), state));
+        }
+        if let Some(newline) = state.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = state.buffer.drain(..=newline).collect::<Vec<_>>();
+            match parse_provider_line(&mut state, &line) {
+                Ok(Some(event)) => return Some((Ok(event), state)),
+                Ok(None) => continue,
+                Err(error) => return Some((Err(error), state)),
+            }
+        }
+        match state.stream.next().await {
+            Some(Ok(chunk)) => {
+                state.received_bytes = state.received_bytes.saturating_add(chunk.len());
+                if state.received_bytes > 4 * 1024 * 1024 {
+                    return Some((Err(ProviderError::InvalidResponse), state));
+                }
+                state.buffer.extend_from_slice(&chunk);
+            }
+            Some(Err(error)) => return Some((Err(map_transport_error(error)), state)),
+            None if !state.buffer.is_empty() => {
+                let line = std::mem::take(&mut state.buffer);
+                match parse_provider_line(&mut state, &line) {
+                    Ok(Some(event)) => return Some((Ok(event), state)),
+                    Ok(None) if state.completed => continue,
+                    Ok(None) | Err(_) => {
+                        return Some((Err(ProviderError::InvalidResponse), state));
+                    }
+                }
+            }
+            None if !state.sse_data.is_empty() => match parse_provider_line(&mut state, b"") {
+                Ok(Some(event)) => return Some((Ok(event), state)),
+                Ok(None) if state.completed => continue,
+                Ok(None) | Err(_) => return Some((Err(ProviderError::InvalidResponse), state)),
+            },
+            None if state.completed => return None,
+            None => return Some((Err(ProviderError::InvalidResponse), state)),
+        }
+    }
+}
+
+fn parse_provider_line(
+    state: &mut ProviderStreamState,
+    line: &[u8],
+) -> Result<Option<ModelEvent>, ProviderError> {
+    let line = std::str::from_utf8(line)
+        .map_err(|_| ProviderError::InvalidResponse)?
+        .trim();
+    let payload = if state.provider_type == "ollama" {
+        if line.is_empty() {
+            return Ok(None);
+        }
+        line.to_owned()
+    } else {
+        if let Some(data) = line.strip_prefix("data:").map(str::trim_start) {
+            if !state.sse_data.is_empty() {
+                state.sse_data.push('\n');
+            }
+            state.sse_data.push_str(data);
+            return Ok(None);
+        }
+        if !line.is_empty() {
+            return Ok(None);
+        }
+        let payload = std::mem::take(&mut state.sse_data);
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        if payload == "[DONE]" {
+            state.completed = true;
+            return Ok(Some(ModelEvent::Completed));
+        }
+        payload
+    };
+    let value: serde_json::Value =
+        serde_json::from_str(&payload).map_err(|_| ProviderError::InvalidResponse)?;
+    if state.provider_type == "ollama" {
+        let text = value["message"]["content"].as_str().unwrap_or_default();
+        if value["done"].as_bool().unwrap_or(false) {
+            state.pending.push_back(ModelEvent::Usage {
+                input_tokens: value["prompt_eval_count"].as_u64().unwrap_or(0),
+                output_tokens: value["eval_count"].as_u64().unwrap_or(0),
+                cached_tokens: 0,
+            });
+            state.pending.push_back(ModelEvent::Completed);
+            state.completed = true;
+        }
+        return if text.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(ModelEvent::TextDelta { text: text.into() }))
+        };
+    }
+    if let Some(usage) = value.get("usage") {
+        state.pending.push_back(ModelEvent::Usage {
+            input_tokens: usage["prompt_tokens"].as_u64().unwrap_or(0),
+            output_tokens: usage["completion_tokens"].as_u64().unwrap_or(0),
+            cached_tokens: usage["prompt_tokens_details"]["cached_tokens"]
+                .as_u64()
+                .unwrap_or(0),
+        });
+    }
+    let text = value["choices"][0]["delta"]["content"]
+        .as_str()
+        .unwrap_or_default();
+    if value["choices"][0]["finish_reason"].is_string() {
+        state.pending.push_back(ModelEvent::Completed);
+        state.completed = true;
+    }
+    if text.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(ModelEvent::TextDelta { text: text.into() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ollama_lines_preserve_unicode() {
+        let mut state = ProviderStreamState {
+            stream: Box::pin(stream::empty()),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "ollama".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        let event = parse_provider_line(
+            &mut state,
+            r#"{"message":{"content":"🦀"},"done":false}"#.as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(event, Some(ModelEvent::TextDelta { text }) if text == "🦀"));
+    }
+
+    #[test]
+    fn openai_sse_dispatches_only_at_event_boundary() {
+        let mut state = ProviderStreamState {
+            stream: Box::pin(stream::empty()),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "openai_compatible".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        assert!(
+            parse_provider_line(
+                &mut state,
+                br#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            matches!(parse_provider_line(&mut state, b"").unwrap(), Some(ModelEvent::TextDelta { text }) if text == "hi")
+        );
+    }
+
+    #[tokio::test]
+    async fn final_ollama_record_without_newline_drains_terminal_events() {
+        let state = ProviderStreamState {
+            stream: Box::pin(stream::iter([Ok(Bytes::from_static(
+                br#"{"message":{"content":""},"done":true,"prompt_eval_count":2,"eval_count":1}"#,
+            ))])),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "ollama".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        let events = stream::unfold(state, next_provider_event)
+            .collect::<Vec<_>>()
+            .await;
+        assert!(matches!(
+            events.as_slice(),
+            [Ok(ModelEvent::Usage { .. }), Ok(ModelEvent::Completed)]
+        ));
+    }
+}
