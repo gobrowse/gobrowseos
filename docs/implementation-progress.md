@@ -47,6 +47,16 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 
 ## Active Milestone
 
-- Milestone 4 is active: implement the sandbox daemon boundary, rootless runtime adapter, PTY lifecycle, filesystem APIs, explicit egress policy, durable terminal metadata, and security-focused integration tests while sandboxing remains release-gated off.
-- The first Milestone 4 foundation is local only: versioned authenticated Unix-socket contracts, bounded connections, operations and replay, peer UID checks, a root-refusing Podman adapter, terminal-monotonic lifecycle cleanup, initial PTY sizing, explicit network/storage/session ceilings, and bounded workspace filesystem operations. It passes 63 focused core/daemon tests but remains intentionally unreachable from the app.
-- Release blockers remain descriptor-relative filesystem operations, quota and restricted-egress provisioning evidence, durable PTY output/reconciliation, schema/API authorization, and runtime-backed adversarial tests.
+- Milestone 4 unit-provable work is complete and tagged `milestone-4` at `8869081` (154 nextest, 0 skipped, against real PostgreSQL 17 + pgvector). Sandboxd remains intentionally unreachable from the app.
+- Restricted-egress network attestation runs at daemon startup (`RestrictedNetworkAttestation` in `gobrowse-core/src/sandbox.rs`; `attest_restricted_network` in `runtime.rs`); `start_spec` rejects `NetworkPolicy::Restricted` until the cache is populated. Schema and `SANDBOX_PROTOCOL_VERSION` unchanged.
+- Daemon restart reconciliation is proven through the `Daemon::serve_until` wire path: reconciled terminals surface `TerminalState::Lost`, durable pre-restart output replays by cursor, surviving containers are removed, and pending inputs become `JournalError::OutcomeUnknown`.
+- Descriptor-relative filesystem operations held against a concurrent symlink-swap race for all six mutating methods (`write`/`patch`/`mkdir`/`move_entry`/`copy`/`delete`); no `LimitExceeded` escape.
+- Remaining Milestone 4 release gates are NOT unit-provable: runtime-backed adversarial tests require a real Podman/kernel boundary (FakePodman emulates the runtime), and schema/API authorization is app-side while sandboxd stays unwired.
+
+## Completed Milestone (auth/webhook/MCP subset)
+
+- Login and owner-setup throttling persists attempts with a uniform Unauthorized response (per `docs/threat-model.md` "uniform login failures"); schema bumped to 4 via `0004_login_attempts.sql`.
+- Webhook HMAC-SHA256 signature verification (manual RFC-2104, no `hmac` dependency) and replay idempotency via `webhook_deliveries` PK; webhooks excluded from the CSRF origin guard because they use signature auth; schema bumped to 5 via `0005_webhooks.sql`.
+- Session rotation invalidates all prior sessions through `users.auth_epoch + 1` (column and enforcement present since `0001_initial.sql`); disabled users cannot log in; non-admins cannot rotate others.
+- CSRF closure: `origin_guard` now rejects missing Origin on state-changing methods and `Sec-Fetch-Site: cross-site`; WebSocket `validate_origin` rejects empty/mismatched Origin and wrong-scheme; latent no-Origin requests in two existing test helpers were corrected.
+- MCP doctor pure-logic validator flags remote/dynamic `$ref`, oversized (>256 KiB), and depth-bombed tool schemas in `gobrowse-core/src/mcp.rs`, reusing the existing `McpDoctorReport`/`DiagnosticStatus`. OAuth matrix and real-server conformance remain release-gated.
