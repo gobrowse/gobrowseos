@@ -4,14 +4,16 @@ This file is the durable handoff record for work after the `milestone-1` tag at 
 
 ## Release State
 
-- Milestone 1 remains tagged and its backup is retained. Milestone 2 commit `574188d` is deployed privately and verified.
+- Milestone 1 and Milestone 2 remain tagged and their backups are retained. Milestone 3 implementation commit `7ee7ff6` is deployed privately and verified.
 - Public exposure remains disabled. The application binds to `127.0.0.1:8080` in the deployment.
 - The pre-migration backup is `/opt/gobrowse-os/backups/pre-milestone-2.dump`; SHA-256 is `5977c99937699233650b91deb0c848baa44976f31f063a9b44a99138aa00ad26`.
-- The deployed Milestone 2 image digest is `sha256:c2c060cf38804a7c58d1c1400fb4118917acc6b16f449ed80d0468f5b845d606`; the live schema version is 2.
+- The retained Milestone 2 image digest is `sha256:c2c060cf38804a7c58d1c1400fb4118917acc6b16f449ed80d0468f5b845d606`; its released schema version was 2.
+- The pre-Milestone 3 backup is `/opt/gobrowse-os/backups/pre-milestone-3.dump`; SHA-256 is `1f08fa30439e613ee34a6562a4bf83274e8afd32df0ca4c40d091609e44727ab`.
+- The deployed Milestone 3 image digest is `sha256:448386209a27c1c700fd9c592de8325e45aea677d281497e12a6bbf6e277038a`; the live schema version is 3.
 
 ## Completed Milestone
 
-Milestone 2 makes the Library complete: enforceable Book scopes, immutable revision snapshots and rollback, conversation projections, Autobiography proposals, durable embedding jobs, provider-neutral embedding adapters, and authorized hybrid retrieval.
+Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral provider streams, idempotent atomic turns, leased multi-instance execution, fenced ordered events, cancellation and takeover, authorized context assembly, run-scoped realtime replay, and transcript/model controls in the operator UI.
 
 ## Decisions
 
@@ -41,8 +43,8 @@ Milestone 2 makes the Library complete: enforceable Book scopes, immutable revis
 - 2026-08-10: Stabilized Milestone 3 repeated the 40/40 fresh-database suite, native/WASM Clippy, release Trunk build, desktop/mobile browser flow, `cargo deny --offline check`, and offline `cargo audit`. Deny reported allowed dependency-duplication warnings; audit reported the allowed transitive unmaintained `proc-macro-error2` warning and no unignored vulnerability.
 - 2026-08-10: The update runbook now stops the previous app before schema migration and requires database restore before old-image rollback; this prevents Milestone 2 writes during the schema-3 transition.
 - 2026-08-10: The reviewed Milestone 3 implementation was committed as `7ee7ff6`; closure review found no remaining high- or medium-severity application findings.
+- 2026-08-11: The private schema-3 deployment passed backup verification, migration/backfill integrity, health/readiness, doctor, static UI, unauthenticated API denial, loopback-only publication, read-only root filesystem, non-root identity, dropped capabilities, and resource checks. The empty deployment remains unclaimed; authenticated chat/provider flows were verified locally without creating production identity or provider state.
 
 ## Active Milestone
 
-- Milestone 3 is implemented locally and not deployed: dynamic chat provider registry, bounded neutral streaming, durable leased runs and ordered events, authorized context assembly, explicit fallback classification, cancellation, deterministic provider E2E tests, and operator UI for transcripts and model routes.
-- Before release: create and verify a pre-migration backup, deploy privately with the previous app stopped during migration, and repeat health/version/doctor/non-root functional checks.
+- Milestone 4 is active: implement the sandbox daemon boundary, rootless runtime adapter, PTY lifecycle, filesystem APIs, explicit egress policy, durable terminal metadata, and security-focused integration tests while sandboxing remains release-gated off.
