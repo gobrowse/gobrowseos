@@ -1423,6 +1423,25 @@ mod tests {
         }
     }
 
+    fn spawn_symlink_swap_attacker(
+        workspace_path: &Path,
+        other_path: &Path,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        let stable = workspace_path.join("stable");
+        let parked = workspace_path.join("parked");
+        let other = other_path.to_path_buf();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                if fs::rename(&stable, &parked).is_ok() {
+                    let _ = symlink(&other, &stable);
+                    let _ = fs::remove_file(&stable);
+                    let _ = fs::rename(&parked, &stable);
+                }
+            }
+        })
+    }
+
     #[test]
     fn trusted_root_must_be_absolute_preexisting_and_have_private_staging() {
         assert!(matches!(
@@ -1666,26 +1685,81 @@ mod tests {
         ));
 
         let stop = Arc::new(AtomicBool::new(false));
-        let attacker_stop = Arc::clone(&stop);
-        let attacker_workspace = workspace_path.clone();
-        let attacker_other = other_path.clone();
-        let attacker = thread::spawn(move || {
-            let stable = attacker_workspace.join("stable");
-            let parked = attacker_workspace.join("parked");
-            while !attacker_stop.load(Ordering::Relaxed) {
-                if fs::rename(&stable, &parked).is_ok() {
-                    let _ = symlink(&attacker_other, &stable);
-                    let _ = fs::remove_file(&stable);
-                    let _ = fs::rename(&parked, &stable);
-                }
-            }
-        });
+        let attacker = spawn_symlink_swap_attacker(&workspace_path, &other_path, Arc::clone(&stop));
 
         for _ in 0..2_000 {
             if let Ok((bytes, _)) = filesystem.read(workspace, "stable/value") {
                 assert_eq!(bytes, b"inside");
             }
         }
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+        assert_eq!(fs::read(other_path.join("secret")).unwrap(), b"outside");
+        assert!(workspace_path.metadata().unwrap().ino() != other_path.metadata().unwrap().ino());
+    }
+
+    #[test]
+    fn mutating_ops_survive_symlink_swap_without_escape() {
+        let root = TestDirectory::new();
+        let filesystem = Arc::new(Filesystem::new(&root.0).unwrap());
+        let workspace = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let workspace_path = filesystem.ensure_workspace(workspace).unwrap();
+        let other_path = filesystem.ensure_workspace(other).unwrap();
+        fs::write(other_path.join("secret"), b"outside").unwrap();
+        fs::create_dir(workspace_path.join("stable")).unwrap();
+        fs::write(workspace_path.join("stable/value"), b"inside").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker = spawn_symlink_swap_attacker(&workspace_path, &other_path, Arc::clone(&stop));
+
+        let inside_hash = sha256(b"inside");
+
+        for _ in 0..2_000 {
+            match filesystem.write(workspace, "stable/value", b"overwrite") {
+                Ok(hash) => assert_eq!(hash, sha256(b"overwrite")),
+                Err(e) => assert!(
+                    !matches!(e, FilesystemError::LimitExceeded),
+                    "write returned LimitExceeded: {e}"
+                ),
+            }
+            match filesystem.patch(workspace, "stable/value", &inside_hash, b"patched") {
+                Ok(hash) => assert_eq!(hash, sha256(b"patched")),
+                Err(e) => assert!(
+                    !matches!(e, FilesystemError::LimitExceeded),
+                    "patch returned LimitExceeded: {e}"
+                ),
+            }
+            match filesystem.mkdir(workspace, "stable/sub") {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !matches!(e, FilesystemError::LimitExceeded),
+                    "mkdir returned LimitExceeded: {e}"
+                ),
+            }
+            match filesystem.move_entry(workspace, "stable/sub", "stable/moved") {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !matches!(e, FilesystemError::LimitExceeded),
+                    "move_entry returned LimitExceeded: {e}"
+                ),
+            }
+            match filesystem.copy(workspace, "stable/value", "stable/copy") {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !matches!(e, FilesystemError::LimitExceeded),
+                    "copy returned LimitExceeded: {e}"
+                ),
+            }
+            match filesystem.delete(workspace, "stable/copy") {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !matches!(e, FilesystemError::LimitExceeded),
+                    "delete returned LimitExceeded: {e}"
+                ),
+            }
+        }
+
         stop.store(true, Ordering::Relaxed);
         attacker.join().unwrap();
         assert_eq!(fs::read(other_path.join("secret")).unwrap(), b"outside");
