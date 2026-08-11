@@ -1137,10 +1137,19 @@ async fn request_json(
     cookie: &str,
     body: Option<Value>,
 ) -> (StatusCode, Value) {
+    // State-changing requests from a browser always include an Origin
+    // header. The default public_origin is http://localhost:8080.
+    let is_state_change = matches!(
+        method,
+        Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+    );
     let mut builder = Request::builder()
         .method(method)
         .uri(uri)
         .header(header::COOKIE, cookie);
+    if is_state_change {
+        builder = builder.header(header::ORIGIN, "http://localhost:8080");
+    }
     let body = if let Some(body) = body {
         builder = builder.header(header::CONTENT_TYPE, "application/json");
         Body::from(body.to_string())

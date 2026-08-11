@@ -150,13 +150,13 @@ fn validate_origin(state: &AppState, headers: &HeaderMap) -> Result<(), AppError
         .get(axum::http::header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .ok_or(AppError::Forbidden)?;
-    if origin.trim_end_matches('/')
-        != state
-            .settings
-            .http
-            .public_origin
-            .as_str()
-            .trim_end_matches('/')
+    let public_origin = state.settings.http.public_origin.as_str();
+    // Parse both as URLs for explicit scheme + host + port comparison.
+    let origin_parsed: url::Url = origin.parse().map_err(|_| AppError::Forbidden)?;
+    let expected_parsed: url::Url = public_origin.parse().map_err(|_| AppError::Forbidden)?;
+    if origin_parsed.scheme() != expected_parsed.scheme()
+        || origin_parsed.host() != expected_parsed.host()
+        || origin_parsed.port() != expected_parsed.port()
     {
         return Err(AppError::Forbidden);
     }
