@@ -95,6 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let workspace_resolver = filesystem.resolver();
     let recovery_store = filesystem.recovery_store();
+    let restricted_network = args.restricted_network.clone();
     let runtime = Arc::new(PodmanRuntime::new(PodmanConfig {
         executable: args.podman,
         image: args.image,
@@ -118,6 +119,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         workspace_resolver,
         recovery_store,
         terminal_journal: terminal_journal.clone(),
+        restricted_network,
     })?);
     let daemon = Daemon::new(
         DaemonConfig {

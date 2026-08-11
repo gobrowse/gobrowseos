@@ -6,6 +6,7 @@ use gobrowse_core::sandbox::{
     MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_OUTPUT_READ_BYTES, MAX_TERMINAL_OUTPUT_WAIT_MS,
     NetworkPolicy, RequestEnvelope, ResourceLimits, ResponseEnvelope, SANDBOX_PROTOCOL_VERSION,
     SandboxErrorCode, SandboxOperation, SandboxProtocolError, SandboxResult,
+    valid_restricted_network_name,
 };
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -846,32 +847,6 @@ fn retryable_accept_error(error: &std::io::Error) -> bool {
             | ErrorKind::OutOfMemory
     ) || matches!(error.raw_os_error(), Some(23 | 24 | 105))
     // Linux ENFILE, EMFILE, and ENOBUFS. The daemon is Linux/Podman-specific.
-}
-
-fn valid_restricted_network_name(name: &str) -> bool {
-    const RESERVED: [&str; 10] = [
-        "host",
-        "slirp4netns",
-        "pasta",
-        "container",
-        "ns",
-        "private",
-        "bridge",
-        "default",
-        "none",
-        "podman",
-    ];
-    let lower = name.to_ascii_lowercase();
-    // This proves only that the mode cannot select a Podman special namespace and that the name
-    // is deployment-owned. Provisioning and auditing the network's egress enforcement remains
-    // release-gated; sandboxd never creates a permissive fallback network.
-    name.starts_with("gobrowse-restricted-")
-        && name.len() > "gobrowse-restricted-".len()
-        && name.len() <= 128
-        && !RESERVED.contains(&lower.as_str())
-        && name
-            .chars()
-            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn is_non_idempotent(operation: &SandboxOperation) -> bool {

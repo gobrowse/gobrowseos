@@ -133,6 +133,8 @@ pub enum SandboxValidationError {
     InvalidLimits,
     #[error("resource limits exceed the hard safety ceiling")]
     LimitsExceedHardCeiling,
+    #[error("restricted network attestation failed")]
+    InvalidNetwork,
 }
 
 impl TerminalStartRequest {
@@ -462,6 +464,32 @@ pub enum SandboxErrorCode {
     Internal,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestrictedNetworkAttestation {
+    pub network_name: String,
+    pub subnet: IpAddr,
+    pub gateway: IpAddr,
+    pub dns: Vec<IpAddr>,
+}
+
+impl RestrictedNetworkAttestation {
+    pub fn validate(&self) -> Result<(), SandboxValidationError> {
+        if !valid_restricted_network_name(&self.network_name) {
+            return Err(SandboxValidationError::InvalidNetwork);
+        }
+        if !is_public_destination(self.gateway) {
+            return Err(SandboxValidationError::InvalidNetwork);
+        }
+        for &addr in &self.dns {
+            if !is_public_destination(addr) {
+                return Err(SandboxValidationError::InvalidNetwork);
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Returns true only for addresses suitable for restricted public egress.
 pub fn is_public_destination(ip: IpAddr) -> bool {
     match ip {
@@ -497,6 +525,29 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xffc0) == 0xfec0
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
+}
+
+pub fn valid_restricted_network_name(name: &str) -> bool {
+    const RESERVED: [&str; 10] = [
+        "host",
+        "slirp4netns",
+        "pasta",
+        "container",
+        "ns",
+        "private",
+        "bridge",
+        "default",
+        "none",
+        "podman",
+    ];
+    let lower = name.to_ascii_lowercase();
+    name.starts_with("gobrowse-restricted-")
+        && name.len() > "gobrowse-restricted-".len()
+        && name.len() <= 128
+        && !RESERVED.contains(&lower.as_str())
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 #[cfg(test)]
@@ -586,6 +637,78 @@ mod tests {
         assert!(is_public_destination(
             "2606:4700:4700::1111".parse().unwrap()
         ));
+    }
+
+    #[test]
+    fn restricted_network_name_rejects_reserved_and_invalid_shapes() {
+        assert!(valid_restricted_network_name("gobrowse-restricted-egress"));
+        assert!(valid_restricted_network_name(
+            "gobrowse-restricted-my_net-01"
+        ));
+        assert!(!valid_restricted_network_name("gobrowse-restricted-"));
+        assert!(!valid_restricted_network_name("host"));
+        assert!(!valid_restricted_network_name("none"));
+        assert!(!valid_restricted_network_name("podman"));
+        assert!(!valid_restricted_network_name("gobrowse-restricted-   "));
+        assert!(!valid_restricted_network_name(&"x".repeat(129)));
+    }
+
+    #[test]
+    fn restricted_network_attestation_rejects_metadata_and_private_ranges() {
+        let attestation = RestrictedNetworkAttestation {
+            network_name: "gobrowse-restricted-bad-gw".into(),
+            subnet: "192.168.0.0".parse().unwrap(),
+            gateway: "10.0.0.1".parse().unwrap(),
+            dns: vec![],
+        };
+        assert_eq!(
+            attestation.validate(),
+            Err(SandboxValidationError::InvalidNetwork)
+        );
+
+        let attestation = RestrictedNetworkAttestation {
+            network_name: "gobrowse-restricted-bad-dns".into(),
+            subnet: "93.184.216.0".parse().unwrap(),
+            gateway: "93.184.216.1".parse().unwrap(),
+            dns: vec!["169.254.169.254".parse().unwrap()],
+        };
+        assert_eq!(
+            attestation.validate(),
+            Err(SandboxValidationError::InvalidNetwork)
+        );
+
+        let attestation = RestrictedNetworkAttestation {
+            network_name: "gobrowse-restricted-bad-name".into(),
+            subnet: "93.184.216.0".parse().unwrap(),
+            gateway: "169.254.169.254".parse().unwrap(), // metadata
+            dns: vec![],
+        };
+        assert_eq!(
+            attestation.validate(),
+            Err(SandboxValidationError::InvalidNetwork)
+        );
+
+        let attestation = RestrictedNetworkAttestation {
+            network_name: "gobrowse-restricted-loopback".into(),
+            subnet: "127.0.0.0".parse().unwrap(),
+            gateway: "127.0.0.1".parse().unwrap(), // loopback
+            dns: vec![],
+        };
+        assert_eq!(
+            attestation.validate(),
+            Err(SandboxValidationError::InvalidNetwork)
+        );
+    }
+
+    #[test]
+    fn restricted_network_attestation_accepts_public_only() {
+        let attestation = RestrictedNetworkAttestation {
+            network_name: "gobrowse-restricted-egress".into(),
+            subnet: "93.184.216.0".parse().unwrap(),
+            gateway: "93.184.216.1".parse().unwrap(),
+            dns: vec!["1.1.1.1".parse().unwrap(), "8.8.8.8".parse().unwrap()],
+        };
+        assert_eq!(attestation.validate(), Ok(()));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    net::IpAddr,
     os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::Stdio,
@@ -13,8 +14,9 @@ use std::{
 use async_trait::async_trait;
 use gobrowse_core::sandbox::{
     MAX_TERMINAL_OUTPUT_CHUNK_BYTES, MAX_TERMINAL_PROCESS_BYTES,
-    MAX_TERMINAL_PROCESS_COMMAND_BYTES, MAX_TERMINAL_PROCESSES, SandboxProcess,
-    TerminalStartRequest, TerminalState, WorkspaceStorageIdentity, workspace_volume_name,
+    MAX_TERMINAL_PROCESS_COMMAND_BYTES, MAX_TERMINAL_PROCESSES, NetworkPolicy,
+    RestrictedNetworkAttestation, SandboxProcess, TerminalStartRequest, TerminalState,
+    WorkspaceStorageIdentity, workspace_volume_name,
 };
 use pty_process::{OwnedWritePty, Size};
 use sha2::{Digest, Sha256};
@@ -72,6 +74,7 @@ pub struct PodmanConfig {
     pub workspace_resolver: WorkspaceResolver,
     pub recovery_store: RecoveryStore,
     pub terminal_journal: TerminalJournal,
+    pub restricted_network: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -480,6 +483,7 @@ impl Registry {
 pub struct PodmanRuntime {
     config: PodmanConfig,
     registry: Arc<Mutex<Registry>>,
+    restricted_network_attestation: Arc<std::sync::Mutex<Option<RestrictedNetworkAttestation>>>,
 }
 
 impl PodmanRuntime {
@@ -518,9 +522,15 @@ impl PodmanRuntime {
         {
             return Err(RuntimeError::InvalidConfiguration);
         }
+        if let Some(ref name) = config.restricted_network
+            && !gobrowse_core::sandbox::valid_restricted_network_name(name)
+        {
+            return Err(RuntimeError::InvalidConfiguration);
+        }
         Ok(Self {
             config,
             registry: Arc::new(Mutex::new(Registry::new())),
+            restricted_network_attestation: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -543,6 +553,16 @@ impl PodmanRuntime {
             return Err(RuntimeError::InvalidConfiguration);
         }
         if !valid_runtime_network(start.request.network_policy, &start.network_name) {
+            return Err(RuntimeError::InvalidConfiguration);
+        }
+        if start.request.network_policy == NetworkPolicy::Restricted
+            && self.config.restricted_network.is_some()
+            && self
+                .restricted_network_attestation
+                .lock()
+                .unwrap()
+                .is_none()
+        {
             return Err(RuntimeError::InvalidConfiguration);
         }
 
@@ -675,6 +695,19 @@ impl PodmanRuntime {
                 "--format".into(),
                 "{{.Name}}|{{.Driver}}|{{json .Options}}|{{.Mountpoint}}".into(),
                 workspace_volume_name(workspace_id),
+            ],
+        }
+    }
+
+    pub fn network_inspect_spec(&self, name: &str) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "network".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{.Name}}|{{.Subnet}}|{{.Gateway}}|{{json .DNS}}".into(),
+                name.into(),
             ],
         }
     }
@@ -842,6 +875,51 @@ impl PodmanRuntime {
                 )
                 .map_err(|_| RuntimeError::WorkspaceVolumeInvalid)
         }
+    }
+
+    async fn attest_restricted_network(
+        &self,
+        name: &str,
+    ) -> Result<RestrictedNetworkAttestation, RuntimeError> {
+        let (status, output) = self
+            .run_output_bounded(self.network_inspect_spec(name), 4 * 1024)
+            .await?;
+        if !status.success() {
+            return Err(RuntimeError::InvalidConfiguration);
+        }
+        let output = String::from_utf8(output).map_err(|_| RuntimeError::InvalidConfiguration)?;
+        let output = output
+            .strip_suffix('\n')
+            .ok_or(RuntimeError::InvalidConfiguration)?;
+        let mut fields = output.splitn(4, '|');
+        let inspected_name = fields.next().ok_or(RuntimeError::InvalidConfiguration)?;
+        let subnet: IpAddr = fields
+            .next()
+            .and_then(|value| value.split('/').next())
+            .ok_or(RuntimeError::InvalidConfiguration)?
+            .parse()
+            .map_err(|_| RuntimeError::InvalidConfiguration)?;
+        let gateway: IpAddr = fields
+            .next()
+            .ok_or(RuntimeError::InvalidConfiguration)?
+            .parse()
+            .map_err(|_| RuntimeError::InvalidConfiguration)?;
+        let dns_json = fields.next().ok_or(RuntimeError::InvalidConfiguration)?;
+        let dns: Vec<IpAddr> =
+            serde_json::from_str(dns_json).map_err(|_| RuntimeError::InvalidConfiguration)?;
+        if inspected_name != name {
+            return Err(RuntimeError::InvalidConfiguration);
+        }
+        let attestation = RestrictedNetworkAttestation {
+            network_name: name.into(),
+            subnet,
+            gateway,
+            dns,
+        };
+        attestation
+            .validate()
+            .map_err(|_| RuntimeError::InvalidConfiguration)?;
+        Ok(attestation)
     }
 
     async fn inspect_paused(&self, terminal_id: Uuid) -> Result<bool, RuntimeError> {
@@ -1669,6 +1747,18 @@ impl SandboxRuntime for PodmanRuntime {
     }
 
     async fn reconcile_recoveries(&self) -> Result<(), RuntimeError> {
+        // Attest the restricted network if configured, caching it for start_spec.
+        if let Some(ref name) = self.config.restricted_network {
+            let needs_attest = self
+                .restricted_network_attestation
+                .lock()
+                .unwrap()
+                .is_none();
+            if needs_attest {
+                let attestation = self.attest_restricted_network(name).await?;
+                *self.restricted_network_attestation.lock().unwrap() = Some(attestation);
+            }
+        }
         self.config
             .terminal_journal
             .reconcile_restart()
@@ -2235,6 +2325,7 @@ while :; do sleep 0.1; done"#;
             workspace_resolver: filesystem.resolver(),
             recovery_store: filesystem.recovery_store(),
             terminal_journal: test_terminal_journal(),
+            restricted_network: None,
         }
     }
 
@@ -2560,6 +2651,7 @@ while :; do sleep 0.1; done"#;
         pause_inspect_entered: PathBuf,
         unpause_failures: PathBuf,
         output_trigger: PathBuf,
+        network_info: PathBuf,
     }
 
     impl FakePodman {
@@ -2582,6 +2674,7 @@ while :; do sleep 0.1; done"#;
             let pause_inspect_entered = root.join("pause-inspect-entered");
             let unpause_failures = root.join("unpause-failures");
             let output_trigger = root.join("output-trigger");
+            let network_info = root.join("network-info");
             let volume_mountpoint = test_filesystem()
                 .resolver()
                 .expected_mountpoint(Uuid::from_u128(1));
@@ -2600,12 +2693,21 @@ pause_inspect_block="{}"
 pause_inspect_entered="{}"
 unpause_failures="{}"
 output_trigger="{}"
+network_info="{}"
 printf '%s\n' "$*" >> "$log"
 case "$1" in
   volume)
     [ "$2" = inspect ] || exit 1
     name="$5"
     printf '%s|local|{{}}|{}\n' "$name"
+    ;;
+  network)
+    [ "$2" = inspect ] || exit 1
+    if [ -e "$network_info" ]; then
+      cat "$network_info"
+    else
+      exit 1
+    fi
     ;;
   run)
     mode=hold
@@ -2696,6 +2798,7 @@ esac
                 pause_inspect_entered.display(),
                 unpause_failures.display(),
                 output_trigger.display(),
+                network_info.display(),
                 volume_mountpoint.display(),
             );
             let mut file = fs::File::create(&temporary_executable).unwrap();
@@ -2718,6 +2821,7 @@ esac
                 pause_inspect_entered,
                 unpause_failures,
                 output_trigger,
+                network_info,
             }
         }
 
@@ -2728,6 +2832,21 @@ esac
                 control_timeout: Duration::from_millis(100),
                 termination_timeout: Duration::from_millis(300),
                 input_write_timeout: Duration::from_millis(50),
+                ..config(WorkspaceProvisioning::NamedVolume {
+                    maximum_bytes: HARD_RESOURCE_LIMITS.writable_storage_bytes,
+                })
+            })
+            .unwrap()
+        }
+
+        fn runtime_restricted(&self, readiness_timeout: Duration, network: &str) -> PodmanRuntime {
+            PodmanRuntime::from_validated_config(PodmanConfig {
+                executable: self.executable.clone(),
+                readiness_timeout,
+                control_timeout: Duration::from_millis(100),
+                termination_timeout: Duration::from_millis(300),
+                input_write_timeout: Duration::from_millis(50),
+                restricted_network: Some(network.into()),
                 ..config(WorkspaceProvisioning::NamedVolume {
                     maximum_bytes: HARD_RESOURCE_LIMITS.writable_storage_bytes,
                 })
@@ -2779,6 +2898,12 @@ esac
                 ),
             )
             .unwrap();
+        }
+
+        fn write_network_info(&self, name: &str, subnet: &str, gateway: &str, dns: &str) {
+            let line = format!("{name}|{subnet}|{gateway}|{dns}\n");
+            fs::write(&self.network_info, line.as_bytes()).unwrap();
+            let _ = fs::remove_file(&self.marker);
         }
     }
 
@@ -3230,5 +3355,324 @@ esac
             TerminalState::Running
         );
         runtime.terminate(terminal_id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restricted_network_attestation_rejects_metadata_and_private_ranges() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        // Gateway 10.0.0.1 is a private address – attestation must reject it.
+        fake.write_network_info(
+            "gobrowse-restricted-bad",
+            "10.0.0.0/24",
+            "10.0.0.1",
+            r#"["8.8.8.8"]"#,
+        );
+        let runtime =
+            fake.runtime_restricted(Duration::from_millis(500), "gobrowse-restricted-bad");
+        let result = runtime.reconcile_recoveries().await;
+        assert!(
+            matches!(result, Err(RuntimeError::InvalidConfiguration)),
+            "expected InvalidConfiguration for private gateway, got {result:?}"
+        );
+
+        // Also verify that a metadata address (169.254.169.254) in DNS is rejected.
+        let fake2 = FakePodman::new();
+        fake2.write_network_info(
+            "gobrowse-restricted-md",
+            "93.184.216.0/24",
+            "93.184.216.1",
+            r#"["169.254.169.254"]"#,
+        );
+        let runtime2 =
+            fake2.runtime_restricted(Duration::from_millis(500), "gobrowse-restricted-md");
+        let result2 = runtime2.reconcile_recoveries().await;
+        assert!(
+            matches!(result2, Err(RuntimeError::InvalidConfiguration)),
+            "expected InvalidConfiguration for metadata DNS, got {result2:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_network_attestation_accepts_public_only() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        // Subnet 93.184.216.0/24, gateway 93.184.216.1, DNS 1.1.1.1 — all public.
+        fake.write_network_info(
+            "gobrowse-restricted-egress",
+            "93.184.216.0/24",
+            "93.184.216.1",
+            r#"["1.1.1.1"]"#,
+        );
+        let runtime =
+            fake.runtime_restricted(Duration::from_millis(500), "gobrowse-restricted-egress");
+        runtime.reconcile_recoveries().await.unwrap();
+        // After attestation, start_spec with NetworkPolicy::Restricted must succeed.
+        let spec = runtime
+            .start_spec(&start(vec!["true".into()], "gobrowse-restricted-egress"))
+            .unwrap();
+        let index = spec.args.iter().position(|arg| arg == "--network").unwrap();
+        assert_eq!(spec.args[index + 1], "gobrowse-restricted-egress");
+    }
+
+    #[tokio::test]
+    async fn serve_until_reconciles_restart_and_surfaces_lost_state_and_durable_output_through_the_wire()
+     {
+        use crate::{
+            Authenticator, ConnectionConfig, Daemon, DaemonConfig, NetworkPolicyConfig,
+            SocketConfig,
+        };
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        use gobrowse_core::sandbox::{
+            RequestEnvelope, SANDBOX_PROTOCOL_VERSION, SandboxOperation, SandboxResult,
+            TerminalState,
+        };
+
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = fake.runtime(Duration::from_millis(500));
+
+        let terminal_id = Uuid::from_u128(100);
+        let workspace_id = Uuid::from_u128(1);
+        let pending_input_id = Uuid::from_u128(200);
+
+        // Seed PRE-RESTART state in the shared journal.
+        let journal = test_terminal_journal();
+        journal
+            .begin_start(terminal_id, workspace_id, [7; 32], 80, 24)
+            .unwrap();
+        journal.set_running(terminal_id).unwrap();
+        journal.append_output(terminal_id, b"replay-me").unwrap();
+        journal
+            .begin_input(terminal_id, pending_input_id, [9; 32])
+            .unwrap();
+
+        // Seed a survivor container so reconciliation has something to clean.
+        fake.seed_survivor(terminal_id, workspace_id);
+
+        // Build a Daemon sharing the same journal and filesystem root as the runtime.
+        let uid = effective_uid_from_proc_status(&fs::read_to_string("/proc/self/status").unwrap())
+            .unwrap();
+        let socket_dir =
+            std::env::temp_dir().join(format!("gobrowse-sandboxd-reconcile-{}", Uuid::new_v4()));
+        fs::create_dir(&socket_dir).unwrap();
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let daemon = Daemon::new(
+            DaemonConfig {
+                socket: SocketConfig {
+                    path: socket_dir.join("sandboxd.sock"),
+                    mode: 0o600,
+                    owner_uid: uid,
+                    allowed_peer_uid: uid,
+                },
+                resource_ceiling: HARD_RESOURCE_LIMITS,
+                network: NetworkPolicyConfig {
+                    restricted_network: None,
+                    allow_full: false,
+                },
+                replay_capacity: 32,
+                connections: ConnectionConfig {
+                    max_connections: 4,
+                    pre_auth_timeout: Duration::from_secs(1),
+                    idle_timeout: Duration::from_secs(1),
+                    operation_timeout: Duration::from_secs(1),
+                },
+            },
+            Authenticator::new("correct opaque daemon token").unwrap(),
+            test_filesystem().clone(),
+            Arc::new(runtime),
+            journal,
+        )
+        .unwrap();
+
+        // Run serve_until with immediate shutdown — reconcile must run at startup
+        // (daemon.rs:~264), bind loops once, runtime.shutdown() no-ops.
+        daemon.clone().serve_until(async { Ok(()) }).await.unwrap();
+
+        // --- Inspect: Lost state surfaces through the wire ---
+        let inspected = daemon
+            .handle_line(
+                &serde_json::to_vec(&RequestEnvelope {
+                    version: SANDBOX_PROTOCOL_VERSION,
+                    request_id: Uuid::new_v4(),
+                    token: "correct opaque daemon token".into(),
+                    operation: SandboxOperation::Inspect { terminal_id },
+                })
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(
+                inspected.result,
+                Ok(SandboxResult::Inspected {
+                    state: TerminalState::Lost,
+                    output_complete: false,
+                    ..
+                })
+            ),
+            "expected Inspected {{ state: Lost, output_complete: false }}, got {inspected:?}"
+        );
+
+        // --- Reconnect: Lost state surfaces ---
+        let reconnected = daemon
+            .handle_line(
+                &serde_json::to_vec(&RequestEnvelope {
+                    version: SANDBOX_PROTOCOL_VERSION,
+                    request_id: Uuid::new_v4(),
+                    token: "correct opaque daemon token".into(),
+                    operation: SandboxOperation::Reconnect { terminal_id },
+                })
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(
+                reconnected.result,
+                Ok(SandboxResult::Reconnected {
+                    state: TerminalState::Lost,
+                    ..
+                })
+            ),
+            "expected Reconnected {{ state: Lost }}, got {reconnected:?}"
+        );
+
+        // --- ReadOutput: durable output survives reconcile ---
+        let output = daemon
+            .handle_line(
+                &serde_json::to_vec(&RequestEnvelope {
+                    version: SANDBOX_PROTOCOL_VERSION,
+                    request_id: Uuid::new_v4(),
+                    token: "correct opaque daemon token".into(),
+                    operation: SandboxOperation::ReadOutput {
+                        terminal_id,
+                        after_cursor: 0,
+                        max_bytes: 16,
+                        wait_ms: 0,
+                    },
+                })
+                .unwrap(),
+            )
+            .await;
+        let expected_base64 = BASE64.encode(b"replay-me");
+        assert!(
+            matches!(
+                &output.result,
+                Ok(SandboxResult::Output {
+                    state: TerminalState::Lost,
+                    output_complete: false,
+                    data_base64,
+                    ..
+                }) if data_base64 == &expected_base64
+            ),
+            "expected Output {{ state: Lost, data_base64: {expected_base64} }}, got {output:?}"
+        );
+
+        // --- Survivor marker removed by terminate during reconcile ---
+        assert!(
+            !fake.marker.exists(),
+            "survivor marker should be removed by reconcile"
+        );
+
+        // --- Pending input marked UNKNOWN by reconcile_restart ---
+        assert!(
+            matches!(
+                test_terminal_journal().begin_input(terminal_id, pending_input_id, [9; 32]),
+                Err(JournalError::OutcomeUnknown)
+            ),
+            "pending input should be UNKNOWN after reconcile_restart"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
+    }
+
+    #[tokio::test]
+    async fn serve_until_attests_restricted_network_on_restart_then_serves() {
+        use crate::{
+            Authenticator, ConnectionConfig, Daemon, DaemonConfig, NetworkPolicyConfig,
+            SocketConfig,
+        };
+        use gobrowse_core::sandbox::{
+            RequestEnvelope, SANDBOX_PROTOCOL_VERSION, SandboxOperation, SandboxResult,
+        };
+
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        // Subnet 93.184.216.0/24, gateway 93.184.216.1, DNS 1.1.1.1 — all public.
+        fake.write_network_info(
+            "gobrowse-restricted-egress",
+            "93.184.216.0/24",
+            "93.184.216.1",
+            r#"["1.1.1.1"]"#,
+        );
+        let runtime =
+            fake.runtime_restricted(Duration::from_millis(500), "gobrowse-restricted-egress");
+        // Clone before moving into Daemon so we can call start_spec afterward.
+        let runtime_for_check = runtime.clone();
+
+        let uid = effective_uid_from_proc_status(&fs::read_to_string("/proc/self/status").unwrap())
+            .unwrap();
+        let socket_dir =
+            std::env::temp_dir().join(format!("gobrowse-sandboxd-attest-{}", Uuid::new_v4()));
+        fs::create_dir(&socket_dir).unwrap();
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let daemon = Daemon::new(
+            DaemonConfig {
+                socket: SocketConfig {
+                    path: socket_dir.join("sandboxd.sock"),
+                    mode: 0o600,
+                    owner_uid: uid,
+                    allowed_peer_uid: uid,
+                },
+                resource_ceiling: HARD_RESOURCE_LIMITS,
+                network: NetworkPolicyConfig {
+                    restricted_network: Some("gobrowse-restricted-egress".into()),
+                    allow_full: false,
+                },
+                replay_capacity: 32,
+                connections: ConnectionConfig {
+                    max_connections: 4,
+                    pre_auth_timeout: Duration::from_secs(1),
+                    idle_timeout: Duration::from_secs(1),
+                    operation_timeout: Duration::from_secs(1),
+                },
+            },
+            Authenticator::new("correct opaque daemon token").unwrap(),
+            test_filesystem().clone(),
+            Arc::new(runtime),
+            test_terminal_journal(),
+        )
+        .unwrap();
+
+        // serve_until calls reconcile_recoveries which attests the restricted network.
+        daemon.clone().serve_until(async { Ok(()) }).await.unwrap();
+
+        // After attestation, start_spec with NetworkPolicy::Restricted must succeed —
+        // no longer InvalidConfiguration.
+        let spec = runtime_for_check
+            .start_spec(&start(vec!["true".into()], "gobrowse-restricted-egress"))
+            .unwrap();
+        let index = spec.args.iter().position(|arg| arg == "--network").unwrap();
+        assert_eq!(spec.args[index + 1], "gobrowse-restricted-egress");
+
+        // The daemon itself is still functional after serve_until returns.
+        let health = daemon
+            .handle_line(
+                &serde_json::to_vec(&RequestEnvelope {
+                    version: SANDBOX_PROTOCOL_VERSION,
+                    request_id: Uuid::new_v4(),
+                    token: "correct opaque daemon token".into(),
+                    operation: SandboxOperation::Health,
+                })
+                .unwrap(),
+            )
+            .await;
+        assert!(
+            matches!(health.result, Ok(SandboxResult::Health { .. })),
+            "expected Health, got {health:?}"
+        );
+
+        let _ = fs::remove_dir_all(&socket_dir);
     }
 }
