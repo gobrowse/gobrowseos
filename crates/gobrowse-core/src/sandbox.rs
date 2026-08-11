@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-pub const SANDBOX_PROTOCOL_VERSION: u16 = 1;
+pub const SANDBOX_PROTOCOL_VERSION: u16 = 2;
 pub const MAX_PROTOCOL_LINE_BYTES: usize = 512 * 1024;
 pub const MAX_COMMAND_ARGUMENTS: usize = 128;
 pub const MAX_COMMAND_ARGUMENT_BYTES: usize = 4 * 1024;
@@ -15,8 +15,20 @@ pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
 pub const MAX_WORKSPACE_PATH_BYTES: usize = 4 * 1024;
 pub const MAX_WORKSPACE_PATH_COMPONENTS: usize = 128;
 pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_TERMINAL_OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
+pub const MAX_TERMINAL_OUTPUT_READ_BYTES: usize = 256 * 1024;
+pub const MAX_TERMINAL_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+pub const MAX_TERMINAL_OUTPUT_WAIT_MS: u32 = 30_000;
+pub const MAX_TERMINAL_PROCESSES: usize = 1_024;
+pub const MAX_TERMINAL_PROCESS_COMMAND_BYTES: usize = 4 * 1024;
+pub const MAX_TERMINAL_PROCESS_BYTES: usize = MAX_PROTOCOL_LINE_BYTES / 2;
 pub const MAX_FILE_PAYLOAD_BYTES: usize = 256 * 1024;
 pub const MAX_DIRECTORY_ENTRIES: usize = 1_024;
+pub const MAX_FILESYSTEM_SEARCH_QUERY_BYTES: usize = 256;
+pub const MAX_FILESYSTEM_SEARCH_RESULTS: usize = 1_024;
+pub const MAX_FILESYSTEM_SCANNED_ENTRIES: usize = 16_384;
+/// A conservative cap leaves room for the response envelope, framing, and future fixed metadata.
+pub const MAX_FILESYSTEM_SEARCH_ENCODED_BYTES: usize = MAX_PROTOCOL_LINE_BYTES / 2;
 
 pub const HARD_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
     cpu_millis: 8_000,
@@ -25,6 +37,19 @@ pub const HARD_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
     pids: 1_024,
     execution_seconds: 24 * 60 * 60,
 };
+
+/// Returns the only runtime storage identity accepted for a workspace.
+#[must_use]
+pub fn workspace_volume_name(workspace_id: Uuid) -> String {
+    format!("gobrowse-workspace-{workspace_id}")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceStorageIdentity {
+    pub volume_name: String,
+    pub device: u64,
+    pub inode: u64,
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -166,6 +191,8 @@ pub fn validate_workspace_path(value: &str) -> Result<PathBuf, SandboxValidation
 #[serde(deny_unknown_fields)]
 pub struct RequestEnvelope {
     pub version: u16,
+    /// Terminal mutation responses are durable. Other mutation responses have only sandboxd's
+    /// bounded process-local replay horizon and must not be treated as durable idempotency records.
     pub request_id: Uuid,
     pub token: String,
     pub operation: SandboxOperation,
@@ -176,21 +203,46 @@ pub struct RequestEnvelope {
 pub enum SandboxOperation {
     Health,
     Start {
+        terminal_id: Uuid,
         request: TerminalStartRequest,
     },
     Input {
         terminal_id: Uuid,
+        input_id: Uuid,
         data_base64: String,
+    },
+    ReadOutput {
+        terminal_id: Uuid,
+        after_cursor: u64,
+        max_bytes: u32,
+        wait_ms: u32,
+    },
+    AckOutput {
+        terminal_id: Uuid,
+        cursor: u64,
     },
     Resize {
         terminal_id: Uuid,
         cols: u16,
         rows: u16,
     },
+    Interrupt {
+        terminal_id: Uuid,
+    },
+    Processes {
+        terminal_id: Uuid,
+    },
+    Kill {
+        terminal_id: Uuid,
+        pid: u32,
+    },
     Terminate {
         terminal_id: Uuid,
     },
     Inspect {
+        terminal_id: Uuid,
+    },
+    Reconnect {
         terminal_id: Uuid,
     },
     FsList {
@@ -201,16 +253,36 @@ pub enum SandboxOperation {
         workspace_id: Uuid,
         path: String,
     },
+    FsMetadata {
+        workspace_id: Uuid,
+        path: String,
+    },
+    FsSearch {
+        workspace_id: Uuid,
+        path: String,
+        query: String,
+    },
     FsWrite {
         workspace_id: Uuid,
         path: String,
+        data_base64: String,
+    },
+    FsPatch {
+        workspace_id: Uuid,
+        path: String,
+        expected_sha256: String,
         data_base64: String,
     },
     FsMkdir {
         workspace_id: Uuid,
         path: String,
     },
-    FsRename {
+    FsMove {
+        workspace_id: Uuid,
+        from: String,
+        to: String,
+    },
+    FsCopy {
         workspace_id: Uuid,
         from: String,
         to: String,
@@ -241,26 +313,80 @@ pub enum SandboxResult {
         network_policy: NetworkPolicy,
     },
     InputAccepted {
+        input_id: Uuid,
         bytes: usize,
+        replayed: bool,
+    },
+    Output {
+        terminal_id: Uuid,
+        start_cursor: u64,
+        next_cursor: u64,
+        data_base64: String,
+        state: TerminalState,
+        output_complete: bool,
+    },
+    OutputAcked {
+        cursor: u64,
     },
     Resized,
+    Interrupted,
+    Processes {
+        processes: Vec<SandboxProcess>,
+    },
+    Killed {
+        pid: u32,
+    },
     Terminated,
     Inspected {
         terminal_id: Uuid,
         workspace_id: Uuid,
         state: TerminalState,
+        cols: u16,
+        rows: u16,
+        exit_code: Option<i32>,
+        reason: Option<String>,
+        output_start_cursor: u64,
+        output_end_cursor: u64,
+        acked_cursor: u64,
+        output_complete: bool,
+    },
+    Reconnected {
+        terminal_id: Uuid,
+        workspace_id: Uuid,
+        state: TerminalState,
+        cols: u16,
+        rows: u16,
+        exit_code: Option<i32>,
+        reason: Option<String>,
+        output_start_cursor: u64,
+        output_end_cursor: u64,
+        acked_cursor: u64,
+        output_complete: bool,
     },
     FsList {
         entries: Vec<FilesystemEntry>,
     },
     FsRead {
         data_base64: String,
+        sha256: String,
+    },
+    FsMetadata {
+        metadata: FilesystemMetadata,
+    },
+    FsSearch {
+        matches: Vec<FilesystemSearchMatch>,
     },
     FsWritten {
         bytes: usize,
+        sha256: String,
+    },
+    FsPatched {
+        bytes: usize,
+        sha256: String,
     },
     FsCreated,
-    FsRenamed,
+    FsMoved,
+    FsCopied,
     FsDeleted,
 }
 
@@ -270,8 +396,16 @@ pub enum TerminalState {
     Running,
     Terminating,
     Unrecoverable,
+    Lost,
     Exited,
     Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxProcess {
+    pub pid: u32,
+    pub command: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,6 +421,23 @@ pub struct FilesystemEntry {
 pub enum FilesystemEntryKind {
     File,
     Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemMetadata {
+    pub kind: FilesystemEntryKind,
+    pub size: u64,
+    pub mode: u32,
+    pub modified_unix_seconds: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemSearchMatch {
+    pub path: String,
+    pub kind: FilesystemEntryKind,
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +458,7 @@ pub enum SandboxErrorCode {
     LimitExceeded,
     DeadlineExceeded,
     Conflict,
+    OutcomeUnknown,
     Internal,
 }
 
@@ -357,6 +509,7 @@ mod tests {
         assert!(validate_workspace_path(".").is_ok());
         assert!(validate_workspace_path("../host").is_err());
         assert!(validate_workspace_path("/etc/passwd").is_err());
+        assert!(validate_workspace_path("nul\0path").is_err());
         assert_eq!(
             validate_workspace_path(&"x".repeat(MAX_WORKSPACE_PATH_BYTES + 1)),
             Err(SandboxValidationError::PathTooLarge)

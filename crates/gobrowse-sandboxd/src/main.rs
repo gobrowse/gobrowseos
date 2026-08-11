@@ -6,8 +6,8 @@ use clap::Parser;
 use gobrowse_core::sandbox::ResourceLimits;
 use gobrowse_sandboxd::{
     Authenticator, ConnectionConfig, Daemon, DaemonConfig, Filesystem, NetworkPolicyConfig,
-    PodmanConfig, PodmanRuntime, SessionLimits, SocketConfig, WorkspaceProvisioning,
-    effective_uid_from_proc_status,
+    PodmanConfig, PodmanRuntime, SessionLimits, SocketConfig, TerminalJournal,
+    WorkspaceProvisioning, effective_uid_from_proc_status,
 };
 use zeroize::Zeroizing;
 
@@ -19,11 +19,15 @@ struct Args {
     #[arg(long)]
     workspace_root: PathBuf,
     #[arg(long)]
+    terminal_journal: Option<PathBuf>,
+    #[arg(long)]
     auth_token_file: PathBuf,
     #[arg(long, value_parser = parse_socket_mode)]
     socket_mode: u32,
     #[arg(long)]
     allowed_peer_uid: u32,
+    #[arg(long)]
+    deployment_id: uuid::Uuid,
     #[arg(long, default_value = "/usr/bin/podman")]
     podman: PathBuf,
     #[arg(long)]
@@ -85,6 +89,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let token = Zeroizing::new(std::fs::read_to_string(&args.auth_token_file)?);
     let auth = Authenticator::new(token.trim())?;
     let filesystem = Filesystem::new(&args.workspace_root)?;
+    let terminal_journal = TerminalJournal::open(
+        args.terminal_journal
+            .unwrap_or_else(|| args.workspace_root.join(".sandboxd-terminals.sqlite3")),
+    )?;
+    let workspace_resolver = filesystem.resolver();
+    let recovery_store = filesystem.recovery_store();
     let runtime = Arc::new(PodmanRuntime::new(PodmanConfig {
         executable: args.podman,
         image: args.image,
@@ -98,12 +108,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_retained_records: args.max_retained_terminal_records,
         },
         workspace_provisioning: if args.quota_managed_workspaces {
-            WorkspaceProvisioning::QuotaManaged {
+            WorkspaceProvisioning::NamedVolume {
                 maximum_bytes: args.max_writable_storage_bytes,
             }
         } else {
-            WorkspaceProvisioning::UnmanagedBindMount
+            WorkspaceProvisioning::Unverified
         },
+        deployment_id: args.deployment_id,
+        workspace_resolver,
+        recovery_store,
+        terminal_journal: terminal_journal.clone(),
     })?);
     let daemon = Daemon::new(
         DaemonConfig {
@@ -135,6 +149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         auth,
         filesystem,
         runtime,
+        terminal_journal,
     )?;
     daemon.serve().await?;
     Ok(())

@@ -31,6 +31,8 @@ struct ReplayInner {
 }
 
 pub struct ReplayCache {
+    // This is intentionally a bounded, process-local replay horizon. Completed entries may be
+    // evicted and daemon restart loses the cache; the protocol documents that it is not durable.
     capacity: usize,
     inner: Mutex<ReplayInner>,
 }

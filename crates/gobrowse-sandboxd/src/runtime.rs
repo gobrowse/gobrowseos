@@ -1,5 +1,6 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    os::unix::process::ExitStatusExt,
     path::PathBuf,
     process::Stdio,
     sync::{
@@ -10,14 +11,25 @@ use std::{
 };
 
 use async_trait::async_trait;
-use gobrowse_core::sandbox::{TerminalStartRequest, TerminalState};
+use gobrowse_core::sandbox::{
+    MAX_TERMINAL_OUTPUT_CHUNK_BYTES, MAX_TERMINAL_PROCESS_BYTES,
+    MAX_TERMINAL_PROCESS_COMMAND_BYTES, MAX_TERMINAL_PROCESSES, SandboxProcess,
+    TerminalStartRequest, TerminalState, WorkspaceStorageIdentity, workspace_volume_name,
+};
+use pty_process::{OwnedWritePty, Size};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::{
-    io::AsyncWriteExt,
-    process::{ChildStdin, Command},
-    sync::{Mutex, watch},
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command,
+    sync::{Mutex, Notify, watch},
 };
 use uuid::Uuid;
+
+use crate::{
+    InputDecision, JournalError, OutputRead, RecoveryRecord, RecoveryStore, StartDecision,
+    TerminalJournal, TerminalRecord, WorkspaceResolver,
+};
 
 const MINIMAL_PATH: &str = "/usr/bin:/bin";
 const CONTAINER_HOME: &str = "/tmp";
@@ -38,10 +50,10 @@ pub struct SessionLimits {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceProvisioning {
-    UnmanagedBindMount,
-    /// The deployment provisioner guarantees a hard per-workspace quota before sandboxd starts.
-    /// Podman bind mounts have no portable quota flag, so the adapter never emulates this mode.
-    QuotaManaged {
+    Unverified,
+    /// The provisioner creates an allowlisted named volume and attests enforced quota identity
+    /// with the labels verified by sandboxd before every start.
+    NamedVolume {
         maximum_bytes: u64,
     },
 }
@@ -56,6 +68,10 @@ pub struct PodmanConfig {
     pub input_write_timeout: Duration,
     pub session_limits: SessionLimits,
     pub workspace_provisioning: WorkspaceProvisioning,
+    pub deployment_id: Uuid,
+    pub workspace_resolver: WorkspaceResolver,
+    pub recovery_store: RecoveryStore,
+    pub terminal_journal: TerminalJournal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,21 +91,69 @@ impl ProcessSpec {
             .kill_on_drop(true);
         command
     }
+
+    fn pty_command(&self) -> pty_process::Command {
+        pty_process::Command::new(&self.program)
+            .args(&self.args)
+            .env_clear()
+            .env("PATH", MINIMAL_PATH)
+            .env("HOME", CONTAINER_HOME)
+            .kill_on_drop(false)
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ValidatedStart {
     pub terminal_id: Uuid,
     pub request: TerminalStartRequest,
-    pub workspace_path: PathBuf,
+    pub workspace_storage: WorkspaceStorageIdentity,
     pub network_name: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspacePause {
+    pub(crate) workspace_id: Uuid,
+    pub(crate) terminal_ids: Vec<Uuid>,
+    pub(crate) recovery_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeInspect {
     pub terminal_id: Uuid,
     pub workspace_id: Uuid,
     pub state: TerminalState,
+    pub cols: u16,
+    pub rows: u16,
+    pub exit_code: Option<i32>,
+    pub reason: Option<String>,
+    pub output_start_cursor: u64,
+    pub output_end_cursor: u64,
+    pub acked_cursor: u64,
+    pub output_complete: bool,
+}
+
+impl From<TerminalRecord> for RuntimeInspect {
+    fn from(record: TerminalRecord) -> Self {
+        Self {
+            terminal_id: record.terminal_id,
+            workspace_id: record.workspace_id,
+            state: record.state,
+            cols: record.cols,
+            rows: record.rows,
+            exit_code: record.exit_code,
+            reason: record.reason,
+            output_start_cursor: record.output_start_cursor,
+            output_end_cursor: record.output_end_cursor,
+            acked_cursor: record.acked_cursor,
+            output_complete: record.output_complete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InputOutcome {
+    pub bytes: usize,
+    pub replayed: bool,
 }
 
 #[derive(Debug, Error)]
@@ -114,6 +178,22 @@ pub enum RuntimeError {
     InputTimeout,
     #[error("Podman operation failed")]
     PodmanFailed,
+    #[error("workspace volume identity or quota verification failed")]
+    WorkspaceVolumeInvalid,
+    #[error("workspace processes could not be positively paused")]
+    WorkspacePauseFailed,
+    #[error("workspace processes could not be positively resumed")]
+    WorkspaceResumeFailed,
+    #[error("workspace recovery could not be reconciled")]
+    WorkspaceRecoveryFailed,
+    #[error("terminal operation outcome is unknown")]
+    OutcomeUnknown,
+    #[error("terminal identifier conflicts with durable state")]
+    Conflict,
+    #[error("terminal journal failed")]
+    Journal(#[source] JournalError),
+    #[error("PTY operation failed")]
+    Pty,
     #[error("runtime I/O failed")]
     Io(#[source] std::io::Error),
 }
@@ -121,10 +201,43 @@ pub enum RuntimeError {
 #[async_trait]
 pub trait SandboxRuntime: Send + Sync {
     async fn start(&self, start: ValidatedStart) -> Result<(), RuntimeError>;
-    async fn input(&self, terminal_id: Uuid, bytes: &[u8]) -> Result<(), RuntimeError>;
+    async fn input(
+        &self,
+        terminal_id: Uuid,
+        input_id: Uuid,
+        bytes: &[u8],
+    ) -> Result<InputOutcome, RuntimeError>;
+    async fn read_output(
+        &self,
+        _terminal_id: Uuid,
+        _after_cursor: u64,
+        _max_bytes: usize,
+        _wait: Duration,
+    ) -> Result<OutputRead, RuntimeError> {
+        Err(RuntimeError::InvalidConfiguration)
+    }
+    async fn ack_output(&self, _terminal_id: Uuid, _cursor: u64) -> Result<u64, RuntimeError> {
+        Err(RuntimeError::InvalidConfiguration)
+    }
     async fn resize(&self, terminal_id: Uuid, cols: u16, rows: u16) -> Result<(), RuntimeError>;
+    async fn interrupt(&self, _terminal_id: Uuid) -> Result<(), RuntimeError> {
+        Err(RuntimeError::InvalidConfiguration)
+    }
+    async fn processes(&self, _terminal_id: Uuid) -> Result<Vec<SandboxProcess>, RuntimeError> {
+        Err(RuntimeError::InvalidConfiguration)
+    }
+    async fn kill(&self, _terminal_id: Uuid, _pid: u32) -> Result<(), RuntimeError> {
+        Err(RuntimeError::InvalidConfiguration)
+    }
     async fn terminate(&self, terminal_id: Uuid) -> Result<(), RuntimeError>;
     async fn inspect(&self, terminal_id: Uuid) -> Result<RuntimeInspect, RuntimeError>;
+    async fn pause_workspace(&self, workspace_id: Uuid) -> Result<WorkspacePause, RuntimeError>;
+    async fn resume_workspace(&self, pause: &WorkspacePause) -> Result<(), RuntimeError>;
+    async fn reconcile_recoveries(&self) -> Result<(), RuntimeError>;
+    async fn ensure_workspace_recovered(&self, workspace_id: Uuid) -> Result<(), RuntimeError>;
+    async fn shutdown(&self) -> Result<(), RuntimeError> {
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -157,10 +270,17 @@ struct Session {
     terminal_id: Uuid,
     workspace_id: Uuid,
     state: watch::Sender<LifecycleState>,
-    stdin: Mutex<Option<ChildStdin>>,
+    pty: Mutex<Option<OwnedWritePty>>,
+    output_notify: Notify,
     termination_requested: AtomicBool,
     termination_owner: AtomicBool,
     background_cleanup_started: AtomicBool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputDrain {
+    Complete,
+    Failed(&'static str),
 }
 
 impl Session {
@@ -170,7 +290,8 @@ impl Session {
             terminal_id,
             workspace_id,
             state,
-            stdin: Mutex::new(None),
+            pty: Mutex::new(None),
+            output_notify: Notify::new(),
             termination_requested: AtomicBool::new(false),
             termination_owner: AtomicBool::new(false),
             background_cleanup_started: AtomicBool::new(false),
@@ -355,6 +476,7 @@ impl Registry {
     }
 }
 
+#[derive(Clone)]
 pub struct PodmanRuntime {
     config: PodmanConfig,
     registry: Arc<Mutex<Registry>>,
@@ -387,10 +509,11 @@ impl PodmanRuntime {
             || config.session_limits.max_active_per_workspace > config.session_limits.max_active
             || config.session_limits.max_retained_records == 0
             || config.session_limits.max_retained_records > MAX_RETAINED_RECORDS_HARD
+            || config.deployment_id.is_nil()
         {
             return Err(RuntimeError::InvalidConfiguration);
         }
-        if let WorkspaceProvisioning::QuotaManaged { maximum_bytes } = config.workspace_provisioning
+        if let WorkspaceProvisioning::NamedVolume { maximum_bytes } = config.workspace_provisioning
             && maximum_bytes == 0
         {
             return Err(RuntimeError::InvalidConfiguration);
@@ -402,7 +525,7 @@ impl PodmanRuntime {
     }
 
     pub fn start_spec(&self, start: &ValidatedStart) -> Result<ProcessSpec, RuntimeError> {
-        let WorkspaceProvisioning::QuotaManaged { maximum_bytes } =
+        let WorkspaceProvisioning::NamedVolume { maximum_bytes } =
             self.config.workspace_provisioning
         else {
             return Err(RuntimeError::WorkspaceQuotaUnavailable);
@@ -410,11 +533,13 @@ impl PodmanRuntime {
         if start.request.limits.writable_storage_bytes > maximum_bytes {
             return Err(RuntimeError::WorkspaceQuotaUnavailable);
         }
-        let workspace = start
-            .workspace_path
-            .to_str()
-            .ok_or(RuntimeError::InvalidConfiguration)?;
-        if workspace.contains([':', ',', '\n', '\r']) || !start.workspace_path.is_absolute() {
+        let workspace = workspace_volume_name(start.request.workspace_id);
+        if start.request.workspace_id.is_nil()
+            || !valid_workspace_volume_name(&workspace)
+            || start.workspace_storage.volume_name != workspace
+            || start.workspace_storage.device == 0
+            || start.workspace_storage.inode == 0
+        {
             return Err(RuntimeError::InvalidConfiguration);
         }
         if !valid_runtime_network(start.request.network_policy, &start.network_name) {
@@ -424,11 +549,25 @@ impl PodmanRuntime {
         let limits = start.request.limits;
         let mut args = vec![
             "run".into(),
-            "--rm".into(),
             "--interactive".into(),
             "--tty".into(),
+            "--sig-proxy=false".into(),
+            "--detach-keys=".into(),
+            "--init".into(),
+            "--pull=never".into(),
+            "--log-driver=none".into(),
+            "--image-volume=ignore".into(),
+            "--http-proxy=false".into(),
             "--name".into(),
             container_name(start.terminal_id),
+            "--label".into(),
+            "io.gobrowse.managed=true".into(),
+            "--label".into(),
+            format!("io.gobrowse.deployment-id={}", self.config.deployment_id),
+            "--label".into(),
+            format!("io.gobrowse.workspace-id={}", start.request.workspace_id),
+            "--label".into(),
+            format!("io.gobrowse.terminal-id={}", start.terminal_id),
             "--cap-drop=ALL".into(),
             "--security-opt=no-new-privileges".into(),
             "--read-only".into(),
@@ -500,6 +639,100 @@ impl PodmanRuntime {
         }
     }
 
+    pub fn processes_spec(&self, terminal_id: Uuid) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "top".into(),
+                container_name(terminal_id),
+                "pid".into(),
+                "comm".into(),
+                "args".into(),
+            ],
+        }
+    }
+
+    pub fn kill_spec(&self, terminal_id: Uuid, pid: u32) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "exec".into(),
+                container_name(terminal_id),
+                "/bin/kill".into(),
+                "-TERM".into(),
+                "--".into(),
+                pid.to_string(),
+            ],
+        }
+    }
+
+    pub fn volume_inspect_spec(&self, workspace_id: Uuid) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "volume".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{.Name}}|{{.Driver}}|{{json .Options}}|{{.Mountpoint}}".into(),
+                workspace_volume_name(workspace_id),
+            ],
+        }
+    }
+
+    pub fn pause_spec(&self, terminal_id: Uuid) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec!["pause".into(), container_name(terminal_id)],
+        }
+    }
+
+    pub fn unpause_spec(&self, terminal_id: Uuid) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec!["unpause".into(), container_name(terminal_id)],
+        }
+    }
+
+    pub fn paused_inspect_spec(&self, terminal_id: Uuid) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "inspect".into(),
+                "--format".into(),
+                "{{.State.Paused}}".into(),
+                container_name(terminal_id),
+            ],
+        }
+    }
+
+    pub fn managed_containers_spec(&self, workspace_id: Option<Uuid>) -> ProcessSpec {
+        let mut args = vec![
+            "ps".into(),
+            "--all".into(),
+            "--filter".into(),
+            "label=io.gobrowse.managed=true".into(),
+            "--filter".into(),
+            format!(
+                "label=io.gobrowse.deployment-id={}",
+                self.config.deployment_id
+            ),
+        ];
+        if let Some(workspace_id) = workspace_id {
+            args.extend([
+                "--filter".into(),
+                format!("label=io.gobrowse.workspace-id={workspace_id}"),
+            ]);
+        }
+        args.extend([
+            "--format".into(),
+            "{{.Names}}|{{.Label \"io.gobrowse.terminal-id\"}}|{{.Label \"io.gobrowse.workspace-id\"}}".into(),
+        ]);
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args,
+        }
+    }
+
     async fn session(&self, terminal_id: Uuid) -> Result<Arc<Session>, RuntimeError> {
         self.registry
             .lock()
@@ -529,19 +762,169 @@ impl PodmanRuntime {
         }
     }
 
-    async fn inspect_ready(&self, terminal_id: Uuid) -> Result<bool, RuntimeError> {
-        let output = tokio::time::timeout(
-            self.config.control_timeout,
-            self.readiness_spec(terminal_id)
-                .command()
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output(),
-        )
+    async fn run_output_bounded(
+        &self,
+        spec: ProcessSpec,
+        maximum: usize,
+    ) -> Result<(std::process::ExitStatus, Vec<u8>), RuntimeError> {
+        let mut child = spec
+            .command()
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(RuntimeError::Io)?;
+        let stdout = child.stdout.take().ok_or(RuntimeError::PodmanFailed)?;
+        let result = tokio::time::timeout(self.config.control_timeout, async {
+            let mut output = Vec::with_capacity(maximum.min(16 * 1024));
+            stdout
+                .take(maximum as u64 + 1)
+                .read_to_end(&mut output)
+                .await
+                .map_err(RuntimeError::Io)?;
+            let status = child.wait().await.map_err(RuntimeError::Io)?;
+            Ok::<_, RuntimeError>((status, output))
+        })
         .await
-        .map_err(|_| RuntimeError::ControlTimeout)?
-        .map_err(RuntimeError::Io)?;
-        Ok(output.status.success() && output.stdout.as_slice() == b"true\n")
+        .map_err(|_| RuntimeError::ControlTimeout)??;
+        if result.1.len() > maximum {
+            Err(RuntimeError::PodmanFailed)
+        } else {
+            Ok(result)
+        }
+    }
+
+    async fn inspect_ready(&self, terminal_id: Uuid) -> Result<bool, RuntimeError> {
+        let (status, output) = self
+            .run_output_bounded(self.readiness_spec(terminal_id), 16)
+            .await?;
+        Ok(status.success() && output.as_slice() == b"true\n")
+    }
+
+    async fn verify_workspace_volume(&self, start: &ValidatedStart) -> Result<(), RuntimeError> {
+        let WorkspaceProvisioning::NamedVolume { maximum_bytes } =
+            self.config.workspace_provisioning
+        else {
+            return Err(RuntimeError::WorkspaceQuotaUnavailable);
+        };
+        let (status, output) = self
+            .run_output_bounded(
+                self.volume_inspect_spec(start.request.workspace_id),
+                16 * 1024,
+            )
+            .await?;
+        if !status.success() {
+            Err(RuntimeError::WorkspaceVolumeInvalid)
+        } else {
+            let output =
+                String::from_utf8(output).map_err(|_| RuntimeError::WorkspaceVolumeInvalid)?;
+            let output = output
+                .strip_suffix('\n')
+                .ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+            let mut fields = output.splitn(4, '|');
+            let name = fields.next().ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+            let driver = fields.next().ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+            let options = fields.next().ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+            let mountpoint = fields.next().ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+            if name != start.workspace_storage.volume_name
+                || start.request.limits.writable_storage_bytes > maximum_bytes
+            {
+                return Err(RuntimeError::WorkspaceVolumeInvalid);
+            }
+            self.config
+                .workspace_resolver
+                .verify_volume(
+                    start.request.workspace_id,
+                    driver,
+                    options,
+                    mountpoint,
+                    &start.workspace_storage,
+                )
+                .map_err(|_| RuntimeError::WorkspaceVolumeInvalid)
+        }
+    }
+
+    async fn inspect_paused(&self, terminal_id: Uuid) -> Result<bool, RuntimeError> {
+        let (status, output) = self
+            .run_output_bounded(self.paused_inspect_spec(terminal_id), 16)
+            .await?;
+        if !status.success() {
+            return Err(RuntimeError::PodmanFailed);
+        }
+        match output.as_slice() {
+            b"true\n" => Ok(true),
+            b"false\n" => Ok(false),
+            _ => Err(RuntimeError::PodmanFailed),
+        }
+    }
+
+    async fn managed_containers(
+        &self,
+        workspace_id: Option<Uuid>,
+    ) -> Result<Vec<(Uuid, Uuid)>, RuntimeError> {
+        let (status, output) = self
+            .run_output_bounded(self.managed_containers_spec(workspace_id), 1024 * 1024)
+            .await?;
+        if !status.success() {
+            return Err(RuntimeError::WorkspaceRecoveryFailed);
+        }
+        let output =
+            String::from_utf8(output).map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?;
+        let mut containers = Vec::new();
+        for line in output.lines() {
+            let mut fields = line.split('|');
+            let name = fields.next().ok_or(RuntimeError::WorkspaceRecoveryFailed)?;
+            let terminal_id = fields
+                .next()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or(RuntimeError::WorkspaceRecoveryFailed)?;
+            let listed_workspace = fields
+                .next()
+                .and_then(|value| Uuid::parse_str(value).ok())
+                .ok_or(RuntimeError::WorkspaceRecoveryFailed)?;
+            if fields.next().is_some()
+                || name != container_name(terminal_id)
+                || workspace_id.is_some_and(|expected| expected != listed_workspace)
+            {
+                return Err(RuntimeError::WorkspaceRecoveryFailed);
+            }
+            containers.push((terminal_id, listed_workspace));
+        }
+        Ok(containers)
+    }
+
+    async fn terminate_managed(&self, terminal_id: Uuid) -> Result<(), RuntimeError> {
+        self.run_checked(force_removal_spec(&self.config, terminal_id))
+            .await
+    }
+
+    async fn remove_workspace_orphans(&self, workspace_id: Uuid) -> Result<(), RuntimeError> {
+        let registered = self
+            .registry
+            .lock()
+            .await
+            .sessions
+            .values()
+            .filter(|session| {
+                session.workspace_id == workspace_id && !session.lifecycle().is_terminal()
+            })
+            .map(|session| session.terminal_id)
+            .collect::<HashSet<_>>();
+        let listed = self.managed_containers(Some(workspace_id)).await?;
+        for (terminal_id, _) in listed {
+            if !registered.contains(&terminal_id) {
+                self.terminate_managed(terminal_id).await?;
+            }
+        }
+        if self
+            .managed_containers(Some(workspace_id))
+            .await?
+            .iter()
+            .any(|(terminal_id, _)| !registered.contains(terminal_id))
+        {
+            return Err(RuntimeError::WorkspaceRecoveryFailed);
+        }
+        Ok(())
     }
 
     async fn await_readiness(&self, session: &Session) -> Result<(), RuntimeError> {
@@ -645,6 +1028,20 @@ async fn cleanup_until(config: &PodmanConfig, session: &Session, deadline: Insta
     if !session.begin_termination() {
         return true;
     }
+    let _ = config.terminal_journal.set_state(
+        session.terminal_id,
+        TerminalState::Terminating,
+        None,
+        Some("termination_requested"),
+        None,
+    );
+    if let Some(pty) = session.pty.lock().await.as_mut() {
+        let _ = tokio::time::timeout(config.input_write_timeout, async {
+            pty.write_all(&[3]).await?;
+            pty.flush().await
+        })
+        .await;
+    }
     let mut state = session.state.subscribe();
     loop {
         if state.borrow_and_update().is_terminal() {
@@ -652,6 +1049,14 @@ async fn cleanup_until(config: &PodmanConfig, session: &Session, deadline: Insta
         }
         if Instant::now() >= deadline {
             session.transition(LifecycleState::Unrecoverable);
+            let _ = config.terminal_journal.set_state(
+                session.terminal_id,
+                TerminalState::Unrecoverable,
+                None,
+                Some("force_cleanup_deadline_exceeded"),
+                None,
+            );
+            session.output_notify.notify_waiters();
             return false;
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -686,51 +1091,266 @@ fn spawn_persistent_cleanup(config: PodmanConfig, session: Arc<Session>) {
     });
 }
 
+impl PodmanRuntime {
+    async fn pause_workspace_owned(
+        &self,
+        workspace_id: Uuid,
+    ) -> Result<WorkspacePause, RuntimeError> {
+        self.ensure_workspace_recovered(workspace_id).await?;
+        let terminal_ids = self
+            .managed_containers(Some(workspace_id))
+            .await?
+            .into_iter()
+            .map(|(terminal_id, _)| terminal_id)
+            .collect::<Vec<_>>();
+        if terminal_ids.is_empty() {
+            return Ok(WorkspacePause {
+                workspace_id,
+                terminal_ids,
+                recovery_id: None,
+            });
+        }
+        let recovery_id = Uuid::new_v4();
+        self.config
+            .recovery_store
+            .persist(&RecoveryRecord {
+                workspace_id,
+                operation_id: recovery_id,
+                containers: terminal_ids.iter().copied().map(container_name).collect(),
+            })
+            .map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?;
+
+        let mut paused = Vec::with_capacity(terminal_ids.len());
+        for terminal_id in terminal_ids {
+            let paused_ok = self.run_checked(self.pause_spec(terminal_id)).await.is_ok()
+                && matches!(self.inspect_paused(terminal_id).await, Ok(true));
+            if !paused_ok {
+                let pause = WorkspacePause {
+                    workspace_id,
+                    terminal_ids: paused,
+                    recovery_id: Some(recovery_id),
+                };
+                return if self.resume_workspace_owned(&pause).await.is_ok() {
+                    Err(RuntimeError::WorkspacePauseFailed)
+                } else {
+                    Err(RuntimeError::WorkspaceResumeFailed)
+                };
+            }
+            paused.push(terminal_id);
+        }
+        Ok(WorkspacePause {
+            workspace_id,
+            terminal_ids: paused,
+            recovery_id: Some(recovery_id),
+        })
+    }
+
+    async fn resume_workspace_owned(&self, pause: &WorkspacePause) -> Result<(), RuntimeError> {
+        if pause.terminal_ids.is_empty() {
+            return Ok(());
+        }
+        let recovery_id = pause
+            .recovery_id
+            .ok_or(RuntimeError::WorkspaceRecoveryFailed)?;
+        for attempt in 0..3 {
+            let listed = self.managed_containers(Some(pause.workspace_id)).await?;
+            let listed = listed
+                .into_iter()
+                .map(|(terminal_id, _)| terminal_id)
+                .collect::<HashSet<_>>();
+            let mut unresolved = false;
+            for terminal_id in &pause.terminal_ids {
+                if !listed.contains(terminal_id) {
+                    continue;
+                }
+                match self.inspect_paused(*terminal_id).await {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        if self
+                            .run_checked(self.unpause_spec(*terminal_id))
+                            .await
+                            .is_err()
+                            || !matches!(self.inspect_paused(*terminal_id).await, Ok(false))
+                        {
+                            unresolved = true;
+                        }
+                    }
+                    Err(_) => unresolved = true,
+                }
+            }
+            if !unresolved {
+                self.config
+                    .recovery_store
+                    .clear(pause.workspace_id, recovery_id)
+                    .map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?;
+                return Ok(());
+            }
+            if attempt < 2 {
+                tokio::time::sleep(CLEANUP_RETRY_INTERVAL).await;
+            }
+        }
+        Err(RuntimeError::WorkspaceResumeFailed)
+    }
+}
+
 #[async_trait]
 impl SandboxRuntime for PodmanRuntime {
     async fn start(&self, start: ValidatedStart) -> Result<(), RuntimeError> {
+        self.ensure_workspace_recovered(start.request.workspace_id)
+            .await?;
         let spec = self.start_spec(&start)?;
+        self.verify_workspace_volume(&start).await?;
+        let fingerprint = start_fingerprint(&start)?;
+        match self
+            .config
+            .terminal_journal
+            .begin_start(
+                start.terminal_id,
+                start.request.workspace_id,
+                fingerprint,
+                start.request.cols,
+                start.request.rows,
+            )
+            .map_err(map_journal_error)?
+        {
+            StartDecision::Existing => {
+                if self
+                    .registry
+                    .lock()
+                    .await
+                    .sessions
+                    .get(&start.terminal_id)
+                    .is_some_and(|session| {
+                        session.workspace_id == start.request.workspace_id
+                            && session.lifecycle() == LifecycleState::Running
+                    })
+                {
+                    return Ok(());
+                }
+                return Err(RuntimeError::Conflict);
+            }
+            StartDecision::Execute => {}
+        }
         let session = Arc::new(Session::new(start.terminal_id, start.request.workspace_id));
-        self.registry
+        if let Err(error) = self
+            .registry
             .lock()
             .await
-            .reserve(Arc::clone(&session), self.config.session_limits)?;
+            .reserve(Arc::clone(&session), self.config.session_limits)
+        {
+            let _ = self.config.terminal_journal.set_state(
+                session.terminal_id,
+                TerminalState::Terminated,
+                None,
+                Some("session_reservation_failed"),
+                Some(false),
+            );
+            return Err(error);
+        }
 
-        let spawned = spec
-            .command()
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(error) => {
+        let (pty, pts) = match pty_process::open() {
+            Ok(pair) => pair,
+            Err(_) => {
                 self.registry
                     .lock()
                     .await
                     .cancel_reservation(session.terminal_id);
-                return Err(RuntimeError::Io(error));
+                let _ = self.config.terminal_journal.set_state(
+                    session.terminal_id,
+                    TerminalState::Terminated,
+                    None,
+                    Some("pty_open_failed"),
+                    Some(false),
+                );
+                return Err(RuntimeError::Pty);
             }
         };
-        let Some(stdin) = child.stdin.take() else {
+        if configure_raw_pty(&pty).is_err()
+            || pty
+                .resize(Size::new(start.request.rows, start.request.cols))
+                .is_err()
+        {
             self.registry
                 .lock()
                 .await
                 .cancel_reservation(session.terminal_id);
-            return Err(RuntimeError::PodmanFailed);
+            let _ = self.config.terminal_journal.set_state(
+                session.terminal_id,
+                TerminalState::Terminated,
+                None,
+                Some("pty_initialization_failed"),
+                Some(false),
+            );
+            return Err(RuntimeError::Pty);
+        }
+        let spawned = spec.pty_command().spawn(pts);
+        let mut child = match spawned {
+            Ok(child) => child,
+            Err(_) => {
+                self.registry
+                    .lock()
+                    .await
+                    .cancel_reservation(session.terminal_id);
+                let _ = self.config.terminal_journal.set_state(
+                    session.terminal_id,
+                    TerminalState::Terminated,
+                    None,
+                    Some("spawn_failed"),
+                    Some(false),
+                );
+                return Err(RuntimeError::Pty);
+            }
         };
+        let (mut output, input) = pty.into_split();
         session
-            .stdin
+            .pty
             .try_lock()
-            .expect("new session stdin lock is uncontended")
-            .replace(stdin);
+            .expect("new session PTY lock is uncontended")
+            .replace(input);
+
+        let output_session = Arc::clone(&session);
+        let output_config = self.config.clone();
+        let output_task = tokio::spawn(async move {
+            let result = drain_pty_output(
+                &mut output,
+                &output_config.terminal_journal,
+                &output_session,
+            )
+            .await;
+            if let OutputDrain::Failed(reason) = result {
+                output_session.begin_termination();
+                let output_journal = output_config.terminal_journal.clone();
+                spawn_persistent_cleanup(output_config, Arc::clone(&output_session));
+                record_output_failure(&output_journal, &output_session, reason);
+            }
+            result
+        });
 
         let monitor_session = Arc::clone(&session);
         let registry = Arc::clone(&self.registry);
         let limits = self.config.session_limits;
+        let monitor_config = self.config.clone();
         tokio::spawn(async move {
-            let _ = child.wait().await;
-            monitor_session.stdin.lock().await.take();
+            let status = child.wait().await.ok();
+            monitor_session.pty.lock().await.take();
+            let output_result = match output_task.await {
+                Ok(result) => result,
+                Err(_) => {
+                    let _ = monitor_config.terminal_journal.set_state(
+                        monitor_session.terminal_id,
+                        monitor_session.lifecycle().terminal_state(),
+                        None,
+                        Some("pty_output_task_failed"),
+                        Some(false),
+                    );
+                    OutputDrain::Failed("pty_output_task_failed")
+                }
+            };
+            let _ = run_checked_with(
+                &monitor_config,
+                force_removal_spec(&monitor_config, monitor_session.terminal_id),
+            )
+            .await;
             let final_state = if monitor_session
                 .termination_requested
                 .load(Ordering::Acquire)
@@ -739,11 +1359,24 @@ impl SandboxRuntime for PodmanRuntime {
             } else {
                 LifecycleState::Exited
             };
+            let (exit_code, exit_reason) = exit_description(status.as_ref(), final_state);
+            let reason = match output_result {
+                OutputDrain::Complete => exit_reason,
+                OutputDrain::Failed(reason) => reason.to_owned(),
+            };
+            let _ = monitor_config.terminal_journal.set_state(
+                monitor_session.terminal_id,
+                final_state.terminal_state(),
+                exit_code,
+                Some(&reason),
+                matches!(output_result, OutputDrain::Failed(_)).then_some(false),
+            );
             registry
                 .lock()
                 .await
                 .complete(monitor_session.terminal_id, limits);
             monitor_session.transition(final_state);
+            monitor_session.output_notify.notify_waiters();
         });
         let mut cancellation_guard = CleanupOnDrop {
             config: self.config.clone(),
@@ -780,8 +1413,29 @@ impl SandboxRuntime for PodmanRuntime {
                     .remove_completed(session.terminal_id);
             }
             cancellation_guard.disarm();
+            let existing = self
+                .config
+                .terminal_journal
+                .inspect(session.terminal_id)
+                .ok();
+            let reason = existing
+                .as_ref()
+                .filter(|record| !record.output_complete)
+                .and_then(|record| record.reason.as_deref())
+                .unwrap_or("start_readiness_failed");
+            let _ = self.config.terminal_journal.set_state(
+                session.terminal_id,
+                TerminalState::Terminated,
+                None,
+                Some(reason),
+                Some(false),
+            );
             return Err(error);
         }
+        self.config
+            .terminal_journal
+            .set_running(session.terminal_id)
+            .map_err(map_journal_error)?;
         cancellation_guard.disarm();
         self.spawn_timeout(
             Arc::clone(&session),
@@ -790,41 +1444,116 @@ impl SandboxRuntime for PodmanRuntime {
         Ok(())
     }
 
-    async fn input(&self, terminal_id: Uuid, bytes: &[u8]) -> Result<(), RuntimeError> {
+    async fn input(
+        &self,
+        terminal_id: Uuid,
+        input_id: Uuid,
+        bytes: &[u8],
+    ) -> Result<InputOutcome, RuntimeError> {
         let session = self.session(terminal_id).await?;
         if session.lifecycle() != LifecycleState::Running {
             return Err(RuntimeError::NotRunning);
         }
-        let mut cancellation_guard = CleanupOnDrop {
-            config: self.config.clone(),
-            session: Arc::clone(&session),
-            armed: true,
-        };
-        let mut stdin = session.stdin.lock().await;
+        let fingerprint: [u8; 32] = Sha256::digest(bytes).into();
+        match self
+            .config
+            .terminal_journal
+            .begin_input(terminal_id, input_id, fingerprint)
+            .map_err(map_journal_error)?
+        {
+            InputDecision::Applied(bytes) => {
+                return Ok(InputOutcome {
+                    bytes,
+                    replayed: true,
+                });
+            }
+            InputDecision::Execute => {}
+        }
+        let mut pty = session.pty.lock().await;
         if session.lifecycle() != LifecycleState::Running {
+            let _ = self
+                .config
+                .terminal_journal
+                .mark_input_unknown(terminal_id, input_id);
             return Err(RuntimeError::NotRunning);
         }
         let write_result = tokio::time::timeout(self.config.input_write_timeout, async {
-            let stdin = stdin.as_mut().ok_or(RuntimeError::NotRunning)?;
-            stdin.write_all(bytes).await.map_err(RuntimeError::Io)?;
-            stdin.flush().await.map_err(RuntimeError::Io)
+            let pty = pty.as_mut().ok_or(RuntimeError::NotRunning)?;
+            pty.write_all(bytes).await.map_err(RuntimeError::Io)?;
+            pty.flush().await.map_err(RuntimeError::Io)
         })
         .await;
         match write_result {
             Ok(Ok(())) => {
-                cancellation_guard.disarm();
-                Ok(())
+                if self
+                    .config
+                    .terminal_journal
+                    .complete_input(terminal_id, input_id, bytes.len())
+                    .is_err()
+                {
+                    let _ = self
+                        .config
+                        .terminal_journal
+                        .mark_input_unknown(terminal_id, input_id);
+                    return Err(RuntimeError::OutcomeUnknown);
+                }
+                Ok(InputOutcome {
+                    bytes: bytes.len(),
+                    replayed: false,
+                })
             }
-            Ok(Err(error)) => Err(error),
-            Err(_) => {
-                stdin.take();
-                drop(stdin);
-                session.begin_termination();
-                spawn_persistent_cleanup(self.config.clone(), session);
-                cancellation_guard.disarm();
-                Err(RuntimeError::InputTimeout)
+            Ok(Err(_)) | Err(_) => {
+                let _ = self
+                    .config
+                    .terminal_journal
+                    .mark_input_unknown(terminal_id, input_id);
+                Err(RuntimeError::OutcomeUnknown)
             }
         }
+    }
+
+    async fn read_output(
+        &self,
+        terminal_id: Uuid,
+        after_cursor: u64,
+        max_bytes: usize,
+        wait: Duration,
+    ) -> Result<OutputRead, RuntimeError> {
+        let first = self
+            .config
+            .terminal_journal
+            .read_output(terminal_id, after_cursor, max_bytes)
+            .map_err(map_journal_error)?;
+        if !first.bytes.is_empty() || first.record.state != TerminalState::Running || wait.is_zero()
+        {
+            return Ok(first);
+        }
+        let Ok(session) = self.session(terminal_id).await else {
+            return Ok(first);
+        };
+        let notified = session.output_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        let second = self
+            .config
+            .terminal_journal
+            .read_output(terminal_id, after_cursor, max_bytes)
+            .map_err(map_journal_error)?;
+        if !second.bytes.is_empty() || second.record.state != TerminalState::Running {
+            return Ok(second);
+        }
+        let _ = tokio::time::timeout(wait, notified).await;
+        self.config
+            .terminal_journal
+            .read_output(terminal_id, after_cursor, max_bytes)
+            .map_err(map_journal_error)
+    }
+
+    async fn ack_output(&self, terminal_id: Uuid, cursor: u64) -> Result<u64, RuntimeError> {
+        self.config
+            .terminal_journal
+            .ack_output(terminal_id, cursor)
+            .map_err(map_journal_error)
     }
 
     async fn resize(&self, terminal_id: Uuid, cols: u16, rows: u16) -> Result<(), RuntimeError> {
@@ -832,14 +1561,76 @@ impl SandboxRuntime for PodmanRuntime {
         if session.lifecycle() != LifecycleState::Running {
             return Err(RuntimeError::NotRunning);
         }
-        self.run_checked(self.resize_spec(terminal_id, cols, rows))
+        session
+            .pty
+            .lock()
             .await
+            .as_ref()
+            .ok_or(RuntimeError::NotRunning)?
+            .resize(Size::new(rows, cols))
+            .map_err(|_| RuntimeError::Pty)?;
+        self.run_checked(self.resize_spec(terminal_id, cols, rows))
+            .await?;
+        self.config
+            .terminal_journal
+            .set_size(terminal_id, cols, rows)
+            .map_err(map_journal_error)
+    }
+
+    async fn interrupt(&self, terminal_id: Uuid) -> Result<(), RuntimeError> {
+        let session = self.session(terminal_id).await?;
+        if session.lifecycle() != LifecycleState::Running {
+            return Err(RuntimeError::NotRunning);
+        }
+        let mut pty = session.pty.lock().await;
+        let pty = pty.as_mut().ok_or(RuntimeError::NotRunning)?;
+        tokio::time::timeout(self.config.input_write_timeout, async {
+            pty.write_all(&[3]).await?;
+            pty.flush().await
+        })
+        .await
+        .map_err(|_| RuntimeError::OutcomeUnknown)?
+        .map_err(RuntimeError::Io)
+    }
+
+    async fn processes(&self, terminal_id: Uuid) -> Result<Vec<SandboxProcess>, RuntimeError> {
+        self.config
+            .terminal_journal
+            .inspect(terminal_id)
+            .map_err(map_journal_error)?;
+        let (status, output) = self
+            .run_output_bounded(self.processes_spec(terminal_id), MAX_TERMINAL_PROCESS_BYTES)
+            .await?;
+        if !status.success() {
+            return Err(RuntimeError::PodmanFailed);
+        }
+        parse_processes(&output)
+    }
+
+    async fn kill(&self, terminal_id: Uuid, pid: u32) -> Result<(), RuntimeError> {
+        if pid == 0 {
+            return Err(RuntimeError::InvalidConfiguration);
+        }
+        self.config
+            .terminal_journal
+            .inspect(terminal_id)
+            .map_err(map_journal_error)?;
+        self.run_checked(self.kill_spec(terminal_id, pid)).await
     }
 
     async fn terminate(&self, terminal_id: Uuid) -> Result<(), RuntimeError> {
         let session = self.session(terminal_id).await?;
+        if session.lifecycle().is_terminal() {
+            return Ok(());
+        }
         session.begin_termination();
-        spawn_persistent_cleanup(self.config.clone(), Arc::clone(&session));
+        let _ = self.config.terminal_journal.set_state(
+            terminal_id,
+            TerminalState::Terminating,
+            None,
+            Some("termination_requested"),
+            None,
+        );
         let deadline = Instant::now() + self.config.termination_timeout;
         if cleanup_until(&self.config, &session, deadline).await {
             Ok(())
@@ -850,13 +1641,214 @@ impl SandboxRuntime for PodmanRuntime {
     }
 
     async fn inspect(&self, terminal_id: Uuid) -> Result<RuntimeInspect, RuntimeError> {
-        let session = self.session(terminal_id).await?;
-        Ok(RuntimeInspect {
-            terminal_id,
-            workspace_id: session.workspace_id,
-            state: session.lifecycle().terminal_state(),
-        })
+        self.config
+            .terminal_journal
+            .inspect(terminal_id)
+            .map(RuntimeInspect::from)
+            .map_err(map_journal_error)
     }
+
+    async fn pause_workspace(&self, workspace_id: Uuid) -> Result<WorkspacePause, RuntimeError> {
+        let runtime = self.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = runtime.pause_workspace_owned(workspace_id).await;
+            if let Err(result) = send.send(result)
+                && let Ok(pause) = result
+            {
+                let _ = runtime.resume_workspace_owned(&pause).await;
+            }
+        });
+        receive
+            .await
+            .map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?
+    }
+
+    async fn resume_workspace(&self, pause: &WorkspacePause) -> Result<(), RuntimeError> {
+        self.resume_workspace_owned(pause).await
+    }
+
+    async fn reconcile_recoveries(&self) -> Result<(), RuntimeError> {
+        self.config
+            .terminal_journal
+            .reconcile_restart()
+            .map_err(map_journal_error)?;
+        let records = self
+            .config
+            .recovery_store
+            .list()
+            .map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?;
+        let managed = self.managed_containers(None).await?;
+        let mut removal_failed = false;
+        for (terminal_id, _) in &managed {
+            removal_failed |= self.terminate_managed(*terminal_id).await.is_err();
+        }
+        if removal_failed || !self.managed_containers(None).await?.is_empty() {
+            return Err(RuntimeError::WorkspaceRecoveryFailed);
+        }
+        for record in records {
+            self.config
+                .recovery_store
+                .clear(record.workspace_id, record.operation_id)
+                .map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_workspace_recovered(&self, workspace_id: Uuid) -> Result<(), RuntimeError> {
+        let records = self
+            .config
+            .recovery_store
+            .list()
+            .map_err(|_| RuntimeError::WorkspaceRecoveryFailed)?;
+        if let Some(record) = records
+            .into_iter()
+            .find(|record| record.workspace_id == workspace_id)
+        {
+            let terminal_ids = record
+                .containers
+                .iter()
+                .map(|name| {
+                    name.strip_prefix("gobrowse-")
+                        .and_then(|value| Uuid::parse_str(value).ok())
+                        .ok_or(RuntimeError::WorkspaceRecoveryFailed)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            self.resume_workspace_owned(&WorkspacePause {
+                workspace_id,
+                terminal_ids,
+                recovery_id: Some(record.operation_id),
+            })
+            .await?;
+        }
+        self.remove_workspace_orphans(workspace_id).await
+    }
+
+    async fn shutdown(&self) -> Result<(), RuntimeError> {
+        let terminal_ids = self
+            .registry
+            .lock()
+            .await
+            .sessions
+            .values()
+            .filter(|session| !session.lifecycle().is_terminal())
+            .map(|session| session.terminal_id)
+            .collect::<Vec<_>>();
+        for terminal_id in terminal_ids {
+            let _ = self.terminate(terminal_id).await;
+        }
+        let remaining = self.managed_containers(None).await?;
+        for (terminal_id, _) in remaining {
+            self.terminate_managed(terminal_id).await?;
+        }
+        Ok(())
+    }
+}
+
+async fn drain_pty_output(
+    output: &mut pty_process::OwnedReadPty,
+    journal: &TerminalJournal,
+    session: &Session,
+) -> OutputDrain {
+    let mut buffer = [0_u8; MAX_TERMINAL_OUTPUT_CHUNK_BYTES];
+    let result = loop {
+        match output.read(&mut buffer).await {
+            Ok(0) => break OutputDrain::Complete,
+            Ok(bytes) => match journal.append_output(session.terminal_id, &buffer[..bytes]) {
+                Ok(accepted) if accepted == bytes => session.output_notify.notify_waiters(),
+                Ok(_) => break OutputDrain::Failed("terminal_output_limit_exceeded"),
+                Err(_) => break OutputDrain::Failed("terminal_output_journal_failed"),
+            },
+            Err(error) if error.raw_os_error() == Some(5) => break OutputDrain::Complete,
+            Err(_) => break OutputDrain::Failed("pty_output_failed"),
+        }
+    };
+    session.output_notify.notify_waiters();
+    result
+}
+
+fn record_output_failure(journal: &TerminalJournal, session: &Session, reason: &str) {
+    let record = journal.inspect(session.terminal_id).ok();
+    let _ = journal.set_state(
+        session.terminal_id,
+        session.lifecycle().terminal_state(),
+        record.as_ref().and_then(|record| record.exit_code),
+        Some(reason),
+        Some(false),
+    );
+}
+
+fn configure_raw_pty(pty: &pty_process::Pty) -> Result<(), RuntimeError> {
+    let mut attributes = rustix::termios::tcgetattr(pty).map_err(|_| RuntimeError::Pty)?;
+    attributes.make_raw();
+    rustix::termios::tcsetattr(pty, rustix::termios::OptionalActions::Now, &attributes)
+        .map_err(|_| RuntimeError::Pty)
+}
+
+fn start_fingerprint(start: &ValidatedStart) -> Result<[u8; 32], RuntimeError> {
+    let mut encoded =
+        serde_json::to_vec(&start.request).map_err(|_| RuntimeError::InvalidConfiguration)?;
+    encoded.extend_from_slice(start.network_name.as_bytes());
+    Ok(Sha256::digest(encoded).into())
+}
+
+fn map_journal_error(error: JournalError) -> RuntimeError {
+    match error {
+        JournalError::NotFound => RuntimeError::NotFound,
+        JournalError::Conflict => RuntimeError::Conflict,
+        JournalError::OutcomeUnknown => RuntimeError::OutcomeUnknown,
+        error => RuntimeError::Journal(error),
+    }
+}
+
+fn exit_description(
+    status: Option<&std::process::ExitStatus>,
+    state: LifecycleState,
+) -> (Option<i32>, String) {
+    if state == LifecycleState::Terminated {
+        return (
+            status.and_then(std::process::ExitStatus::code),
+            "terminated".into(),
+        );
+    }
+    match status {
+        Some(status) if status.code().is_some() => (
+            status.code(),
+            format!("exit_status_{}", status.code().unwrap_or_default()),
+        ),
+        Some(status) if status.signal().is_some() => (
+            None,
+            format!("exit_signal_{}", status.signal().unwrap_or_default()),
+        ),
+        Some(_) => (None, "exited".into()),
+        None => (None, "wait_failed".into()),
+    }
+}
+
+fn parse_processes(output: &[u8]) -> Result<Vec<SandboxProcess>, RuntimeError> {
+    let output = std::str::from_utf8(output).map_err(|_| RuntimeError::PodmanFailed)?;
+    let mut processes = Vec::new();
+    let mut command_bytes = 0_usize;
+    for line in output.lines().skip(1) {
+        let mut fields = line.trim().splitn(2, char::is_whitespace);
+        let pid = fields
+            .next()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|pid| *pid != 0)
+            .ok_or(RuntimeError::PodmanFailed)?;
+        let command = fields.next().unwrap_or_default().trim().to_owned();
+        command_bytes = command_bytes
+            .checked_add(command.len())
+            .ok_or(RuntimeError::PodmanFailed)?;
+        if command.len() > MAX_TERMINAL_PROCESS_COMMAND_BYTES
+            || command_bytes > MAX_TERMINAL_PROCESS_BYTES
+            || processes.len() >= MAX_TERMINAL_PROCESSES
+        {
+            return Err(RuntimeError::PodmanFailed);
+        }
+        processes.push(SandboxProcess { pid, command });
+    }
+    Ok(processes)
 }
 
 pub fn effective_uid_from_proc_status(status: &str) -> Result<u32, RuntimeError> {
@@ -897,6 +1889,12 @@ fn valid_runtime_network(policy: gobrowse_core::sandbox::NetworkPolicy, name: &s
     }
 }
 
+fn valid_workspace_volume_name(name: &str) -> bool {
+    name.len() == "gobrowse-workspace-".len() + 36
+        && name.starts_with("gobrowse-workspace-")
+        && Uuid::parse_str(&name["gobrowse-workspace-".len()..]).is_ok()
+}
+
 fn cpu_limit(cpu_millis: u32) -> String {
     format!("{}.{:03}", cpu_millis / 1_000, cpu_millis % 1_000)
 }
@@ -907,13 +1905,319 @@ fn container_name(terminal_id: Uuid) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write, os::unix::fs::PermissionsExt, path::Path, sync::Barrier};
+    use std::{
+        fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        path::Path,
+        sync::{Barrier, OnceLock},
+    };
 
-    use gobrowse_core::sandbox::{HARD_RESOURCE_LIMITS, NetworkPolicy, ResourceLimits};
+    use gobrowse_core::sandbox::{
+        HARD_RESOURCE_LIMITS, MAX_TERMINAL_OUTPUT_BYTES, NetworkPolicy, ResourceLimits,
+    };
 
     use super::*;
 
+    async fn read_pty_until(output: &mut pty_process::OwnedReadPty, expected: &[u8]) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut collected = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !collected
+                .windows(expected.len())
+                .any(|window| window == expected)
+            {
+                let bytes = output.read(&mut buffer).await.unwrap();
+                assert_ne!(bytes, 0, "PTY closed before expected output");
+                collected.extend_from_slice(&buffer[..bytes]);
+                assert!(collected.len() <= 16 * 1024);
+            }
+            collected
+        })
+        .await
+        .unwrap()
+    }
+
+    struct JournalFile(PathBuf);
+
+    impl JournalFile {
+        fn new() -> Self {
+            Self(std::env::temp_dir().join(format!(
+                "gobrowse-local-pty-journal-{}.sqlite3",
+                Uuid::new_v4()
+            )))
+        }
+    }
+
+    impl Drop for JournalFile {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = fs::remove_file(format!("{}{}", self.0.display(), suffix));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_pty_is_a_tty_and_supports_input_resize_interrupt_and_background_output() {
+        let (pty, pts) = pty_process::open().unwrap();
+        configure_raw_pty(&pty).unwrap();
+        pty.resize(Size::new(40, 100)).unwrap();
+        let script = r#"stty sane
+trap 'printf "INTERRUPTED\n"; exit 130' INT
+printf 'TTY=%s SIZE=%s\n' "$(test -t 0 && echo yes || echo no)" "$(stty size)"
+IFS= read -r line
+printf 'INPUT=%s\n' "$line"
+(sleep 0.05; printf 'BACKGROUND\n') &
+trap 'printf "RESIZED=%s\n" "$(stty size)"' WINCH
+while :; do sleep 0.1; done"#;
+        let mut child = pty_process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", MINIMAL_PATH)
+            .kill_on_drop(false)
+            .spawn(pts)
+            .unwrap();
+        let (mut output, mut input) = pty.into_split();
+
+        let initial = read_pty_until(&mut output, b"SIZE=40 100").await;
+        assert!(initial.windows(7).any(|window| window == b"TTY=yes"));
+        input.write_all(b"hello pty\n").await.unwrap();
+        input.flush().await.unwrap();
+        let echoed = read_pty_until(&mut output, b"BACKGROUND").await;
+        assert!(
+            echoed
+                .windows(15)
+                .any(|window| window == b"INPUT=hello pty")
+        );
+
+        input.resize(Size::new(55, 120)).unwrap();
+        let resized = read_pty_until(&mut output, b"RESIZED=55 120").await;
+        assert!(
+            resized
+                .windows(14)
+                .any(|window| window == b"RESIZED=55 120")
+        );
+
+        input.write_all(&[3]).await.unwrap();
+        input.flush().await.unwrap();
+        let interrupted = read_pty_until(&mut output, b"INTERRUPTED").await;
+        assert!(
+            interrupted
+                .windows(11)
+                .any(|window| window == b"INTERRUPTED")
+        );
+        let status = tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.code(), Some(130));
+    }
+
+    #[tokio::test]
+    async fn local_pty_output_replays_by_cursor_after_ack_reopen_and_restart() {
+        let file = JournalFile::new();
+        let journal = TerminalJournal::open(&file.0).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        journal
+            .begin_start(terminal_id, workspace_id, [5; 32], 80, 24)
+            .unwrap();
+        journal.set_running(terminal_id).unwrap();
+
+        let (pty, pts) = pty_process::open().unwrap();
+        configure_raw_pty(&pty).unwrap();
+        let mut child = pty_process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf alpha; sleep 30")
+            .kill_on_drop(false)
+            .spawn(pts)
+            .unwrap();
+        let (mut output, input) = pty.into_split();
+        let session = Arc::new(Session::new(terminal_id, workspace_id));
+        assert!(session.transition(LifecycleState::Running));
+        let output_journal = journal.clone();
+        let output_session = Arc::clone(&session);
+        let pump = tokio::spawn(async move {
+            drain_pty_output(&mut output, &output_journal, &output_session).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while journal.inspect(terminal_id).unwrap().output_end_cursor < 5 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let first = journal.read_output(terminal_id, 0, 3).unwrap();
+        assert_eq!(first.bytes, b"alp");
+        journal.ack_output(terminal_id, first.next_cursor).unwrap();
+
+        let reopened = TerminalJournal::open(&file.0).unwrap();
+        let replayed = reopened
+            .read_output(terminal_id, first.next_cursor, 32)
+            .unwrap();
+        assert_eq!(replayed.bytes, b"ha");
+        pump.abort();
+        assert!(pump.await.unwrap_err().is_cancelled());
+        assert_eq!(reopened.reconcile_restart().unwrap(), [terminal_id]);
+        let lost = reopened.inspect(terminal_id).unwrap();
+        assert_eq!(lost.state, TerminalState::Lost);
+        assert!(!lost.output_complete);
+
+        child.kill().await.unwrap();
+        drop(input);
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_pty_output_limit_stops_the_drain_and_is_durable() {
+        let file = JournalFile::new();
+        let journal = TerminalJournal::open(&file.0).unwrap();
+        let terminal_id = Uuid::new_v4();
+        let workspace_id = Uuid::new_v4();
+        journal
+            .begin_start(terminal_id, workspace_id, [6; 32], 80, 24)
+            .unwrap();
+        journal.set_running(terminal_id).unwrap();
+        journal
+            .set_output_bytes_for_test(terminal_id, MAX_TERMINAL_OUTPUT_BYTES - 10)
+            .unwrap();
+
+        let (pty, pts) = pty_process::open().unwrap();
+        configure_raw_pty(&pty).unwrap();
+        let mut child = pty_process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf 0123456789ABCDEFGHIJ; while :; do sleep 1; done")
+            .kill_on_drop(false)
+            .spawn(pts)
+            .unwrap();
+        let (mut output, input) = pty.into_split();
+        let session = Session::new(terminal_id, workspace_id);
+        assert!(session.transition(LifecycleState::Running));
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            drain_pty_output(&mut output, &journal, &session),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result,
+            OutputDrain::Failed("terminal_output_limit_exceeded")
+        );
+        record_output_failure(&journal, &session, "terminal_output_limit_exceeded");
+        let record = journal.inspect(terminal_id).unwrap();
+        assert_eq!(record.output_end_cursor, 10);
+        assert_eq!(
+            record.reason.as_deref(),
+            Some("terminal_output_limit_exceeded")
+        );
+        assert!(!record.output_complete);
+        assert_eq!(
+            journal.read_output(terminal_id, 0, 32).unwrap().bytes,
+            b"0123456789"
+        );
+
+        drop(input);
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_pty_concurrent_resize_write_kill_and_exit_do_not_deadlock() {
+        let (pty, pts) = pty_process::open().unwrap();
+        configure_raw_pty(&pty).unwrap();
+        pty.resize(Size::new(24, 80)).unwrap();
+        let mut child = pty_process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf READY; while :; do IFS= read -r line || exit; printf '%s' \"$line\"; done")
+            .kill_on_drop(false)
+            .spawn(pts)
+            .unwrap();
+        let (mut output, input) = pty.into_split();
+        read_pty_until(&mut output, b"READY").await;
+        let input = Arc::new(tokio::sync::Mutex::new(input));
+        let start = Arc::new(tokio::sync::Barrier::new(3));
+
+        let writer = {
+            let input = Arc::clone(&input);
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                for _ in 0..1_000 {
+                    let mut input = input.lock().await;
+                    if input.write_all(b"line\n").await.is_err() {
+                        break;
+                    }
+                    drop(input);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        let resizer = {
+            let input = Arc::clone(&input);
+            let start = Arc::clone(&start);
+            tokio::spawn(async move {
+                start.wait().await;
+                for index in 0..1_000_u16 {
+                    let input = input.lock().await;
+                    let _ = input.resize(Size::new(24 + index % 20, 80 + index % 40));
+                    drop(input);
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        start.wait().await;
+        tokio::task::yield_now().await;
+        child.start_kill().unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            writer.await.unwrap();
+            resizer.await.unwrap();
+        })
+        .await
+        .unwrap();
+        assert!(!status.success());
+    }
+
+    fn test_filesystem() -> &'static crate::Filesystem {
+        static FILESYSTEM: OnceLock<crate::Filesystem> = OnceLock::new();
+        FILESYSTEM.get_or_init(|| {
+            let storage_root =
+                std::env::temp_dir().join(format!("gobrowse-runtime-storage-{}", Uuid::new_v4()));
+            fs::create_dir(&storage_root).unwrap();
+            fs::set_permissions(&storage_root, fs::Permissions::from_mode(0o700)).unwrap();
+            let filesystem = crate::Filesystem::new(&storage_root).unwrap();
+            filesystem.ensure_workspace(Uuid::from_u128(1)).unwrap();
+            filesystem
+        })
+    }
+
+    fn test_terminal_journal() -> TerminalJournal {
+        static JOURNAL: OnceLock<TerminalJournal> = OnceLock::new();
+        JOURNAL
+            .get_or_init(|| {
+                TerminalJournal::open(std::env::temp_dir().join(format!(
+                    "gobrowse-runtime-terminals-{}.sqlite3",
+                    Uuid::new_v4()
+                )))
+                .unwrap()
+            })
+            .clone()
+    }
+
+    async fn recovery_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
     fn config(provisioning: WorkspaceProvisioning) -> PodmanConfig {
+        let filesystem = test_filesystem();
         PodmanConfig {
             executable: PathBuf::from("/usr/bin/podman"),
             image: "registry.example/gobrowse/sandbox@sha256:abc123".into(),
@@ -927,11 +2231,15 @@ mod tests {
                 max_retained_records: 8,
             },
             workspace_provisioning: provisioning,
+            deployment_id: Uuid::from_u128(2),
+            workspace_resolver: filesystem.resolver(),
+            recovery_store: filesystem.recovery_store(),
+            terminal_journal: test_terminal_journal(),
         }
     }
 
     fn runtime() -> PodmanRuntime {
-        PodmanRuntime::from_validated_config(config(WorkspaceProvisioning::QuotaManaged {
+        PodmanRuntime::from_validated_config(config(WorkspaceProvisioning::NamedVolume {
             maximum_bytes: HARD_RESOURCE_LIMITS.writable_storage_bytes,
         }))
         .unwrap()
@@ -946,7 +2254,7 @@ mod tests {
         ValidatedStart {
             terminal_id: Uuid::nil(),
             request: TerminalStartRequest {
-                workspace_id: Uuid::nil(),
+                workspace_id: Uuid::from_u128(1),
                 command,
                 working_directory: "src".into(),
                 cols: 80,
@@ -960,7 +2268,9 @@ mod tests {
                     execution_seconds: 60,
                 },
             },
-            workspace_path: PathBuf::from("/srv/gobrowse/workspaces/workspace"),
+            workspace_storage: test_filesystem()
+                .workspace_storage(Uuid::from_u128(1))
+                .unwrap(),
             network_name: network_name.into(),
         }
     }
@@ -973,6 +2283,15 @@ mod tests {
             .unwrap();
         assert_eq!(spec.program, Path::new("/usr/bin/podman"));
         for required in [
+            "--interactive",
+            "--tty",
+            "--sig-proxy=false",
+            "--detach-keys=",
+            "--init",
+            "--pull=never",
+            "--log-driver=none",
+            "--image-volume=ignore",
+            "--http-proxy=false",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
@@ -987,7 +2306,16 @@ mod tests {
                 "{required}"
             );
         }
+        assert!(!spec.args.iter().any(|argument| argument == "--rm"));
         assert!(!spec.args.iter().any(|argument| argument == "--privileged"));
+        for label in [
+            "io.gobrowse.managed=true",
+            "io.gobrowse.deployment-id=00000000-0000-0000-0000-000000000002",
+            "io.gobrowse.workspace-id=00000000-0000-0000-0000-000000000001",
+            "io.gobrowse.terminal-id=00000000-0000-0000-0000-000000000000",
+        ] {
+            assert!(spec.args.iter().any(|argument| argument == label));
+        }
         assert!(
             !spec
                 .args
@@ -1011,16 +2339,42 @@ mod tests {
     }
 
     #[test]
+    fn workspace_volume_identity_is_generated_and_allowlisted() {
+        let runtime = runtime();
+        let workspace_id = Uuid::from_u128(1);
+        assert_eq!(
+            runtime.volume_inspect_spec(workspace_id).args,
+            [
+                "volume",
+                "inspect",
+                "--format",
+                "{{.Name}}|{{.Driver}}|{{json .Options}}|{{.Mountpoint}}",
+                "gobrowse-workspace-00000000-0000-0000-0000-000000000001",
+            ]
+        );
+        let spec = runtime
+            .start_spec(&start(vec!["true".into()], "none"))
+            .unwrap();
+        assert!(spec.args.windows(2).any(|pair| {
+            pair
+                == [
+                    "--volume",
+                    "gobrowse-workspace-00000000-0000-0000-0000-000000000001:/workspace:rw,nodev,nosuid",
+                ]
+        }));
+    }
+
+    #[test]
     fn unmanaged_or_insufficient_workspace_quota_fails_closed() {
         let unmanaged =
-            PodmanRuntime::from_validated_config(config(WorkspaceProvisioning::UnmanagedBindMount))
+            PodmanRuntime::from_validated_config(config(WorkspaceProvisioning::Unverified))
                 .unwrap();
         assert!(matches!(
             unmanaged.start_spec(&start(vec!["true".into()], "none")),
             Err(RuntimeError::WorkspaceQuotaUnavailable)
         ));
         let limited =
-            PodmanRuntime::from_validated_config(config(WorkspaceProvisioning::QuotaManaged {
+            PodmanRuntime::from_validated_config(config(WorkspaceProvisioning::NamedVolume {
                 maximum_bytes: 1,
             }))
             .unwrap();
@@ -1040,19 +2394,8 @@ mod tests {
         let workspace = Uuid::new_v4();
         let other_workspace = Uuid::new_v4();
         let mut registry = Registry::new();
-        let make_session = |terminal_id, workspace_id| {
-            let mut child = Command::new("/bin/true")
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap();
-            let session = Arc::new(Session::new(terminal_id, workspace_id));
-            session
-                .stdin
-                .try_lock()
-                .unwrap()
-                .replace(child.stdin.take().unwrap());
-            session
-        };
+        let make_session =
+            |terminal_id, workspace_id| Arc::new(Session::new(terminal_id, workspace_id));
         let first = make_session(Uuid::new_v4(), workspace);
         registry.reserve(Arc::clone(&first), limits).unwrap();
         assert!(matches!(
@@ -1119,7 +2462,7 @@ mod tests {
         assert!(
             PodmanRuntime::from_validated_config(PodmanConfig {
                 image: "--privileged".into(),
-                ..config(WorkspaceProvisioning::QuotaManaged {
+                ..config(WorkspaceProvisioning::NamedVolume {
                     maximum_bytes: HARD_RESOURCE_LIMITS.writable_storage_bytes,
                 })
             })
@@ -1130,13 +2473,18 @@ mod tests {
                 .start_spec(&start(vec!["true".into()], "container:host"))
                 .is_err()
         );
-        assert!(
-            runtime()
-                .start_spec(&ValidatedStart {
-                    workspace_path: PathBuf::from("/tmp/unsafe:volume"),
-                    ..start(vec!["true".into()], "none")
-                })
-                .is_err()
+        let spec = runtime()
+            .start_spec(&start(vec!["true".into()], "none"))
+            .unwrap();
+        let volume = spec
+            .args
+            .windows(2)
+            .find(|pair| pair[0] == "--volume")
+            .unwrap()[1]
+            .clone();
+        assert_eq!(
+            volume,
+            "gobrowse-workspace-00000000-0000-0000-0000-000000000001:/workspace:rw,nodev,nosuid"
         );
     }
 
@@ -1203,7 +2551,15 @@ mod tests {
         root: PathBuf,
         executable: PathBuf,
         log: PathBuf,
+        marker: PathBuf,
+        container_info: PathBuf,
         control_failures: PathBuf,
+        pause_block: PathBuf,
+        pause_entered: PathBuf,
+        pause_inspect_block: PathBuf,
+        pause_inspect_entered: PathBuf,
+        unpause_failures: PathBuf,
+        output_trigger: PathBuf,
     }
 
     impl FakePodman {
@@ -1218,6 +2574,17 @@ mod tests {
             let control_failures = root.join("control-failures");
             let resize_failure = root.join("resize-failure");
             let slow_readiness = root.join("slow-readiness");
+            let paused = root.join("paused");
+            let container_info = root.join("container-info");
+            let pause_block = root.join("pause-block");
+            let pause_entered = root.join("pause-entered");
+            let pause_inspect_block = root.join("pause-inspect-block");
+            let pause_inspect_entered = root.join("pause-inspect-entered");
+            let unpause_failures = root.join("unpause-failures");
+            let output_trigger = root.join("output-trigger");
+            let volume_mountpoint = test_filesystem()
+                .resolver()
+                .expected_mountpoint(Uuid::from_u128(1));
             let script = format!(
                 r#"#!/bin/sh
 marker="{}"
@@ -1225,26 +2592,79 @@ log="{}"
 control_failures="{}"
 resize_failure="{}"
 slow_readiness="{}"
+paused="{}"
+container_info="{}"
+pause_block="{}"
+pause_entered="{}"
+pause_inspect_block="{}"
+pause_inspect_entered="{}"
+unpause_failures="{}"
+output_trigger="{}"
 printf '%s\n' "$*" >> "$log"
 case "$1" in
+  volume)
+    [ "$2" = inspect ] || exit 1
+    name="$5"
+    printf '%s|local|{{}}|{}\n' "$name"
+    ;;
   run)
     mode=hold
     for argument in "$@"; do
+      case "$argument" in
+        io.gobrowse.terminal-id=*) terminal="${{argument#*=}}" ;;
+        io.gobrowse.workspace-id=*) workspace="${{argument#*=}}" ;;
+      esac
       [ "$argument" = natural ] && mode=natural
       [ "$argument" = never-ready ] && mode=never-ready
       [ "$argument" = control-recover ] && printf '2\n' > "$control_failures"
       [ "$argument" = control-persistent ] && printf 'persistent\n' > "$control_failures"
       [ "$argument" = resize-fail ] && : > "$resize_failure"
-      [ "$argument" = slow-ready ] && : > "$slow_readiness"
+       [ "$argument" = slow-ready ] && : > "$slow_readiness"
+      [ "$argument" = output-overflow ] && mode=output-overflow
     done
+    printf 'gobrowse-%s|%s|%s\n' "$terminal" "$terminal" "$workspace" > "$container_info"
     if [ "$mode" = never-ready ]; then sleep 0.30; exit 0; fi
     : > "$marker"
     if [ "$mode" = natural ]; then sleep 0.20; rm -f "$marker"; exit 0; fi
+    if [ "$mode" = output-overflow ]; then
+      while [ ! -e "$output_trigger" ] && [ -e "$marker" ]; do sleep 0.01; done
+      [ -e "$marker" ] || exit 0
+      printf '0123456789ABCDEFGHIJ'
+    fi
     while [ -e "$marker" ]; do sleep 0.05; done
     ;;
+  ps)
+    [ -e "$marker" ] && cat "$container_info"
+    true
+    ;;
   inspect)
+    if [ "$3" = "{{{{.State.Paused}}}}" ]; then
+      if [ -e "$pause_inspect_block" ]; then
+        : > "$pause_inspect_entered"
+        while [ -e "$pause_inspect_block" ]; do sleep 0.01; done
+      fi
+      [ -e "$paused" ] && printf 'true\n' || printf 'false\n'
+      exit 0
+    fi
     if [ -e "$slow_readiness" ]; then sleep 0.20; rm -f "$slow_readiness"; fi
     [ -e "$marker" ] && printf 'true\n' || exit 1
+    ;;
+  pause)
+    [ -e "$marker" ] || exit 1
+    : > "$pause_entered"
+    while [ -e "$pause_block" ]; do sleep 0.01; done
+    : > "$paused"
+    ;;
+  unpause)
+    [ -e "$paused" ] || exit 1
+    if [ -e "$unpause_failures" ]; then
+      failures=$(cat "$unpause_failures")
+      if [ "$failures" -gt 0 ]; then
+        printf '%s\n' "$((failures - 1))" > "$unpause_failures"
+        exit 1
+      fi
+    fi
+    rm -f "$paused"
     ;;
   container)
     [ "$2" = resize ] || exit 1
@@ -1259,7 +2679,7 @@ case "$1" in
         exit 1
       fi
     fi
-    rm -f "$marker"
+    rm -f "$marker" "$paused" "$container_info"
     ;;
 esac
 "#,
@@ -1268,6 +2688,15 @@ esac
                 control_failures.display(),
                 resize_failure.display(),
                 slow_readiness.display(),
+                paused.display(),
+                container_info.display(),
+                pause_block.display(),
+                pause_entered.display(),
+                pause_inspect_block.display(),
+                pause_inspect_entered.display(),
+                unpause_failures.display(),
+                output_trigger.display(),
+                volume_mountpoint.display(),
             );
             let mut file = fs::File::create(&temporary_executable).unwrap();
             file.write_all(script.as_bytes()).unwrap();
@@ -1280,7 +2709,15 @@ esac
                 root,
                 executable,
                 log,
+                marker,
+                container_info,
                 control_failures,
+                pause_block,
+                pause_entered,
+                pause_inspect_block,
+                pause_inspect_entered,
+                unpause_failures,
+                output_trigger,
             }
         }
 
@@ -1291,7 +2728,7 @@ esac
                 control_timeout: Duration::from_millis(100),
                 termination_timeout: Duration::from_millis(300),
                 input_write_timeout: Duration::from_millis(50),
-                ..config(WorkspaceProvisioning::QuotaManaged {
+                ..config(WorkspaceProvisioning::NamedVolume {
                     maximum_bytes: HARD_RESOURCE_LIMITS.writable_storage_bytes,
                 })
             })
@@ -1305,6 +2742,44 @@ esac
         fn allow_control_recovery(&self) {
             let _ = fs::remove_file(&self.control_failures);
         }
+
+        fn block_pause(&self) {
+            fs::write(&self.pause_block, b"").unwrap();
+        }
+
+        fn release_pause(&self) {
+            let _ = fs::remove_file(&self.pause_block);
+        }
+
+        fn block_pause_inspect(&self) {
+            fs::write(&self.pause_inspect_block, b"").unwrap();
+        }
+
+        fn release_pause_inspect(&self) {
+            let _ = fs::remove_file(&self.pause_inspect_block);
+        }
+
+        fn fail_unpause(&self, attempts: usize) {
+            fs::write(&self.unpause_failures, attempts.to_string()).unwrap();
+        }
+
+        fn trigger_output(&self) {
+            fs::write(&self.output_trigger, b"").unwrap();
+        }
+
+        fn seed_survivor(&self, terminal_id: Uuid, workspace_id: Uuid) {
+            fs::write(&self.marker, b"").unwrap();
+            fs::write(
+                &self.container_info,
+                format!(
+                    "{}|{}|{}\n",
+                    container_name(terminal_id),
+                    terminal_id,
+                    workspace_id
+                ),
+            )
+            .unwrap();
+        }
     }
 
     impl Drop for FakePodman {
@@ -1315,6 +2790,7 @@ esac
 
     #[tokio::test]
     async fn start_waits_for_readiness_and_terminal_transitions_are_coherent() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
         let runtime = fake.runtime(Duration::from_millis(500));
         let terminal_id = Uuid::new_v4();
@@ -1360,7 +2836,201 @@ esac
     }
 
     #[tokio::test]
+    async fn journal_output_limit_terminates_the_foreground_pty_workload() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = fake.runtime(Duration::from_millis(500));
+        let terminal_id = Uuid::new_v4();
+        runtime
+            .start(ValidatedStart {
+                terminal_id,
+                ..start(vec!["output-overflow".into()], "none")
+            })
+            .await
+            .unwrap();
+        runtime
+            .config
+            .terminal_journal
+            .set_output_bytes_for_test(terminal_id, MAX_TERMINAL_OUTPUT_BYTES - 10)
+            .unwrap();
+        fake.trigger_output();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let inspected = runtime.inspect(terminal_id).await.unwrap();
+                if inspected.state == TerminalState::Terminated {
+                    assert_eq!(
+                        inspected.reason.as_deref(),
+                        Some("terminal_output_limit_exceeded")
+                    );
+                    assert!(!inspected.output_complete);
+                    assert_eq!(inspected.output_end_cursor, 10);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(runtime.managed_containers(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn startup_marks_unattachable_pty_lost_and_removes_surviving_container() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = fake.runtime(Duration::from_millis(500));
+        let terminal_id = Uuid::new_v4();
+        let workspace_id = Uuid::from_u128(1);
+        runtime
+            .config
+            .terminal_journal
+            .begin_start(terminal_id, workspace_id, [8; 32], 90, 30)
+            .unwrap();
+        runtime
+            .config
+            .terminal_journal
+            .set_running(terminal_id)
+            .unwrap();
+        fake.seed_survivor(terminal_id, workspace_id);
+
+        runtime.reconcile_recoveries().await.unwrap();
+        let inspected = runtime.inspect(terminal_id).await.unwrap();
+        assert_eq!(inspected.state, TerminalState::Lost);
+        assert_eq!(inspected.reason.as_deref(), Some("daemon_restart_pty_lost"));
+        assert!(!inspected.output_complete);
+        assert!(runtime.managed_containers(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn volume_labels_are_verified_and_active_workspace_pause_is_positive() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = fake.runtime(Duration::from_millis(500));
+        let terminal_id = Uuid::new_v4();
+        let workspace_id = Uuid::from_u128(1);
+        runtime
+            .start(ValidatedStart {
+                terminal_id,
+                ..start(vec!["hold".into()], "none")
+            })
+            .await
+            .unwrap();
+        let pause = runtime.pause_workspace(workspace_id).await.unwrap();
+        assert_eq!(pause.workspace_id, workspace_id);
+        assert_eq!(pause.terminal_ids, [terminal_id]);
+        runtime.resume_workspace(&pause).await.unwrap();
+        let log = fake.command_log();
+        assert!(log.contains(&format!("pause {}", container_name(terminal_id))));
+        assert!(log.contains("{{.State.Paused}}"));
+        assert!(log.contains(&format!("unpause {}", container_name(terminal_id))));
+        runtime.terminate(terminal_id).await.unwrap();
+
+        let invalid_runtime = PodmanRuntime::from_validated_config(PodmanConfig {
+            executable: fake.executable.clone(),
+            workspace_provisioning: WorkspaceProvisioning::NamedVolume { maximum_bytes: 2 },
+            ..config(WorkspaceProvisioning::NamedVolume { maximum_bytes: 2 })
+        })
+        .unwrap();
+        let mut invalid_start = start(vec!["true".into()], "none");
+        invalid_start.request.limits.writable_storage_bytes = 1;
+        invalid_start.workspace_storage.inode += 1;
+        assert!(matches!(
+            invalid_runtime.start(invalid_start).await,
+            Err(RuntimeError::WorkspaceVolumeInvalid)
+        ));
+    }
+
+    #[tokio::test]
+    async fn pause_cancellation_unpause_retry_and_restart_recovery_are_durable() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = Arc::new(fake.runtime(Duration::from_millis(500)));
+        let workspace_id = Uuid::from_u128(1);
+        let terminal_id = Uuid::new_v4();
+        runtime
+            .start(ValidatedStart {
+                terminal_id,
+                ..start(vec!["hold".into()], "none")
+            })
+            .await
+            .unwrap();
+
+        fake.block_pause();
+        let pausing = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.pause_workspace(workspace_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !fake.pause_entered.exists()
+                || runtime.config.recovery_store.list().unwrap().is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pausing.abort();
+        fake.release_pause();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !runtime.config.recovery_store.list().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        fake.block_pause_inspect();
+        let pausing = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move { runtime.pause_workspace(workspace_id).await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !fake.pause_inspect_entered.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        pausing.abort();
+        fake.release_pause_inspect();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !runtime.config.recovery_store.list().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let pause = runtime.pause_workspace(workspace_id).await.unwrap();
+        fake.fail_unpause(2);
+        runtime.resume_workspace(&pause).await.unwrap();
+        assert!(runtime.config.recovery_store.list().unwrap().is_empty());
+
+        let pause = runtime.pause_workspace(workspace_id).await.unwrap();
+        fake.fail_unpause(10);
+        assert!(matches!(
+            runtime.resume_workspace(&pause).await,
+            Err(RuntimeError::WorkspaceResumeFailed)
+        ));
+        assert!(!runtime.config.recovery_store.list().unwrap().is_empty());
+        let blocked = runtime
+            .start(ValidatedStart {
+                terminal_id: Uuid::new_v4(),
+                ..start(vec!["hold".into()], "none")
+            })
+            .await;
+        assert!(matches!(blocked, Err(RuntimeError::WorkspaceResumeFailed)));
+
+        let restarted = fake.runtime(Duration::from_millis(500));
+        restarted.reconcile_recoveries().await.unwrap();
+        assert!(restarted.config.recovery_store.list().unwrap().is_empty());
+        assert!(restarted.managed_containers(None).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn start_fails_when_positive_readiness_is_not_observed() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
         let runtime = fake.runtime(Duration::from_millis(50));
         let result = runtime
@@ -1377,20 +3047,34 @@ esac
 
     #[tokio::test]
     async fn cancellation_during_start_arms_container_cleanup() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
-        let runtime = fake.runtime(Duration::from_millis(500));
+        let runtime = Arc::new(fake.runtime(Duration::from_millis(500)));
         let terminal_id = Uuid::new_v4();
-        assert!(
-            tokio::time::timeout(
-                Duration::from_millis(10),
-                runtime.start(ValidatedStart {
-                    terminal_id,
-                    ..start(vec!["slow-ready".into()], "none")
-                })
-            )
-            .await
-            .is_err()
-        );
+        let starting = {
+            let runtime = Arc::clone(&runtime);
+            tokio::spawn(async move {
+                runtime
+                    .start(ValidatedStart {
+                        terminal_id,
+                        ..start(vec!["slow-ready".into()], "none")
+                    })
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !fake
+                .command_log()
+                .lines()
+                .any(|line| line.starts_with("run "))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        starting.abort();
+        assert!(starting.await.unwrap_err().is_cancelled());
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 if runtime.inspect(terminal_id).await.unwrap().state == TerminalState::Terminated {
@@ -1405,6 +3089,7 @@ esac
 
     #[tokio::test]
     async fn initial_resize_failure_cleans_up_and_fails_start() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
         let runtime = fake.runtime(Duration::from_millis(500));
         let terminal_id = Uuid::new_v4();
@@ -1422,8 +3107,11 @@ esac
 
     #[tokio::test]
     async fn failed_control_commands_release_ownership_and_recover_within_deadline() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
-        let runtime = fake.runtime(Duration::from_millis(500));
+        let mut runtime = fake.runtime(Duration::from_millis(500));
+        runtime.config.control_timeout = Duration::from_millis(500);
+        runtime.config.termination_timeout = Duration::from_secs(2);
         let terminal_id = Uuid::new_v4();
         runtime
             .start(ValidatedStart {
@@ -1442,6 +3130,7 @@ esac
 
     #[tokio::test]
     async fn later_terminate_retries_after_unrecoverable_control_failure() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
         let runtime = fake.runtime(Duration::from_millis(500));
         let terminal_id = Uuid::new_v4();
@@ -1470,6 +3159,7 @@ esac
 
     #[tokio::test]
     async fn execution_timeout_keeps_cleaning_after_unrecoverable_deadline() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
         let runtime = fake.runtime(Duration::from_millis(500));
         let terminal_id = Uuid::new_v4();
@@ -1510,7 +3200,8 @@ esac
     }
 
     #[tokio::test]
-    async fn terminal_input_backpressure_times_out_and_cleans_up() {
+    async fn partial_terminal_input_is_unknown_and_is_not_retried_or_killed() {
+        let _recovery_lock = recovery_test_lock().await;
         let fake = FakePodman::new();
         let runtime = fake.runtime(Duration::from_millis(500));
         let terminal_id = Uuid::new_v4();
@@ -1521,19 +3212,23 @@ esac
             })
             .await
             .unwrap();
+        let input_id = Uuid::new_v4();
         assert!(matches!(
-            runtime.input(terminal_id, &vec![0; 8 * 1024 * 1024]).await,
-            Err(RuntimeError::InputTimeout)
+            runtime
+                .input(terminal_id, input_id, &vec![0; 8 * 1024 * 1024],)
+                .await,
+            Err(RuntimeError::OutcomeUnknown)
         ));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if runtime.inspect(terminal_id).await.unwrap().state == TerminalState::Terminated {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(matches!(
+            runtime
+                .input(terminal_id, input_id, &vec![0; 8 * 1024 * 1024])
+                .await,
+            Err(RuntimeError::OutcomeUnknown)
+        ));
+        assert_eq!(
+            runtime.inspect(terminal_id).await.unwrap().state,
+            TerminalState::Running
+        );
+        runtime.terminate(terminal_id).await.unwrap();
     }
 }
