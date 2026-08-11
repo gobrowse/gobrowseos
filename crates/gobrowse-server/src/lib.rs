@@ -15,6 +15,7 @@ pub mod realtime;
 pub mod run_api;
 pub mod vault;
 pub mod vault_api;
+pub mod webhooks;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
+        .route("/auth/rotate", post(auth::rotate_sessions))
         .route("/version", get(api::version))
         .route(
             "/workspaces",
@@ -142,6 +144,7 @@ pub fn router(state: AppState) -> Router {
             axum::routing::put(vault_api::replace_secret).delete(vault_api::delete_secret),
         )
         .route("/vault/rotate", post(vault_api::rotate_secrets))
+        .route("/webhooks/{id}/deliver", post(webhooks::receive_webhook))
         .route(
             "/library/books/{id}",
             get(library_api::get_book).put(library_api::update_book),
@@ -206,6 +209,13 @@ async fn origin_guard(
         *request.method(),
         Method::POST | Method::PUT | Method::PATCH | Method::DELETE
     ) {
+        // Webhook deliveries use HMAC-signature auth, not cookies;
+        // CSRF origin enforcement does not apply.
+        if request.uri().path().starts_with("/api/v1/webhooks/") {
+            return Ok(next.run(request).await);
+        }
+        // Sec-Fetch-Site: cross-site navigations and form submissions
+        // from third-party origins must be rejected.
         if request
             .headers()
             .get("sec-fetch-site")
@@ -214,17 +224,22 @@ async fn origin_guard(
         {
             return Err(AppError::Forbidden);
         }
-        if let Some(origin) = request
+        // Origin must be present and exactly match the configured
+        // public_origin (scheme + host + port). A missing Origin on a
+        // state-changing request is rejected; same-origin deployments
+        // require this for CSRF protection.
+        let origin = request
             .headers()
             .get(header::ORIGIN)
             .and_then(|value| value.to_str().ok())
-            && origin.trim_end_matches('/')
-                != state
-                    .settings
-                    .http
-                    .public_origin
-                    .as_str()
-                    .trim_end_matches('/')
+            .ok_or(AppError::Forbidden)?;
+        if origin.trim_end_matches('/')
+            != state
+                .settings
+                .http
+                .public_origin
+                .as_str()
+                .trim_end_matches('/')
         {
             return Err(AppError::Forbidden);
         }
