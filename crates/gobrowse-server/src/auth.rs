@@ -7,7 +7,7 @@ use argon2::{
 use axum::{
     Json,
     extract::State,
-    http::{HeaderMap, HeaderValue, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::IntoResponse,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -137,6 +137,47 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RotateSessionsRequest {
+    pub user_id: Uuid,
+}
+
+async fn check_login_throttle(
+    pool: &sqlx::PgPool,
+    email: &str,
+    settings: &crate::config::AuthSettings,
+) -> Result<(), AppError> {
+    let window = time::Duration::seconds(settings.login_throttle_window_secs);
+    let max_attempts = settings.login_throttle_max_attempts as i64;
+    let cutoff = time::OffsetDateTime::now_utc() - window;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_attempts WHERE email = $1 AND occurred_at > $2",
+    )
+    .bind(email.to_lowercase())
+    .bind(cutoff)
+    .fetch_one(pool)
+    .await?;
+    if count >= max_attempts {
+        return Err(AppError::Unauthorized);
+    }
+    Ok(())
+}
+
+async fn record_login_attempt(
+    pool: &sqlx::PgPool,
+    email: &str,
+    ip_hash: Option<&[u8]>,
+    outcome: &str,
+) -> Result<(), AppError> {
+    sqlx::query("INSERT INTO login_attempts (email, ip_hash, outcome) VALUES ($1, $2, $3)")
+        .bind(email.to_lowercase())
+        .bind(ip_hash)
+        .bind(outcome)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn setup_status(State(state): State<AppState>) -> Result<Json<SetupStatus>, AppError> {
     let exists: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE role = 'OWNER')")
@@ -151,6 +192,7 @@ pub async fn create_owner(
     State(state): State<AppState>,
     Json(input): Json<OwnerSetupRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    check_login_throttle(&state.pool, input.email.trim(), &state.settings.auth).await?;
     validate_identity(&input.email, &input.display_name, &input.password)?;
     let password_hash = state.passwords.hash(&input.password).await?;
     let mut tx = state.pool.begin().await?;
@@ -216,6 +258,7 @@ pub async fn create_owner(
     .await?;
     let (cookie, user) = create_session(&state, &mut tx, user_id).await?;
     tx.commit().await?;
+    record_login_attempt(&state.pool, input.email.trim(), None, "success").await?;
     Ok(([(header::SET_COOKIE, cookie)], Json(user)))
 }
 
@@ -223,6 +266,7 @@ pub async fn login(
     State(state): State<AppState>,
     Json(input): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
+    check_login_throttle(&state.pool, input.email.trim(), &state.settings.auth).await?;
     let row = sqlx::query(
         "SELECT id, primary_profile_id, email, display_name, role, password_hash \
          FROM users WHERE lower(email) = lower($1) AND disabled_at IS NULL",
@@ -239,6 +283,7 @@ pub async fn login(
         .await?
         || row.is_none()
     {
+        record_login_attempt(&state.pool, input.email.trim(), None, "failure").await?;
         return Err(AppError::Unauthorized);
     }
     let row = row.expect("checked above");
@@ -256,6 +301,7 @@ pub async fn login(
     )
     .await?;
     tx.commit().await?;
+    record_login_attempt(&state.pool, input.email.trim(), None, "success").await?;
     Ok(([(header::SET_COOKIE, cookie)], Json(user)))
 }
 
@@ -283,6 +329,41 @@ pub async fn me(
     headers: HeaderMap,
 ) -> Result<Json<AuthenticatedUser>, AppError> {
     Ok(Json(require_user(&state, &headers).await?))
+}
+
+pub async fn rotate_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<RotateSessionsRequest>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    if user.id != input.user_id && !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
+    let target_row = sqlx::query(
+        "SELECT id, primary_profile_id FROM users WHERE id = $1 AND disabled_at IS NULL",
+    )
+    .bind(input.user_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let mut tx = state.pool.begin().await?;
+    sqlx::query("UPDATE users SET auth_epoch = auth_epoch + 1 WHERE id = $1")
+        .bind(input.user_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(target_row.get("primary_profile_id")),
+        "auth.sessions_rotated",
+        "user",
+        Some(input.user_id.to_string()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn require_user(

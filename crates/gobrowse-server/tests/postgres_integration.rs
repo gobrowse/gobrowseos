@@ -2,6 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gobrowse_server::{config::VaultSettings, vault};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Connection, PgConnection, PgPool, Row};
+use time::Duration;
 use uuid::Uuid;
 
 async fn test_pool() -> Option<PgPool> {
@@ -28,7 +29,7 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 3);
+    assert_eq!(row.get::<i64, _>("schema_version"), 5);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
@@ -532,4 +533,164 @@ async fn schema_v3_safely_upgrades_permitted_v1_states() {
         .execute(&pool)
         .await
         .expect("drop isolated upgrade schema");
+}
+
+#[tokio::test]
+async fn login_rate_limit_blocks_after_threshold() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let email = format!("throttle-{}@example.test", Uuid::now_v7().simple());
+    let email_lower = email.to_lowercase();
+    let now = time::OffsetDateTime::now_utc();
+
+    sqlx::query("DELETE FROM login_attempts WHERE email = $1")
+        .bind(&email_lower)
+        .execute(&pool)
+        .await
+        .expect("clean up previous attempts");
+
+    for _ in 0..5 {
+        sqlx::query(
+            "INSERT INTO login_attempts (email, outcome, occurred_at) VALUES ($1, 'failure', $2)",
+        )
+        .bind(&email_lower)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert attempt");
+    }
+
+    let window = Duration::seconds(300);
+    let cutoff = now - window;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_attempts WHERE email = $1 AND occurred_at > $2",
+    )
+    .bind(&email_lower)
+    .bind(cutoff)
+    .fetch_one(&pool)
+    .await
+    .expect("count attempts");
+    assert!(
+        count >= 5,
+        "expected at least 5 recent attempts for throttled email, got {count}"
+    );
+
+    sqlx::query("DELETE FROM login_attempts WHERE email = $1")
+        .bind(&email_lower)
+        .execute(&pool)
+        .await
+        .expect("clean up test data");
+}
+
+#[tokio::test]
+async fn login_rate_limit_recovers_after_window_expiry() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let email = format!("recover-{}@example.test", Uuid::now_v7().simple());
+    let email_lower = email.to_lowercase();
+
+    sqlx::query("DELETE FROM login_attempts WHERE email = $1")
+        .bind(&email_lower)
+        .execute(&pool)
+        .await
+        .expect("clean up previous attempts");
+
+    let old_time = time::OffsetDateTime::now_utc() - Duration::seconds(301);
+    for _ in 0..5 {
+        sqlx::query(
+            "INSERT INTO login_attempts (email, outcome, occurred_at) VALUES ($1, 'failure', $2)",
+        )
+        .bind(&email_lower)
+        .bind(old_time)
+        .execute(&pool)
+        .await
+        .expect("insert old attempt");
+    }
+
+    let window = Duration::seconds(300);
+    let cutoff = time::OffsetDateTime::now_utc() - window;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_attempts WHERE email = $1 AND occurred_at > $2",
+    )
+    .bind(&email_lower)
+    .bind(cutoff)
+    .fetch_one(&pool)
+    .await
+    .expect("count recent attempts");
+    assert_eq!(count, 0, "old attempts must not count within the window");
+
+    sqlx::query("DELETE FROM login_attempts WHERE email = $1")
+        .bind(&email_lower)
+        .execute(&pool)
+        .await
+        .expect("clean up test data");
+}
+
+#[tokio::test]
+async fn locked_account_returns_uniform_unauthorized() {
+    let Some(pool) = test_pool().await else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let email = format!("locked-{}@example.test", Uuid::now_v7().simple());
+    let email_lower = email.to_lowercase();
+    let now = time::OffsetDateTime::now_utc();
+
+    sqlx::query("DELETE FROM login_attempts WHERE email = $1")
+        .bind(&email_lower)
+        .execute(&pool)
+        .await
+        .expect("clean up previous attempts");
+
+    for _ in 0..5 {
+        sqlx::query(
+            "INSERT INTO login_attempts (email, outcome, occurred_at) VALUES ($1, 'failure', $2)",
+        )
+        .bind(&email_lower)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("insert failure");
+    }
+
+    let window = Duration::seconds(300);
+    let cutoff = now - window;
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM login_attempts WHERE email = $1 AND occurred_at > $2",
+    )
+    .bind(&email_lower)
+    .bind(cutoff)
+    .fetch_one(&pool)
+    .await
+    .expect("count attempts");
+    assert!(
+        count >= 5,
+        "locked account must have at least {} recent failures, got {count}",
+        5
+    );
+
+    let outcomes: Vec<String> =
+        sqlx::query("SELECT outcome FROM login_attempts WHERE email = $1 ORDER BY occurred_at")
+            .bind(&email_lower)
+            .fetch_all(&pool)
+            .await
+            .expect("read outcomes")
+            .into_iter()
+            .map(|row| row.get("outcome"))
+            .collect();
+    assert!(!outcomes.is_empty(), "should have recorded outcomes");
+    assert!(
+        outcomes.iter().all(|o| o == "failure"),
+        "all recorded attempts should be failures"
+    );
+
+    sqlx::query("DELETE FROM login_attempts WHERE email = $1")
+        .bind(&email_lower)
+        .execute(&pool)
+        .await
+        .expect("clean up test data");
 }

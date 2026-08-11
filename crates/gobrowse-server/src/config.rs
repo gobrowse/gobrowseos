@@ -88,6 +88,17 @@ pub struct AuthSettings {
     pub argon2_iterations: u32,
     pub argon2_parallelism: u32,
     pub max_parallel_hashes: usize,
+    #[serde(default = "default_login_throttle_max_attempts")]
+    pub login_throttle_max_attempts: u32,
+    #[serde(default = "default_login_throttle_window_secs")]
+    pub login_throttle_window_secs: i64,
+}
+
+const fn default_login_throttle_max_attempts() -> u32 {
+    5
+}
+const fn default_login_throttle_window_secs() -> i64 {
+    300
 }
 
 impl Default for AuthSettings {
@@ -99,6 +110,8 @@ impl Default for AuthSettings {
             argon2_iterations: 2,
             argon2_parallelism: 1,
             max_parallel_hashes: 4,
+            login_throttle_max_attempts: default_login_throttle_max_attempts(),
+            login_throttle_window_secs: default_login_throttle_window_secs(),
         }
     }
 }
