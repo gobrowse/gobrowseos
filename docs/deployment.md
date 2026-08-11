@@ -24,8 +24,9 @@ The example Compose file caps the app and PostgreSQL at 384 MB each and uses fra
 
 1. Create and verify a database backup.
 2. Pull/build the target image by immutable tag or digest.
-3. Run migrations with the target image: `docker compose run --rm app migrate`.
-4. Start the target app and wait for `/health/ready`.
-5. Keep the previous image digest until functional checks pass.
+3. Put the service in maintenance mode and stop the existing app so an older binary cannot write through a newer schema.
+4. Run migrations with the target image: `docker compose run --rm app migrate`.
+5. Start the target app and wait for `/health/ready` before removing maintenance mode.
+6. Keep the previous image digest and verified backup until functional checks pass.
 
-Migrations are forward-only. Application rollback is supported only when the previous version accepts the migrated schema. A database downgrade requires restoring the pre-update backup.
+Treat migrations as incompatible with the previous app unless the release notes explicitly document an expand-compatible schema. If migration or startup fails, stop the target app, restore the pre-update database backup, restore the previous image digest, and only then restart the previous app. Never run the previous binary against a schema it was not released to accept.
