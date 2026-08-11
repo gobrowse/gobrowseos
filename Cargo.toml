@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/gobrowse-core",
+    "crates/gobrowse-sandboxd",
     "crates/gobrowse-server",
     "crates/gobrowse-web",
 ]

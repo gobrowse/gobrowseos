@@ -48,3 +48,5 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 ## Active Milestone
 
 - Milestone 4 is active: implement the sandbox daemon boundary, rootless runtime adapter, PTY lifecycle, filesystem APIs, explicit egress policy, durable terminal metadata, and security-focused integration tests while sandboxing remains release-gated off.
+- The first Milestone 4 foundation is local only: versioned authenticated Unix-socket contracts, bounded connections, operations and replay, peer UID checks, a root-refusing Podman adapter, terminal-monotonic lifecycle cleanup, initial PTY sizing, explicit network/storage/session ceilings, and bounded workspace filesystem operations. It passes 63 focused core/daemon tests but remains intentionally unreachable from the app.
+- Release blockers remain descriptor-relative filesystem operations, quota and restricted-egress provisioning evidence, durable PTY output/reconciliation, schema/API authorization, and runtime-backed adversarial tests.

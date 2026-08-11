@@ -17,8 +17,8 @@ Modules remain modules until an actual process, target, or dependency boundary j
 1. Milestone 1: typed config, server/CLI, secure owner setup and login, schema, Compose, CI, Rust/WASM shell.
 2. Milestone 2: Books, immutable revisions, Autobiography proposals/rollback, chunks, PostgreSQL lexical and pgvector retrieval, background embedding jobs.
 3. Milestone 3: model registry, neutral messages, streaming agent state machine, deterministic fake model, fallback classification, durable conversation events.
-4. Milestone 4: tools, policy decisions, approvals, idempotency records, file/Git operations, checkpoints.
-5. Milestone 5: separately deployed `sandboxd`, rootless runtime adapter, PTY streams, persistent workspace volumes, egress policy.
+4. Milestone 4: separately deployed `sandboxd`, rootless runtime adapter, PTY streams, persistent workspace volumes, filesystem boundary, and egress policy.
+5. Milestone 5: tools, policy decisions, approvals, idempotency records, file/Git operations, checkpoints.
 6. Milestone 6: tasks, Activity Ledger, worktrees, delegation, agent timelines and UI.
 7. Milestone 7: Skills import/revisions/evaluation/promotion.
 8. Milestone 8: dual-era MCP client, encrypted credential vault, OAuth, diagnostics and generator workflow.

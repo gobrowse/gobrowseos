@@ -7,6 +7,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+pub const SANDBOX_PROTOCOL_VERSION: u16 = 1;
+pub const MAX_PROTOCOL_LINE_BYTES: usize = 512 * 1024;
+pub const MAX_COMMAND_ARGUMENTS: usize = 128;
+pub const MAX_COMMAND_ARGUMENT_BYTES: usize = 4 * 1024;
+pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
+pub const MAX_WORKSPACE_PATH_BYTES: usize = 4 * 1024;
+pub const MAX_WORKSPACE_PATH_COMPONENTS: usize = 128;
+pub const MAX_TERMINAL_INPUT_BYTES: usize = 64 * 1024;
+pub const MAX_FILE_PAYLOAD_BYTES: usize = 256 * 1024;
+pub const MAX_DIRECTORY_ENTRIES: usize = 1_024;
+
+pub const HARD_RESOURCE_LIMITS: ResourceLimits = ResourceLimits {
+    cpu_millis: 8_000,
+    memory_bytes: 16 * 1024 * 1024 * 1024,
+    writable_storage_bytes: 16 * 1024 * 1024 * 1024,
+    pids: 1_024,
+    execution_seconds: 24 * 60 * 60,
+};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum NetworkPolicy {
@@ -16,17 +35,54 @@ pub enum NetworkPolicy {
     Full,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResourceLimits {
     pub cpu_millis: u32,
     pub memory_bytes: u64,
+    pub writable_storage_bytes: u64,
     pub pids: u32,
     pub execution_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl ResourceLimits {
+    pub fn validate_hard_ceiling(self) -> Result<Self, SandboxValidationError> {
+        if self.cpu_millis == 0
+            || self.memory_bytes == 0
+            || self.writable_storage_bytes == 0
+            || self.pids == 0
+            || self.execution_seconds == 0
+        {
+            return Err(SandboxValidationError::InvalidLimits);
+        }
+        if self.cpu_millis > HARD_RESOURCE_LIMITS.cpu_millis
+            || self.memory_bytes > HARD_RESOURCE_LIMITS.memory_bytes
+            || self.writable_storage_bytes > HARD_RESOURCE_LIMITS.writable_storage_bytes
+            || self.pids > HARD_RESOURCE_LIMITS.pids
+            || self.execution_seconds > HARD_RESOURCE_LIMITS.execution_seconds
+        {
+            return Err(SandboxValidationError::LimitsExceedHardCeiling);
+        }
+        Ok(self)
+    }
+
+    #[must_use]
+    pub fn narrow_to(self, ceiling: Self) -> Self {
+        Self {
+            cpu_millis: self.cpu_millis.min(ceiling.cpu_millis),
+            memory_bytes: self.memory_bytes.min(ceiling.memory_bytes),
+            writable_storage_bytes: self
+                .writable_storage_bytes
+                .min(ceiling.writable_storage_bytes),
+            pids: self.pids.min(ceiling.pids),
+            execution_seconds: self.execution_seconds.min(ceiling.execution_seconds),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TerminalStartRequest {
-    pub request_id: Uuid,
     pub workspace_id: Uuid,
     pub command: Vec<String>,
     pub working_directory: String,
@@ -40,41 +96,61 @@ pub struct TerminalStartRequest {
 pub enum SandboxValidationError {
     #[error("command must not be empty")]
     EmptyCommand,
+    #[error("command exceeds the supported bounds")]
+    CommandTooLarge,
     #[error("workspace path must be relative and cannot traverse parents")]
     UnsafePath,
+    #[error("workspace path exceeds the supported bounds")]
+    PathTooLarge,
     #[error("terminal dimensions are outside the supported range")]
     InvalidTerminalSize,
     #[error("resource limits must be positive")]
     InvalidLimits,
+    #[error("resource limits exceed the hard safety ceiling")]
+    LimitsExceedHardCeiling,
 }
 
 impl TerminalStartRequest {
     pub fn validate(&self) -> Result<PathBuf, SandboxValidationError> {
-        if self.command.is_empty() || self.command[0].is_empty() {
-            return Err(SandboxValidationError::EmptyCommand);
-        }
+        validate_command(&self.command)?;
         let path = validate_workspace_path(&self.working_directory)?;
         if !(20..=1_000).contains(&self.cols) || !(5..=500).contains(&self.rows) {
             return Err(SandboxValidationError::InvalidTerminalSize);
         }
-        if self.limits.cpu_millis == 0
-            || self.limits.memory_bytes == 0
-            || self.limits.pids == 0
-            || self.limits.execution_seconds == 0
-        {
-            return Err(SandboxValidationError::InvalidLimits);
-        }
+        self.limits.validate_hard_ceiling()?;
         Ok(path)
     }
+}
+
+pub fn validate_command(command: &[String]) -> Result<(), SandboxValidationError> {
+    if command.is_empty() || command[0].is_empty() {
+        return Err(SandboxValidationError::EmptyCommand);
+    }
+    if command.len() > MAX_COMMAND_ARGUMENTS
+        || command.iter().any(|arg| {
+            arg.is_empty() || arg.as_bytes().contains(&0) || arg.len() > MAX_COMMAND_ARGUMENT_BYTES
+        })
+        || command.iter().map(String::len).sum::<usize>() > MAX_COMMAND_BYTES
+    {
+        return Err(SandboxValidationError::CommandTooLarge);
+    }
+    Ok(())
 }
 
 pub fn validate_workspace_path(value: &str) -> Result<PathBuf, SandboxValidationError> {
     if value.is_empty() || value.as_bytes().contains(&0) {
         return Err(SandboxValidationError::UnsafePath);
     }
+    if value.len() > MAX_WORKSPACE_PATH_BYTES {
+        return Err(SandboxValidationError::PathTooLarge);
+    }
     let path = Path::new(value);
+    let components = path.components().collect::<Vec<_>>();
+    if components.len() > MAX_WORKSPACE_PATH_COMPONENTS {
+        return Err(SandboxValidationError::PathTooLarge);
+    }
     if path.is_absolute()
-        || path.components().any(|component| {
+        || components.iter().any(|component| {
             matches!(
                 component,
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
@@ -84,6 +160,154 @@ pub fn validate_workspace_path(value: &str) -> Result<PathBuf, SandboxValidation
         return Err(SandboxValidationError::UnsafePath);
     }
     Ok(path.to_path_buf())
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestEnvelope {
+    pub version: u16,
+    pub request_id: Uuid,
+    pub token: String,
+    pub operation: SandboxOperation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxOperation {
+    Health,
+    Start {
+        request: TerminalStartRequest,
+    },
+    Input {
+        terminal_id: Uuid,
+        data_base64: String,
+    },
+    Resize {
+        terminal_id: Uuid,
+        cols: u16,
+        rows: u16,
+    },
+    Terminate {
+        terminal_id: Uuid,
+    },
+    Inspect {
+        terminal_id: Uuid,
+    },
+    FsList {
+        workspace_id: Uuid,
+        path: String,
+    },
+    FsRead {
+        workspace_id: Uuid,
+        path: String,
+    },
+    FsWrite {
+        workspace_id: Uuid,
+        path: String,
+        data_base64: String,
+    },
+    FsMkdir {
+        workspace_id: Uuid,
+        path: String,
+    },
+    FsRename {
+        workspace_id: Uuid,
+        from: String,
+        to: String,
+    },
+    FsDelete {
+        workspace_id: Uuid,
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseEnvelope {
+    pub version: u16,
+    pub request_id: Uuid,
+    pub result: Result<SandboxResult, SandboxProtocolError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SandboxResult {
+    Health {
+        status: String,
+    },
+    Started {
+        terminal_id: Uuid,
+        limits: ResourceLimits,
+        network_policy: NetworkPolicy,
+    },
+    InputAccepted {
+        bytes: usize,
+    },
+    Resized,
+    Terminated,
+    Inspected {
+        terminal_id: Uuid,
+        workspace_id: Uuid,
+        state: TerminalState,
+    },
+    FsList {
+        entries: Vec<FilesystemEntry>,
+    },
+    FsRead {
+        data_base64: String,
+    },
+    FsWritten {
+        bytes: usize,
+    },
+    FsCreated,
+    FsRenamed,
+    FsDeleted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TerminalState {
+    Running,
+    Terminating,
+    Unrecoverable,
+    Exited,
+    Terminated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemEntry {
+    pub name: String,
+    pub kind: FilesystemEntryKind,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum FilesystemEntryKind {
+    File,
+    Directory,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SandboxProtocolError {
+    pub code: SandboxErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SandboxErrorCode {
+    InvalidRequest,
+    UnsupportedVersion,
+    Unauthorized,
+    NotFound,
+    PolicyDenied,
+    LimitExceeded,
+    DeadlineExceeded,
+    Conflict,
+    Internal,
 }
 
 /// Returns true only for addresses suitable for restricted public egress.
@@ -113,7 +337,8 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
     let segments = ip.segments();
-    !(ip.is_unspecified()
+    !(ip.to_ipv4_mapped().is_some()
+        || ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
         || (segments[0] & 0xfe00) == 0xfc00
@@ -127,14 +352,68 @@ mod tests {
     use super::*;
 
     #[test]
-    fn workspace_paths_reject_traversal_and_absolute_paths() {
+    fn workspace_paths_reject_traversal_absolute_and_oversized_paths() {
         assert!(validate_workspace_path("src/lib.rs").is_ok());
+        assert!(validate_workspace_path(".").is_ok());
         assert!(validate_workspace_path("../host").is_err());
         assert!(validate_workspace_path("/etc/passwd").is_err());
+        assert_eq!(
+            validate_workspace_path(&"x".repeat(MAX_WORKSPACE_PATH_BYTES + 1)),
+            Err(SandboxValidationError::PathTooLarge)
+        );
     }
 
     #[test]
-    fn restricted_egress_blocks_metadata_and_private_networks() {
+    fn command_bounds_reject_empty_nul_and_oversized_arguments() {
+        assert!(validate_command(&["sh".into(), "-c".into(), "true".into()]).is_ok());
+        assert_eq!(
+            validate_command(&[]),
+            Err(SandboxValidationError::EmptyCommand)
+        );
+        assert_eq!(
+            validate_command(&["a\0b".into()]),
+            Err(SandboxValidationError::CommandTooLarge)
+        );
+        assert_eq!(
+            validate_command(&["x".repeat(MAX_COMMAND_ARGUMENT_BYTES + 1)]),
+            Err(SandboxValidationError::CommandTooLarge)
+        );
+        assert_eq!(
+            validate_command(&vec!["x".into(); MAX_COMMAND_ARGUMENTS + 1]),
+            Err(SandboxValidationError::CommandTooLarge)
+        );
+    }
+
+    #[test]
+    fn resource_limits_are_positive_and_have_hard_ceilings() {
+        assert_eq!(
+            ResourceLimits {
+                cpu_millis: HARD_RESOURCE_LIMITS.cpu_millis + 1,
+                ..HARD_RESOURCE_LIMITS
+            }
+            .validate_hard_ceiling(),
+            Err(SandboxValidationError::LimitsExceedHardCeiling)
+        );
+        assert_eq!(
+            ResourceLimits {
+                pids: 0,
+                ..HARD_RESOURCE_LIMITS
+            }
+            .validate_hard_ceiling(),
+            Err(SandboxValidationError::InvalidLimits)
+        );
+        assert_eq!(
+            ResourceLimits {
+                writable_storage_bytes: 0,
+                ..HARD_RESOURCE_LIMITS
+            }
+            .validate_hard_ceiling(),
+            Err(SandboxValidationError::InvalidLimits)
+        );
+    }
+
+    #[test]
+    fn restricted_egress_blocks_metadata_private_and_mapped_networks() {
         for address in [
             "169.254.169.254",
             "127.0.0.1",
@@ -142,6 +421,8 @@ mod tests {
             "192.168.1.1",
             "::1",
             "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:1.1.1.1",
         ] {
             assert!(
                 !is_public_destination(address.parse().unwrap()),
@@ -149,5 +430,17 @@ mod tests {
             );
         }
         assert!(is_public_destination("1.1.1.1".parse().unwrap()));
+        assert!(is_public_destination(
+            "2606:4700:4700::1111".parse().unwrap()
+        ));
+    }
+
+    #[test]
+    fn protocol_rejects_unknown_fields() {
+        let request = format!(
+            r#"{{"version":1,"request_id":"{}","token":"token","operation":{{"op":"health"}},"extra":true}}"#,
+            Uuid::nil()
+        );
+        assert!(serde_json::from_str::<RequestEnvelope>(&request).is_err());
     }
 }
