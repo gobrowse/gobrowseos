@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -236,6 +238,82 @@ fn walk_for_dollar_ref(value: &serde_json::Value, depth: u32) -> RefCheck {
     }
 }
 
+// --- audience binding validation ---
+
+/// Returns true for IP addresses that are public-routable under the
+/// same rules as [`crate::sandbox::is_public_destination`].
+/// DNS names always return `true` — we cannot statically verify them,
+/// so the audience allow-list gate in [`validate_audience_binding`]
+/// is the security control for name-based targets.
+fn is_public_host(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Ipv4(ip) => crate::sandbox::is_public_destination(IpAddr::V4(*ip)),
+        url::Host::Ipv6(ip) => crate::sandbox::is_public_destination(IpAddr::V6(*ip)),
+        url::Host::Domain(_) => true,
+    }
+}
+
+/// Validate that `target`'s host is a public destination AND is
+/// present in the tool's `allowed_audiences` allow-list.
+///
+/// This is a pure (no-I/O) static gate.  Real OAuth / JWKS audience
+/// validation against a live IdP is excluded per the release-gated
+/// banner at the top of this file.
+///
+/// # Returns
+/// * `Pass` — host is a public IP (or DNS name) present in the allow-list.
+/// * `Fail` — host is private/metadata, missing, or not in the allow-list.
+pub fn validate_audience_binding(
+    tool_name: &str,
+    target: &Url,
+    allowed_audiences: &[&str],
+) -> DiagnosticCheck {
+    let code = format!("mcp.audience.{tool_name}");
+    let label = "audience binding".to_string();
+
+    let host = match target.host() {
+        Some(h) => h,
+        None => {
+            return DiagnosticCheck {
+                code,
+                label,
+                status: DiagnosticStatus::Fail,
+                detail: "target has no host".into(),
+                latency_ms: None,
+            };
+        }
+    };
+
+    if !is_public_host(&host) {
+        return DiagnosticCheck {
+            code,
+            label,
+            status: DiagnosticStatus::Fail,
+            detail: "target is a private/metadata destination".into(),
+            latency_ms: None,
+        };
+    }
+
+    let host_str = target.host_str().unwrap_or("");
+    if !allowed_audiences.contains(&host_str) {
+        return DiagnosticCheck {
+            code,
+            label,
+            status: DiagnosticStatus::Fail,
+            detail: "target host not in allowed audiences".into(),
+            latency_ms: None,
+        };
+    }
+
+    DiagnosticCheck {
+        code,
+        label,
+        status: DiagnosticStatus::Pass,
+        detail: "target bound to an allowed audience".into(),
+        latency_ms: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -465,12 +543,53 @@ mod tests {
         assert!(!report.is_fail());
     }
 
-    // ── audience_binding_reported_in_detail ─────────────────────
-    // SKIPPED: mcp.rs has no OAuth / audience concepts.
-    // This test belongs in the release-gated real‑server conformance
-    // layer that is not yet built.
+    // ── validate_audience_binding tests ─────────────────────────
+
     #[test]
-    fn audience_binding_reported_in_detail_not_yet_applicable() {
-        // placeholder — remove when OAuth matrix is wired into the doctor
+    fn audience_binding_accepts_matching_host() {
+        let target = Url::parse("https://api.example.com").unwrap();
+        let check = validate_audience_binding("test_tool", &target, &["api.example.com"]);
+        assert_eq!(check.status, DiagnosticStatus::Pass);
+        assert!(check.detail.contains("allowed audience"));
+    }
+
+    #[test]
+    fn audience_binding_rejects_metadata_endpoint() {
+        let target = Url::parse("https://169.254.169.254/latest/meta-data").unwrap();
+        let check = validate_audience_binding("test_tool", &target, &["169.254.169.254"]);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("private/metadata"));
+    }
+
+    #[test]
+    fn audience_binding_rejects_private_range_target() {
+        let target = Url::parse("https://10.0.0.5").unwrap();
+        let check = validate_audience_binding("test_tool", &target, &["10.0.0.5"]);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("private/metadata"));
+    }
+
+    #[test]
+    fn audience_binding_rejects_unlisted_host() {
+        let target = Url::parse("https://evil.example").unwrap();
+        let check = validate_audience_binding("test_tool", &target, &["api.example.com"]);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("not in allowed audiences"));
+    }
+
+    #[test]
+    fn audience_binding_rejects_loopback_target() {
+        let target = Url::parse("http://127.0.0.1").unwrap();
+        let check = validate_audience_binding("test_tool", &target, &["127.0.0.1"]);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("private/metadata"));
+    }
+
+    #[test]
+    fn audience_binding_rejects_missing_host() {
+        let target = Url::parse("data:text/plain,hello").unwrap();
+        let check = validate_audience_binding("test_tool", &target, &["example.com"]);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("no host"));
     }
 }
