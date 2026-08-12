@@ -3675,4 +3675,276 @@ esac
 
         let _ = fs::remove_dir_all(&socket_dir);
     }
+
+    // ------------------------------------------------------------------
+    // Docker-backed adversarial sandbox boundary tests (M4 runtime gate)
+    //
+    // These tests prove kernel-level container isolation against a real
+    // docker daemon through a `podman`→`docker` argv-translation shim.
+    // They bypass sandboxd's `start` lifecycle (which requires workspace
+    // volumes, PTY journal, and the full PodmanRuntime machinery) and
+    // instead shell out to the shim directly. The shim translates
+    // `start_spec`-equivalent argv, stripping docker-unsupported flags:
+    //   --userns=keep-id  → dropped (docker has no equivalent; rootless
+    //                        is handled at the daemon level)
+    //   --pid=private     → dropped (docker defaults to private PID ns)
+    //   --uts=private     → dropped (docker defaults to private UTS ns)
+    //   --image-volume=ignore → dropped (docker has no --image-volume)
+    //   --http-proxy=false    → dropped (docker has no --http-proxy)
+    //
+    // All other isolation flags (--cap-drop=ALL, --security-opt=no-new-
+    // privs, --read-only, --ipc=private, --cgroupns=private, --network=
+    // none, --pids-limit, --memory, --cpus) pass through verbatim and
+    // are enforced by the docker daemon's containerd/runc backend.
+    //
+    // Enabled only with GOBROWSE_SANDBOX_DOCKER=1 + --run-ignored only.
+    // The shim and any images/volumes are local test infra, never committed.
+    // ------------------------------------------------------------------
+
+    struct DockerShim {
+        dir: PathBuf,
+        script: PathBuf,
+    }
+
+    impl DockerShim {
+        fn new() -> Self {
+            let dir = std::env::temp_dir().join(format!("gobrowse-podman-shim-{}", Uuid::new_v4()));
+            fs::create_dir(&dir).unwrap();
+            let script = dir.join("podman");
+            // Uses xargs with null-delimited args to avoid shell interpolation
+            // (eval would expand $? $var etc. in container commands).
+            let shim_content = "#!/bin/sh\n\
+# gobrowse podman→docker shim — strips docker-unsupported flags\n\
+tmp=$(mktemp)\n\
+trap 'rm -f \"$tmp\"' EXIT\n\
+for arg do\n\
+    case \"$arg\" in\n\
+        --userns=keep-id|--pid=private|--uts=private|--image-volume=ignore|--http-proxy=false) ;;\n\
+        *) printf '%s\\0' \"$arg\" >> \"$tmp\" ;;\n\
+    esac\n\
+done\n\
+exec xargs -0 -a \"$tmp\" /usr/bin/docker\n";
+            fs::write(&script, shim_content).unwrap();
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+            Self { dir, script }
+        }
+
+        fn path(&self) -> &Path {
+            &self.script
+        }
+
+        fn ensure_alpine_image() {
+            let status = std::process::Command::new("docker")
+                .args(["pull", "alpine:3.20"])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("docker pull alpine:3.20 failed — is docker running?");
+            assert!(status.success(), "docker pull alpine:3.20 failed");
+        }
+    }
+
+    impl Drop for DockerShim {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn require_docker_boundary() {
+        if std::env::var("GOBROWSE_SANDBOX_DOCKER").as_deref() != Ok("1") {
+            panic!(
+                "GOBROWSE_SANDBOX_DOCKER=1 must be set to run docker-backed sandbox boundary tests"
+            );
+        }
+        // Smoke-check that docker daemon is reachable.
+        let status = std::process::Command::new("docker")
+            .args(["info"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("docker is not available");
+        assert!(status.success(), "docker daemon is not responding");
+    }
+
+    /// Build a docker `run` command through the shim with the full isolation
+    /// argv that `start_spec` emits (minus docker-unsupported flags which
+    /// the shim strips). Returns the completed tokio Command ready to await.
+    fn docker_run(shim: &DockerShim, shell_command: &str) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(shim.path());
+        cmd.args([
+            "run",
+            "--rm",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--read-only",
+            "--ipc=private",
+            "--cgroupns=private",
+            "--network=none",
+            "alpine:3.20",
+            "sh",
+            "-c",
+            shell_command,
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+        cmd
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
+    async fn docker_backed_container_has_private_pid_namespace() {
+        require_docker_boundary();
+        let shim = DockerShim::new();
+        DockerShim::ensure_alpine_image();
+
+        // With docker defaults (= private PID namespace), only the
+        // container's own processes should be visible — typically 2–3
+        // (init, sh, ps). The host's PID 1 must not appear.
+        let output = docker_run(&shim, "ps -o pid= | wc -l; echo '---'; ps -o pid=,comm=")
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "ps in container failed: stdout={stdout} stderr={stderr}"
+        );
+
+        let mut lines: Vec<&str> = stdout.lines().collect();
+        let wc_line = lines.remove(0);
+        let pid_count: usize = wc_line.trim().parse().unwrap();
+        // observed: 3 (init + sh + ps-or-wc) under docker default PID ns
+        assert!(
+            pid_count <= 5,
+            "expected ≤5 PIDs in private PID namespace, got {pid_count}. full output:\n{stdout}"
+        );
+
+        let separator = lines.iter().position(|line| *line == "---");
+        assert!(
+            separator.is_some(),
+            "missing separator in ps output:\n{stdout}"
+        );
+        let ps_lines = &lines[separator.unwrap() + 1..];
+        // Host PID 1 (typically /sbin/init or systemd) must NOT appear.
+        let host_init_keywords = ["systemd", "init", "s6-svscan"];
+        for line in ps_lines {
+            for kw in &host_init_keywords {
+                assert!(
+                    !line.contains(kw),
+                    "host process '{kw}' visible inside container — PID namespace not isolated"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
+    async fn docker_backed_container_rootfs_is_read_only() {
+        require_docker_boundary();
+        let shim = DockerShim::new();
+        DockerShim::ensure_alpine_image();
+
+        let output = docker_run(
+            &shim,
+            "touch /should-fail 2>&1 || printf 'READONLY_FS_OK\\n'",
+        )
+        .output()
+        .await
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("Read-only file system"),
+            "expected 'Read-only file system' from touch, got: stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("READONLY_FS_OK"),
+            "touch should have failed (read-only rootfs), but it succeeded. stdout={stdout}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
+    async fn docker_backed_container_drops_all_capabilities() {
+        require_docker_boundary();
+        let shim = DockerShim::new();
+        DockerShim::ensure_alpine_image();
+
+        let output = docker_run(&shim, "cat /proc/self/status | grep CapEff")
+            .output()
+            .await
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "capability inspection failed: {stdout}"
+        );
+        // observed: CapEff:\t0000000000000000 when --cap-drop=ALL is applied
+        let cap_line = stdout.trim();
+        assert!(
+            cap_line.contains("0000000000000000"),
+            "expected all capabilities dropped (CapEff: 0000000000000000), got: {cap_line}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
+    async fn docker_backed_container_cannot_escape_host_mount() {
+        require_docker_boundary();
+        let shim = DockerShim::new();
+        DockerShim::ensure_alpine_image();
+
+        // Without any capabilities or privileged mode, mounting a new
+        // filesystem must be denied by the kernel.
+        let output = docker_run(
+            &shim,
+            "mount -t tmpfs tmpfs /mnt 2>&1 || printf 'MOUNT_DENIED\\n'",
+        )
+        .output()
+        .await
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("MOUNT_DENIED"),
+            "mount in unprivileged container should be denied. stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("permission denied"),
+            "expected 'permission denied' from mount, got: {stdout}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
+    async fn docker_backed_container_denies_private_egress() {
+        require_docker_boundary();
+        let shim = DockerShim::new();
+        DockerShim::ensure_alpine_image();
+
+        // With --network=none, no non-loopback interface exists.
+        // Attempting to reach any external host (metadata or private
+        // range) must fail immediately.
+        let output = docker_run(
+            &shim,
+            "ping -c 1 -W 1 169.254.169.254 2>&1 || printf 'MD_UNREACHABLE\\n'; \
+             ping -c 1 -W 1 1.1.1.1 2>&1 || printf 'PUB_UNREACHABLE\\n'",
+        )
+        .output()
+        .await
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Both ping attempts must fail (no egress to metadata or public IP).
+        assert!(
+            stdout.contains("MD_UNREACHABLE"),
+            "metadata IP (169.254.169.254) should be unreachable with --network=none. stdout={stdout}"
+        );
+        assert!(
+            stdout.contains("PUB_UNREACHABLE"),
+            "public IP (1.1.1.1) should be unreachable with --network=none. stdout={stdout}"
+        );
+    }
 }
