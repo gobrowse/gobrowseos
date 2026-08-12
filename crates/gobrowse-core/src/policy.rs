@@ -103,4 +103,48 @@ mod tests {
             PolicyDecision::Ask
         );
     }
+
+    #[test]
+    fn rule_decision_above_fires_when_risk_exceeds_max() {
+        // Write rule with Execute risk → Deny (decision_above arm)
+        let engine = PolicyEngine::new(vec![PolicyRule {
+            tool_pattern: "write_tool".into(),
+            maximum_auto_risk: RiskClass::Write,
+            decision_above: PolicyDecision::Deny,
+        }]);
+        // Execute is higher ordinal than Write, so risk > maximum_auto_risk
+        assert_eq!(
+            engine.evaluate("write_tool", RiskClass::Execute),
+            PolicyDecision::Deny
+        );
+    }
+
+    #[test]
+    fn exact_pattern_match_takes_precedence_over_default() {
+        // Two rules: exact match first, star-default second.
+        // The exact pattern must be found first by find().
+        let engine = PolicyEngine::new(vec![
+            PolicyRule {
+                tool_pattern: "specific_tool".into(),
+                maximum_auto_risk: RiskClass::Read,
+                decision_above: PolicyDecision::Deny,
+            },
+            PolicyRule {
+                tool_pattern: "*".into(),
+                maximum_auto_risk: RiskClass::Write,
+                decision_above: PolicyDecision::Deny,
+            },
+        ]);
+        // "specific_tool" with Write risk → matches the exact rule first
+        // (Read max, Write above → Deny)
+        assert_eq!(
+            engine.evaluate("specific_tool", RiskClass::Write),
+            PolicyDecision::Deny
+        );
+        // A different tool falls through to the "*" default
+        assert_eq!(
+            engine.evaluate("other_tool", RiskClass::Write),
+            PolicyDecision::Allow
+        );
+    }
 }

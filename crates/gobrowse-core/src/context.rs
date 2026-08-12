@@ -102,4 +102,16 @@ mod tests {
         );
         assert_eq!(built.selected[0].stable_id, "a");
     }
+
+    /// Pins the contract: oversized required content is admitted even when it
+    /// exceeds the budget. Callers must compact oversized required content
+    /// before invoking build_context.
+    #[test]
+    fn oversized_required_is_admitted_even_when_over_budget() {
+        let built = build_context(vec![candidate("req", 200, 1, true)], 100);
+        assert_eq!(built.selected.len(), 1);
+        assert_eq!(built.selected[0].stable_id, "req");
+        assert_eq!(built.used_tokens, 200);
+        assert!(built.used_tokens > built.budget);
+    }
 }

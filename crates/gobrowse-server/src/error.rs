@@ -66,3 +66,86 @@ impl IntoResponse for AppError {
             .into_response()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn extract(response: Response) -> (StatusCode, ApiError) {
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let api_error: ApiError = serde_json::from_slice(&body).unwrap();
+        (status, api_error)
+    }
+
+    #[tokio::test]
+    async fn every_app_error_variant_maps_to_correct_status_and_code() {
+        let test_cases: Vec<(AppError, StatusCode, &str)> = vec![
+            (
+                AppError::Unauthorized,
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+            ),
+            (AppError::Forbidden, StatusCode::FORBIDDEN, "forbidden"),
+            (AppError::NotFound, StatusCode::NOT_FOUND, "not_found"),
+            (
+                AppError::Conflict("state conflict"),
+                StatusCode::CONFLICT,
+                "conflict",
+            ),
+            (
+                AppError::Validation("field x is required".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation",
+            ),
+            (
+                AppError::RateLimited,
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+            ),
+        ];
+
+        for (error, expected_status, expected_code) in test_cases {
+            let (status, api_error) = extract(error.into_response()).await;
+            assert_eq!(status, expected_status, "wrong status for {expected_code}");
+            assert_eq!(
+                api_error.code, expected_code,
+                "wrong code for {expected_code}"
+            );
+            assert!(
+                !api_error.correlation_id.is_nil(),
+                "missing correlation_id for {expected_code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn database_error_returns_500_with_masked_message() {
+        let db_err =
+            AppError::Database(sqlx::Error::Configuration(Box::new(std::io::Error::other(
+                "config error",
+            ))));
+        let (status, api_error) = extract(db_err.into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(api_error.code, "internal");
+        assert_eq!(
+            api_error.message,
+            "The operation failed. Use the correlation ID in server diagnostics."
+        );
+        assert!(!api_error.correlation_id.is_nil());
+    }
+
+    #[tokio::test]
+    async fn internal_error_returns_500_with_masked_message() {
+        let internal_err = AppError::Internal(anyhow::anyhow!("secret details"));
+        let (status, api_error) = extract(internal_err.into_response()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(api_error.code, "internal");
+        assert_eq!(
+            api_error.message,
+            "The operation failed. Use the correlation ID in server diagnostics."
+        );
+        assert!(!api_error.correlation_id.is_nil());
+    }
+}

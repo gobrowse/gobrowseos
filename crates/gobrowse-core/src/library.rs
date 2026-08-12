@@ -249,28 +249,40 @@ pub fn rank_fusion(
 mod tests {
     use super::*;
 
-    fn autobiography(body: String) -> Book {
+    fn book(overrides: impl FnOnce(&mut Book)) -> Book {
         let now = OffsetDateTime::UNIX_EPOCH;
-        Book {
+        let mut b = Book {
             id: Uuid::nil(),
             profile_id: Uuid::nil(),
-            title: "Autobiography".into(),
-            body,
-            book_type: BookType::Autobiography,
-            scope: BookScope::Profile,
+            title: "Valid Title".into(),
+            body: String::new(),
+            book_type: BookType::Note,
+            scope: BookScope::Global,
             tags: vec![],
             provenance: Provenance::User,
             trust: TrustLevel::UserProvided,
             author: "owner".into(),
             workspace_id: None,
             conversation_id: None,
-            security_classification: SecurityClassification::Confidential,
+            security_classification: SecurityClassification::Public,
             embedding_status: EmbeddingStatus::Pending,
             metadata: serde_json::json!({}),
             revision: 1,
             created_at: now,
             updated_at: now,
-        }
+        };
+        overrides(&mut b);
+        b
+    }
+
+    fn autobiography(body: String) -> Book {
+        book(|b| {
+            b.title = "Autobiography".into();
+            b.body = body;
+            b.book_type = BookType::Autobiography;
+            b.scope = BookScope::Profile;
+            b.security_classification = SecurityClassification::Confidential;
+        })
     }
 
     #[test]
@@ -287,6 +299,58 @@ mod tests {
     }
 
     #[test]
+    fn book_validation_enforces_all_scope_and_title_invariants() {
+        // EmptyTitle: blank
+        assert_eq!(
+            book(|b| b.title = String::new()).validate(),
+            Err(BookValidationError::EmptyTitle)
+        );
+        // EmptyTitle: whitespace-only
+        assert_eq!(
+            book(|b| b.title = "   ".into()).validate(),
+            Err(BookValidationError::EmptyTitle)
+        );
+        // TitleTooLong
+        assert_eq!(
+            book(|b| b.title = "x".repeat(513)).validate(),
+            Err(BookValidationError::TitleTooLong)
+        );
+        // MissingWorkspace
+        assert_eq!(
+            book(|b| b.scope = BookScope::Workspace).validate(),
+            Err(BookValidationError::MissingWorkspace)
+        );
+        // MissingProjectWorkspace
+        assert_eq!(
+            book(|b| b.scope = BookScope::Project).validate(),
+            Err(BookValidationError::MissingProjectWorkspace)
+        );
+        // MissingConversation
+        assert_eq!(
+            book(|b| b.scope = BookScope::Conversation).validate(),
+            Err(BookValidationError::MissingConversation)
+        );
+        // Workspace scope with workspace_id → Ok
+        assert!(
+            book(|b| {
+                b.scope = BookScope::Workspace;
+                b.workspace_id = Some(Uuid::new_v4());
+            })
+            .validate()
+            .is_ok()
+        );
+        // Conversation scope with conversation_id → Ok
+        assert!(
+            book(|b| {
+                b.scope = BookScope::Conversation;
+                b.conversation_id = Some(Uuid::new_v4());
+            })
+            .validate()
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn chunking_preserves_unicode_and_overlap() {
         let chunks = chunk_text("a🦀bcdef", 4, 1);
         assert_eq!(chunks.len(), 2);
@@ -296,6 +360,21 @@ mod tests {
             &"a🦀bcdef"[chunks[1].source_start..chunks[1].source_end],
             "cdef"
         );
+    }
+
+    #[test]
+    fn chunk_text_handles_empty_and_single_chunk() {
+        // Empty body → empty vec
+        let chunks = chunk_text("", 64, 8);
+        assert!(chunks.is_empty());
+
+        // Single chunk: text shorter than max_chars
+        let chunks = chunk_text("hello world", 64, 8);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "hello world");
+        assert_eq!(chunks[0].ordinal, 0);
+        assert_eq!(chunks[0].source_start, 0);
+        assert_eq!(chunks[0].source_end, "hello world".len());
     }
 
     #[test]
@@ -310,5 +389,30 @@ mod tests {
             RankingWeights::default(),
         );
         assert_eq!(ranked[0].id, shared);
+    }
+
+    #[test]
+    fn rank_fusion_clamps_out_of_range_boosts_and_breaks_ties_by_id() {
+        let id_a = Uuid::nil();
+        let id_b = Uuid::from_u128(1);
+        // Same lexical rank → tie; boost one with out-of-range values
+        let mut boosts = HashMap::new();
+        // recency 2.0 should be clamped to 1.0, source -1.0 clamped to 0.0,
+        // workspace 0.5 in-range
+        boosts.insert(id_a, (2.0, -1.0, 0.5));
+        boosts.insert(id_b, (0.0, 0.0, 0.0));
+        let weights = RankingWeights::default();
+        let ranked = rank_fusion(&[id_a, id_b], &[], &boosts, weights);
+        // Both have same base score (same rank in lexical, none in semantic)
+        // id_a gets clamped boost, so it should rank above id_b
+        assert!(ranked[0].score > ranked[1].score);
+        assert_eq!(ranked[0].id, id_a);
+
+        // Tie-break by id: same score → lower UUID first
+        let ranked = rank_fusion(&[id_a, id_b], &[], &HashMap::new(), weights);
+        assert_eq!(ranked.len(), 2);
+        // Same score from same lexical rank; tie breaks by id ascending
+        assert_eq!(ranked[0].id, id_a); // nil UUID < uuid(1)
+        assert_eq!(ranked[1].id, id_b);
     }
 }

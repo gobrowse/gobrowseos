@@ -46,6 +46,54 @@ pub struct DiagnosticCheck {
     pub latency_ms: Option<u64>,
 }
 
+// --- transport endpoint validation ---
+
+/// Validate that an [`McpTransport`] uses a supported scheme or a non-empty
+/// command.  This is a pure static check; it does not resolve the endpoint.
+///
+/// * `Stdio` → Pass iff the command string is non-empty.
+/// * `StreamableHttp` → Pass iff the endpoint scheme is `http` or `https`;
+///   any other scheme (file, ftp, unix, etc.) is Fail.
+pub fn validate_transport_endpoint(transport: &McpTransport) -> DiagnosticCheck {
+    match transport {
+        McpTransport::Stdio { command, .. } => {
+            if command.is_empty() {
+                DiagnosticCheck {
+                    code: "mcp.transport".into(),
+                    label: "transport endpoint".into(),
+                    status: DiagnosticStatus::Fail,
+                    detail: "stdio command is empty".into(),
+                    latency_ms: None,
+                }
+            } else {
+                DiagnosticCheck {
+                    code: "mcp.transport".into(),
+                    label: "transport endpoint".into(),
+                    status: DiagnosticStatus::Pass,
+                    detail: format!("stdio transport via {command}"),
+                    latency_ms: None,
+                }
+            }
+        }
+        McpTransport::StreamableHttp { endpoint } => match endpoint.scheme() {
+            "http" | "https" => DiagnosticCheck {
+                code: "mcp.transport".into(),
+                label: "transport endpoint".into(),
+                status: DiagnosticStatus::Pass,
+                detail: format!("streamable HTTP endpoint {endpoint}"),
+                latency_ms: None,
+            },
+            _ => DiagnosticCheck {
+                code: "mcp.transport".into(),
+                label: "transport endpoint".into(),
+                status: DiagnosticStatus::Fail,
+                detail: format!("disallowed endpoint scheme: {endpoint}"),
+                latency_ms: None,
+            },
+        },
+    }
+}
+
 // release-gated: real OAuth matrix / server conformance is not covered here.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpDoctorReport {
@@ -1298,5 +1346,158 @@ mod tests {
             now,
         );
         assert!(result.is_ok(), "oauth token validation failed: {result:?}");
+    }
+
+    // ── validate_transport_endpoint tests ────────────────────────
+
+    #[test]
+    fn streamable_http_accepts_https_rejects_file_ftp_unix() {
+        // HTTPS → Pass
+        let https = McpTransport::StreamableHttp {
+            endpoint: Url::parse("https://mcp.example.com/rpc").unwrap(),
+        };
+        let check = validate_transport_endpoint(&https);
+        assert_eq!(check.status, DiagnosticStatus::Pass);
+
+        // HTTP → Pass
+        let http = McpTransport::StreamableHttp {
+            endpoint: Url::parse("http://localhost:3000/mcp").unwrap(),
+        };
+        let check = validate_transport_endpoint(&http);
+        assert_eq!(check.status, DiagnosticStatus::Pass);
+
+        // file:// → Fail
+        let file = McpTransport::StreamableHttp {
+            endpoint: Url::parse("file:///etc/passwd").unwrap(),
+        };
+        let check = validate_transport_endpoint(&file);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("disallowed endpoint scheme"));
+
+        // ftp:// → Fail
+        let ftp = McpTransport::StreamableHttp {
+            endpoint: Url::parse("ftp://evil.example/tool").unwrap(),
+        };
+        let check = validate_transport_endpoint(&ftp);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("disallowed endpoint scheme"));
+    }
+
+    #[test]
+    fn stdio_passes_when_command_nonempty() {
+        let stdio = McpTransport::Stdio {
+            command: "npx".into(),
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+            ],
+        };
+        let check = validate_transport_endpoint(&stdio);
+        assert_eq!(check.status, DiagnosticStatus::Pass);
+        assert!(check.detail.contains("npx"));
+    }
+
+    #[test]
+    fn stdio_fails_when_command_is_empty() {
+        let stdio = McpTransport::Stdio {
+            command: String::new(),
+            args: vec![],
+        };
+        let check = validate_transport_endpoint(&stdio);
+        assert_eq!(check.status, DiagnosticStatus::Fail);
+        assert!(check.detail.contains("empty"));
+    }
+
+    // ── validate_mcp_oauth_token: string aud + missing claims ───
+
+    #[test]
+    fn validate_mcp_oauth_token_handles_string_aud_and_missing_claims() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+
+        // String aud (not array) → Ok
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": "mcp://my-server",
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert!(
+            result.is_ok(),
+            "string aud should be accepted, got {result:?}"
+        );
+
+        // Missing iss → InvalidFormat
+        let payload = serde_json::json!({
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
+
+        // Missing exp → InvalidFormat
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
+
+        // Missing sub → InvalidFormat
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
+
+        // Non-string, non-array aud → InvalidFormat
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": 42,
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
     }
 }

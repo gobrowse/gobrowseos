@@ -147,4 +147,75 @@ mod tests {
         ));
         assert_eq!(second.remaining_turns(), 1);
     }
+
+    #[tokio::test]
+    async fn empty_routes_return_temporary_unavailable() {
+        let result = open_with_fallback(&[], &request()).await;
+        assert!(matches!(result, Err(ProviderError::TemporaryUnavailable)));
+    }
+
+    #[tokio::test]
+    async fn all_routes_fail_returns_last_error() {
+        let first = Arc::new(FakeModelProvider::new(
+            "first",
+            [FakeTurn::Reject(ProviderError::RateLimited {
+                retry_after_seconds: None,
+            })],
+        ));
+        let second = Arc::new(FakeModelProvider::new(
+            "second",
+            [FakeTurn::Reject(ProviderError::Timeout)],
+        ));
+        let routes = vec![
+            ModelRoute {
+                provider: first,
+                identity: ModelIdentity {
+                    provider: "first".into(),
+                    model: "a".into(),
+                },
+            },
+            ModelRoute {
+                provider: second,
+                identity: ModelIdentity {
+                    provider: "second".into(),
+                    model: "b".into(),
+                },
+            },
+        ];
+        let result = open_with_fallback(&routes, &request()).await;
+        // last_error is the Timeout from the second provider
+        assert!(matches!(result, Err(ProviderError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn first_route_success_skips_remaining() {
+        let first = Arc::new(FakeModelProvider::new(
+            "first",
+            [FakeTurn::Events(vec![Ok(ModelEvent::Completed)])],
+        ));
+        let second = Arc::new(FakeModelProvider::new(
+            "second",
+            [FakeTurn::Events(vec![Ok(ModelEvent::Completed)])],
+        ));
+        let routes = vec![
+            ModelRoute {
+                provider: first,
+                identity: ModelIdentity {
+                    provider: "first".into(),
+                    model: "a".into(),
+                },
+            },
+            ModelRoute {
+                provider: second.clone(),
+                identity: ModelIdentity {
+                    provider: "second".into(),
+                    model: "b".into(),
+                },
+            },
+        ];
+        let (selected, _stream) = open_with_fallback(&routes, &request()).await.unwrap();
+        assert_eq!(selected.provider, "first");
+        // second provider was never consumed
+        assert_eq!(second.remaining_turns(), 1);
+    }
 }

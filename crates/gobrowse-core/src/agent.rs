@@ -167,4 +167,67 @@ mod tests {
         assert_eq!(budget.input_limit(), 0);
         assert!(!budget.fits());
     }
+
+    #[test]
+    fn paused_run_resumes_into_building_context() {
+        let mut run = AgentRun {
+            id: Uuid::nil(),
+            state: RunState::Paused,
+            step: 3,
+        };
+        let next = run.transition(RunEvent::ResumeRequested).unwrap();
+        assert_eq!(next, RunState::BuildingContext);
+        assert_eq!(run.state, RunState::BuildingContext);
+        assert_eq!(run.step, 4);
+    }
+
+    #[test]
+    fn cancel_and_fail_are_terminal_from_running_tool() {
+        let mut run = AgentRun {
+            id: Uuid::nil(),
+            state: RunState::RunningTool,
+            step: 5,
+        };
+        assert_eq!(
+            run.transition(RunEvent::CancelRequested).unwrap(),
+            RunState::Canceled
+        );
+        assert!(run.state.is_terminal());
+
+        let mut run2 = AgentRun {
+            id: Uuid::nil(),
+            state: RunState::RunningTool,
+            step: 5,
+        };
+        assert_eq!(run2.transition(RunEvent::Failed).unwrap(), RunState::Failed);
+        assert!(run2.state.is_terminal());
+    }
+
+    #[test]
+    fn model_busy_self_loop_preserves_state() {
+        let mut run = AgentRun {
+            id: Uuid::nil(),
+            state: RunState::AwaitingModel,
+            step: 2,
+        };
+        let next = run.transition(RunEvent::ModelRequested).unwrap();
+        assert_eq!(next, RunState::AwaitingModel);
+        assert_eq!(run.state, RunState::AwaitingModel);
+        assert_eq!(run.step, 3); // step increments even on self-loop
+    }
+
+    #[test]
+    fn invalid_transition_carries_from_and_event() {
+        let mut run = AgentRun {
+            id: Uuid::nil(),
+            state: RunState::Completed,
+            step: 7,
+        };
+        let err = run.transition(RunEvent::ModelRequested).unwrap_err();
+        assert_eq!(err.from, RunState::Completed);
+        assert_eq!(err.event, RunEvent::ModelRequested);
+        // state and step unchanged on error
+        assert_eq!(run.state, RunState::Completed);
+        assert_eq!(run.step, 7);
+    }
 }
