@@ -36,12 +36,20 @@ pub fn task_branch(task_id: Uuid, title: &str) -> String {
     }
 }
 
+fn segment_is_only_dot(branch: &str) -> bool {
+    branch.split('/').any(|segment| segment == ".")
+}
+
 pub fn validate_branch(branch: &str) -> Result<(), WorktreeError> {
     if branch.is_empty()
         || branch.starts_with('-')
+        || branch.starts_with("refs/")
         || branch.ends_with('/')
+        || branch.ends_with('.')
+        || branch.ends_with(".lock")
         || branch.contains("..")
         || branch.contains("@{")
+        || segment_is_only_dot(branch)
         || branch.chars().any(|character| {
             character.is_control()
                 || matches!(character, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
@@ -75,8 +83,53 @@ mod tests {
 
     #[test]
     fn dangerous_ref_syntax_is_rejected() {
-        for branch in ["../main", "main@{1}", "bad branch", "-option", "ends/"] {
+        for branch in [
+            "../main",
+            "main@{1}",
+            "bad branch",
+            "-option",
+            "ends/",
+            "ends.",
+            "x.lock",
+            "refs/heads/main",
+            "foo/./bar",
+        ] {
             assert!(validate_branch(branch).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn validate_branch_rejects_trailing_dot() {
+        for branch in ["foo.", "feature/end.", "agent/x."] {
+            assert!(validate_branch(branch).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn validate_branch_rejects_dotlock_suffix() {
+        for branch in ["refs.lock", "feature/x.lock", "agent/task.lock"] {
+            assert!(validate_branch(branch).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn validate_branch_rejects_ref_namespace_injection() {
+        for branch in ["refs/heads/main", "refs/tags/x", "refs/anything"] {
+            assert!(validate_branch(branch).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn validate_branch_rejects_segment_of_only_dots_or_dot() {
+        for branch in ["foo/./bar", "foo/.../bar"] {
+            assert!(validate_branch(branch).is_err(), "{branch}");
+        }
+    }
+
+    #[test]
+    fn validate_branch_accepts_normal_nested_slash_paths() {
+        for branch in ["agent/abc-def", "feature/foo/bar", "x/y-z"] {
+            assert!(validate_branch(branch).is_ok(), "{branch}");
         }
     }
 }
