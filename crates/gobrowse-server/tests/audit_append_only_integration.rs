@@ -1,3 +1,5 @@
+mod common;
+
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -59,10 +61,12 @@ async fn seed_audit_row(pool: &PgPool) -> (Uuid, Uuid, i64) {
 
 #[tokio::test]
 async fn audit_events_rejects_update() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let (_profile_id, _user_id, seq) = seed_audit_row(&pool).await;
 
     // Run UPDATE inside a transaction we always roll back.
@@ -85,10 +89,12 @@ async fn audit_events_rejects_update() {
 
 #[tokio::test]
 async fn audit_events_rejects_delete() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let (_profile_id, _user_id, seq) = seed_audit_row(&pool).await;
 
     let mut tx = pool.begin().await.expect("begin tx");
@@ -110,10 +116,12 @@ async fn audit_events_rejects_delete() {
 
 #[tokio::test]
 async fn audit_events_rejects_truncate() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     // Seed a row so we can verify it survives.
     let (_profile_id, _user_id, _seq) = seed_audit_row(&pool).await;
 
@@ -134,10 +142,12 @@ async fn audit_events_rejects_truncate() {
 
 #[tokio::test]
 async fn audit_appends_succeed_after_mutation_rejection() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let (_profile_id, _user_id, seq) = seed_audit_row(&pool).await;
 
     // Verify UPDATE is rejected (proves the trigger is active).

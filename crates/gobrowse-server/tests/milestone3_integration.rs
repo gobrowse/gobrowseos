@@ -1,3 +1,5 @@
+mod common;
+
 use std::time::Duration as StdDuration;
 
 use axum::{
@@ -36,6 +38,10 @@ async fn milestone3_workflows_are_durable_and_searchable() {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping Milestone 2 integration test");
         return;
     };
+    // Serialize ALL DB integration tests across processes — the spawned
+    // run_worker's claim_runs scans agent_runs globally with FOR UPDATE
+    // SKIP LOCKED and races every other test file.
+    let _lock = common::acquire_test_lock(&database_url).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test PostgreSQL");

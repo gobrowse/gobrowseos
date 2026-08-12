@@ -1,3 +1,5 @@
+mod common;
+
 use axum::{
     Router,
     body::Body,
@@ -190,14 +192,14 @@ async fn request_json(
 
 #[tokio::test]
 async fn rotate_sessions_invalidates_existing_sessions() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!(
             "GOBROWSE_TEST_DATABASE_URL is unset; skipping session rotation integration test"
         );
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await
@@ -271,14 +273,14 @@ async fn rotate_sessions_invalidates_existing_sessions() {
 
 #[tokio::test]
 async fn fresh_session_survives_self_rotation() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!(
             "GOBROWSE_TEST_DATABASE_URL is unset; skipping session rotation integration test"
         );
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await
@@ -381,14 +383,14 @@ async fn fresh_session_survives_self_rotation() {
 
 #[tokio::test]
 async fn disabled_user_cannot_login_after_disable() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!(
             "GOBROWSE_TEST_DATABASE_URL is unset; skipping session rotation integration test"
         );
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await
@@ -463,14 +465,14 @@ async fn disabled_user_cannot_login_after_disable() {
 
 #[tokio::test]
 async fn non_admin_cannot_rotate_other_user() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!(
             "GOBROWSE_TEST_DATABASE_URL is unset; skipping session rotation integration test"
         );
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await

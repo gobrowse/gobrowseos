@@ -1,3 +1,5 @@
+mod common;
+
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gobrowse_server::{config::VaultSettings, vault};
 use secrecy::{ExposeSecret, SecretString};
@@ -18,10 +20,12 @@ async fn test_pool() -> Option<PgPool> {
 
 #[tokio::test]
 async fn migrations_enable_pgvector_and_schema_version() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let row = sqlx::query(
         "SELECT schema_version, EXISTS(SELECT 1 FROM pg_extension WHERE extname = 'vector') AS vector_enabled \
          FROM schema_metadata WHERE singleton",
@@ -29,16 +33,18 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 6);
+    assert_eq!(row.get::<i64, _>("schema_version"), 7);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
 #[tokio::test]
 async fn autobiography_constraint_uses_character_length() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'constraint-test')")
         .bind(profile_id)
@@ -79,10 +85,12 @@ async fn autobiography_constraint_uses_character_length() {
 
 #[tokio::test]
 async fn lexical_search_and_revision_history_are_transactional() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let profile_id = Uuid::now_v7();
     let book_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'search-test')")
@@ -137,10 +145,12 @@ async fn lexical_search_and_revision_history_are_transactional() {
 
 #[tokio::test]
 async fn vault_round_trip_never_persists_plaintext() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'vault-test')")
         .bind(profile_id)
@@ -240,6 +250,7 @@ async fn schema_v3_safely_upgrades_permitted_v1_states() {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test PostgreSQL");
@@ -537,10 +548,12 @@ async fn schema_v3_safely_upgrades_permitted_v1_states() {
 
 #[tokio::test]
 async fn login_rate_limit_blocks_after_threshold() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let email = format!("throttle-{}@example.test", Uuid::now_v7().simple());
     let email_lower = email.to_lowercase();
     let now = time::OffsetDateTime::now_utc();
@@ -586,10 +599,12 @@ async fn login_rate_limit_blocks_after_threshold() {
 
 #[tokio::test]
 async fn login_rate_limit_recovers_after_window_expiry() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let email = format!("recover-{}@example.test", Uuid::now_v7().simple());
     let email_lower = email.to_lowercase();
 
@@ -632,10 +647,12 @@ async fn login_rate_limit_recovers_after_window_expiry() {
 
 #[tokio::test]
 async fn locked_account_returns_uniform_unauthorized() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let email = format!("locked-{}@example.test", Uuid::now_v7().simple());
     let email_lower = email.to_lowercase();
     let now = time::OffsetDateTime::now_utc();

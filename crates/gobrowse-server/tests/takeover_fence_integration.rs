@@ -1,3 +1,5 @@
+mod common;
+
 use axum::{
     Router,
     body::Body,
@@ -222,6 +224,7 @@ async fn cancel_run_finalizes_when_lease_already_expired() {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping takeover fence test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test PostgreSQL");
@@ -321,6 +324,7 @@ async fn release_lease_rejects_stale_execution_token_after_takeover() {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unsetting; skipping takeover fence test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test PostgreSQL");
@@ -393,6 +397,7 @@ async fn fail_run_rejects_stale_token_when_lease_renewed() {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unsetting; skipping takeover fence test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test PostgreSQL");
@@ -476,6 +481,7 @@ async fn cancel_run_is_idempotent_after_already_cancelled() {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unsetting; skipping takeover fence test");
         return;
     };
+    let _lock = common::acquire_test_lock(&database_url).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("connect to test PostgreSQL");

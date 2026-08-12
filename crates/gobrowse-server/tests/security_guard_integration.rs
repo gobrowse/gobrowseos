@@ -3,6 +3,8 @@
 //! HTTP tests use Router::oneshot against a minimal AppState; WS tests
 //! require a real PostgreSQL database for session authentication.
 
+mod common;
+
 use axum::{
     Router,
     body::Body,
@@ -166,12 +168,12 @@ async fn send(
 
 #[tokio::test]
 async fn cross_origin_post_is_forbidden() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let state = AppState::new(
         pool.clone(),
         settings_with_origin("https://app.example.com", &database_url),
@@ -199,12 +201,12 @@ async fn cross_origin_post_is_forbidden() {
 
 #[tokio::test]
 async fn cross_site_fetch_site_is_forbidden() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let state = AppState::new(
         pool.clone(),
         settings_with_origin("https://app.example.com", &database_url),
@@ -233,12 +235,12 @@ async fn cross_site_fetch_site_is_forbidden() {
 
 #[tokio::test]
 async fn same_site_post_is_allowed() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let state = AppState::new(
         pool.clone(),
         settings_with_origin("http://localhost:8080", &database_url),
@@ -268,12 +270,12 @@ async fn same_site_post_is_allowed() {
 
 #[tokio::test]
 async fn missing_origin_on_state_change_is_forbidden() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let state = AppState::new(
         pool.clone(),
         settings_with_origin("http://localhost:8080", &database_url),
@@ -306,12 +308,12 @@ async fn missing_origin_on_state_change_is_forbidden() {
 
 #[tokio::test]
 async fn websocket_upgrade_rejects_missing_origin() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let (profile_id, user_id, _cookie) = create_authed_session(&pool, "OWNER").await;
     let state = AppState::new(
         pool.clone(),
@@ -348,12 +350,12 @@ async fn websocket_upgrade_rejects_missing_origin() {
 
 #[tokio::test]
 async fn websocket_upgrade_rejects_mismatched_origin() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let (profile_id, user_id, cookie) = create_authed_session(&pool, "OWNER").await;
     let state = AppState::new(
         pool.clone(),
@@ -395,12 +397,12 @@ async fn websocket_upgrade_rejects_mismatched_origin() {
 
 #[tokio::test]
 async fn websocket_upgrade_rejects_http_scheme_against_https_public_origin() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping security guard test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
     let (profile_id, user_id, cookie) = create_authed_session(&pool, "OWNER").await;
     // Public origin is https but the WS Origin header uses http.
     let state = AppState::new(

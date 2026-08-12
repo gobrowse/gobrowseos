@@ -1,3 +1,5 @@
+mod common;
+
 use axum::{
     Router,
     body::Body,
@@ -154,12 +156,12 @@ async fn send_webhook_delivery(
 
 #[tokio::test]
 async fn valid_signature_is_accepted_and_dedups_delivery() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping webhook integration test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'webhook-test-profile')")
@@ -230,12 +232,12 @@ async fn valid_signature_is_accepted_and_dedups_delivery() {
 
 #[tokio::test]
 async fn replayed_delivery_id_returns_conflict() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping webhook integration test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'webhook-replay-profile')")
@@ -295,12 +297,12 @@ async fn replayed_delivery_id_returns_conflict() {
 
 #[tokio::test]
 async fn tampered_body_rejected_constant_time() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping webhook integration test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'webhook-tamper-profile')")
@@ -389,12 +391,12 @@ async fn tampered_body_rejected_constant_time() {
 
 #[tokio::test]
 async fn disabled_webhook_returns_not_found() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping webhook integration test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'webhook-disabled-profile')")
@@ -439,12 +441,12 @@ async fn disabled_webhook_returns_not_found() {
 
 #[tokio::test]
 async fn nonexistent_webhook_returns_not_found() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping webhook integration test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await
@@ -476,12 +478,12 @@ async fn nonexistent_webhook_returns_not_found() {
 
 #[tokio::test]
 async fn stale_timestamp_rejected() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping webhook integration test");
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let profile_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'webhook-stale-profile')")

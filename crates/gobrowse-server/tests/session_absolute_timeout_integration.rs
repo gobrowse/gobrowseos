@@ -1,3 +1,5 @@
+mod common;
+
 use axum::{
     Router,
     body::Body,
@@ -220,14 +222,14 @@ async fn cleanup_user(pool: &PgPool, user: &TestUser) {
 
 #[tokio::test]
 async fn expired_absolute_timeout_rejects_even_when_idle_remaining() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!(
             "GOBROWSE_TEST_DATABASE_URL is unset; skipping absolute-timeout integration test"
         );
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await
@@ -268,14 +270,14 @@ async fn expired_absolute_timeout_rejects_even_when_idle_remaining() {
 
 #[tokio::test]
 async fn idle_refresh_within_absolute_window_still_works() {
-    let Some(pool) = test_pool().await else {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!(
             "GOBROWSE_TEST_DATABASE_URL is unset; skipping absolute-timeout integration test"
         );
         return;
     };
-    let database_url =
-        std::env::var("GOBROWSE_TEST_DATABASE_URL").expect("already checked by test_pool");
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
 
     let state = AppState::new(pool.clone(), test_settings(&database_url))
         .await
