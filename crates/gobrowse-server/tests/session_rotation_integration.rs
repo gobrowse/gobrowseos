@@ -256,11 +256,7 @@ async fn rotate_sessions_invalidates_existing_sessions() {
         .execute(&pool)
         .await
         .expect("cleanup login attempts");
-    sqlx::query("DELETE FROM audit_events WHERE actor_user_id = $1")
-        .bind(user.user_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup audit events");
+    // audit_events is append-only; FK ON DELETE SET NULL handles cleanup.
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user.user_id)
         .execute(&pool)
@@ -370,11 +366,7 @@ async fn fresh_session_survives_self_rotation() {
         .execute(&pool)
         .await
         .expect("cleanup login attempts");
-    sqlx::query("DELETE FROM audit_events WHERE actor_user_id = $1")
-        .bind(user.user_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup audit events");
+    // audit_events is append-only; FK ON DELETE SET NULL handles cleanup.
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user.user_id)
         .execute(&pool)
@@ -456,11 +448,7 @@ async fn disabled_user_cannot_login_after_disable() {
         .execute(&pool)
         .await
         .expect("cleanup login attempts");
-    sqlx::query("DELETE FROM audit_events WHERE actor_user_id = $1")
-        .bind(user.user_id)
-        .execute(&pool)
-        .await
-        .expect("cleanup audit events");
+    // audit_events is append-only; FK ON DELETE SET NULL handles cleanup.
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user.user_id)
         .execute(&pool)
@@ -546,11 +534,7 @@ async fn non_admin_cannot_rotate_other_user() {
             .execute(&pool)
             .await
             .expect("cleanup login attempts");
-        sqlx::query("DELETE FROM audit_events WHERE actor_user_id = $1")
-            .bind(user.user_id)
-            .execute(&pool)
-            .await
-            .expect("cleanup audit events");
+        // audit_events is append-only; FK ON DELETE SET NULL handles cleanup.
         sqlx::query("DELETE FROM users WHERE id = $1")
             .bind(user.user_id)
             .execute(&pool)
