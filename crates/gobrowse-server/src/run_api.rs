@@ -1578,6 +1578,48 @@ fn app_database_error(error: AppError) -> sqlx::Error {
     }
 }
 
+/// Public ONLY for integration-test coverage; do not call from production code.
+pub async fn test_release_lease(
+    pool: &PgPool,
+    run_id: Uuid,
+    token: Uuid,
+    profile_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    release_lease(
+        pool,
+        run_id,
+        RunLease {
+            token,
+            profile_id,
+            takeover: false,
+        },
+    )
+    .await
+}
+
+/// Public ONLY for integration-test coverage; do not call from production code.
+pub async fn test_fail_run(
+    pool: &PgPool,
+    run_id: Uuid,
+    token: Uuid,
+    profile_id: Uuid,
+    code: &'static str,
+    detail: &'static str,
+) -> Result<(), sqlx::Error> {
+    fail_run(
+        pool,
+        run_id,
+        RunLease {
+            token,
+            profile_id,
+            takeover: false,
+        },
+        code,
+        detail,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod concurrency_tests {
     use super::*;
