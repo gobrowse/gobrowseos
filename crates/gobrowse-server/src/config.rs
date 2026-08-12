@@ -189,8 +189,12 @@ impl Settings {
         if self.auth.session_idle_minutes <= 0
             || self.auth.session_absolute_hours <= 0
             || self.auth.argon2_memory_kib == 0
+            || self.auth.argon2_memory_kib < 8192
+            || self.auth.argon2_memory_kib > 4_194_304
             || self.auth.argon2_iterations == 0
+            || self.auth.argon2_iterations < 2
             || self.auth.argon2_parallelism == 0
+            || self.auth.argon2_parallelism < 1
             || self.auth.max_parallel_hashes == 0
         {
             return Err(SettingsError::InvalidSecuritySetting);
@@ -224,6 +228,23 @@ impl Settings {
 mod tests {
     use super::*;
 
+    /// Build a `Settings` with all required fields set to sane defaults
+    /// so that only the caller's deliberate mutation triggers validation
+    /// rejections.
+    fn base_test_settings() -> Settings {
+        Settings {
+            http: HttpSettings::default(),
+            database: DatabaseSettings {
+                url: "postgres://test/placeholder".into(),
+                max_connections: 2,
+            },
+            auth: AuthSettings::default(),
+            vault: VaultSettings::default(),
+            features: FeatureSettings::default(),
+            observability: ObservabilitySettings::default(),
+        }
+    }
+
     #[test]
     fn vault_defaults_to_first_key_version() {
         assert_eq!(VaultSettings::default().key_version, 1);
@@ -237,5 +258,41 @@ mod tests {
         }))
         .expect("deserialize Milestone 2 feature settings");
         assert!(!features.local_models);
+    }
+
+    #[test]
+    fn config_rejects_argon2_memory_kib_below_floor() {
+        let mut settings = base_test_settings();
+        settings.auth.argon2_memory_kib = 4096;
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidSecuritySetting)
+        ));
+    }
+
+    #[test]
+    fn config_rejects_argon2_iterations_below_floor() {
+        let mut settings = base_test_settings();
+        settings.auth.argon2_iterations = 1;
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidSecuritySetting)
+        ));
+    }
+
+    #[test]
+    fn config_rejects_argon2_memory_kib_above_ceiling() {
+        let mut settings = base_test_settings();
+        settings.auth.argon2_memory_kib = 8_388_608;
+        assert!(matches!(
+            settings.validate(),
+            Err(SettingsError::InvalidSecuritySetting)
+        ));
+    }
+
+    #[test]
+    fn config_accepts_baseline_argon2_params() {
+        let settings = base_test_settings();
+        assert!(settings.validate().is_ok());
     }
 }
