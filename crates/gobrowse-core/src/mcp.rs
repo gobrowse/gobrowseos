@@ -1,6 +1,9 @@
 use std::net::IpAddr;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use url::Url;
 
 pub const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
@@ -314,6 +317,289 @@ pub fn validate_audience_binding(
     }
 }
 
+// release-gated: real RS256/JWKS rotation against live OIDC providers is
+// not covered here; this is an HS256 mock-IdP simulation.
+//
+// ── OAuth token validation (HS256 mock conformance) ─────────────
+//
+// Pure JWT-claim validation logic + manual HMAC-SHA256 verification.
+// The HS256 choice reuses the workspace deps (sha2, subtle, base64)
+// without adding jsonwebtoken or ring.  No I/O — all functions below
+// are pure and suitable for use in both unit tests and the MCP doctor
+// conformance harness.
+
+/// HMAC-SHA256 block size in bytes (RFC 2104 §2).
+const HMAC_SHA256_BLOCK_SIZE: usize = 64;
+
+/// Inner pad byte (RFC 2104 §2).
+const HMAC_IPAD: u8 = 0x36;
+
+/// Outer pad byte (RFC 2104 §2).
+const HMAC_OPAD: u8 = 0x5c;
+
+/// Error variants for MCP OAuth token validation.
+///
+/// Every variant carries a human-readable description via `#[error]`.
+/// The order matches the validation pipeline: format → signature →
+/// temporal → binding → identity.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum McpAuthError {
+    #[error("token format is invalid (not a 3-part JWT)")]
+    InvalidFormat,
+    #[error("token signature does not match")]
+    InvalidSignature,
+    #[error("token has expired (exp < now)")]
+    Expired,
+    #[error("token audience does not match any expected audience")]
+    AudienceMismatch,
+    #[error("token issuer does not match expected issuer")]
+    IssuerMismatch,
+    #[error("token is not yet valid (nbf > now)")]
+    NotYetValid,
+}
+
+/// Parsed JWT claims relevant to MCP audience-binding validation.
+///
+/// `aud` is always normalized to a `Vec<String>` during parsing.
+#[derive(Debug, Clone)]
+pub struct McpTokenClaims {
+    pub iss: String,
+    pub aud: Vec<String>,
+    pub exp: i64,
+    pub nbf: Option<i64>,
+    pub sub: String,
+}
+
+// ── private helpers ─────────────────────────────────────────────
+
+/// Compute HMAC-SHA256(key, message) per RFC 2104 using only [`sha2::Sha256`].
+///
+/// This is a private copy of the same algorithm used in the server crate's
+/// [`webhooks::hmac_sha256`], kept here to avoid a core↔server dependency.
+///
+/// # Panics
+/// Cannot panic — `Sha256::new()` + `update` + `finalize` never fail.
+fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    // Steps 1-2: normalize key to exactly block-size bytes.
+    let mut key_block = [0u8; HMAC_SHA256_BLOCK_SIZE];
+
+    if key.len() > HMAC_SHA256_BLOCK_SIZE {
+        let mut h = Sha256::new();
+        h.update(key);
+        let hashed = h.finalize();
+        key_block[..32].copy_from_slice(&hashed);
+    } else {
+        key_block[..key.len()].copy_from_slice(key);
+    }
+
+    // Step 3: inner hash = H((key XOR ipad) || message)
+    let mut ipad_block = [HMAC_IPAD; HMAC_SHA256_BLOCK_SIZE];
+    for i in 0..HMAC_SHA256_BLOCK_SIZE {
+        ipad_block[i] ^= key_block[i];
+    }
+    let mut inner = Sha256::new();
+    inner.update(ipad_block);
+    inner.update(message);
+    let inner_hash = inner.finalize();
+
+    // Step 4: outer hash = H((key XOR opad) || inner_hash)
+    let mut opad_block = [HMAC_OPAD; HMAC_SHA256_BLOCK_SIZE];
+    for i in 0..HMAC_SHA256_BLOCK_SIZE {
+        opad_block[i] ^= key_block[i];
+    }
+    let mut outer = Sha256::new();
+    outer.update(opad_block);
+    outer.update(inner_hash);
+    outer.finalize().into()
+}
+
+/// Base64url-no-pad decode helper.  Maps decode failures to [`McpAuthError::InvalidFormat`].
+fn base64url_decode(input: &str) -> Result<Vec<u8>, McpAuthError> {
+    URL_SAFE_NO_PAD
+        .decode(input)
+        .map_err(|_| McpAuthError::InvalidFormat)
+}
+
+// ── public API ──────────────────────────────────────────────────
+
+/// Parse a JWT into its three components **without verifying the signature**.
+///
+/// Returns `(header_json, payload_json, raw_signature_b64_bytes)` where the
+/// third element is a slice of the original `token` string.
+///
+/// # Errors
+/// Returns [`McpAuthError::InvalidFormat`] if the token does not contain
+/// exactly two '.' separators or if the header/payload are not valid
+/// base64url-encoded JSON.
+pub fn parse_jwt_unverified(
+    token: &str,
+) -> Result<(serde_json::Value, serde_json::Value, &[u8]), McpAuthError> {
+    let mut parts = token.splitn(3, '.');
+    let header_b64 = parts.next().ok_or(McpAuthError::InvalidFormat)?;
+    let payload_b64 = parts.next().ok_or(McpAuthError::InvalidFormat)?;
+    let sig_b64 = parts.next().ok_or(McpAuthError::InvalidFormat)?;
+
+    // Ensure exactly 3 parts (no extra '.' after the signature).
+    if parts.next().is_some() {
+        return Err(McpAuthError::InvalidFormat);
+    }
+
+    let header_bytes = base64url_decode(header_b64)?;
+    let header: serde_json::Value =
+        serde_json::from_slice(&header_bytes).map_err(|_| McpAuthError::InvalidFormat)?;
+
+    let payload_bytes = base64url_decode(payload_b64)?;
+    let payload: serde_json::Value =
+        serde_json::from_slice(&payload_bytes).map_err(|_| McpAuthError::InvalidFormat)?;
+
+    Ok((header, payload, sig_b64.as_bytes()))
+}
+
+/// Validate JWT claims against expected values.
+///
+/// This is the security-relevant pure logic:
+/// - **Audience binding** prevents token confusion across MCP servers.
+/// - **Expiry** prevents stale-token replay.
+/// - **Issuer** prevents malicious-IdP tokens.
+/// - **nbf** (not-before) prevents premature token use.
+///
+/// # Arguments
+/// * `claims` — parsed claims from the token.
+/// * `expected_issuer` — the exact issuer string the token must carry.
+/// * `expected_audiences` — the set of acceptable audience values;
+///   the token is accepted if **any** of its `aud` values appears here.
+/// * `now` — current Unix timestamp (seconds).
+pub fn validate_jwt_claims(
+    claims: &McpTokenClaims,
+    expected_issuer: &str,
+    expected_audiences: &[&str],
+    now: i64,
+) -> Result<(), McpAuthError> {
+    if claims.iss != expected_issuer {
+        return Err(McpAuthError::IssuerMismatch);
+    }
+
+    if !claims
+        .aud
+        .iter()
+        .any(|a| expected_audiences.contains(&a.as_str()))
+    {
+        return Err(McpAuthError::AudienceMismatch);
+    }
+
+    if claims.exp < now {
+        return Err(McpAuthError::Expired);
+    }
+
+    if let Some(nbf) = claims.nbf
+        && nbf > now
+    {
+        return Err(McpAuthError::NotYetValid);
+    }
+
+    Ok(())
+}
+
+/// Verify an HS256 (HMAC-SHA256) JWT signature.
+///
+/// Splits the token, recomputes `HMAC-SHA256(secret, header_b64.payload_b64)`,
+/// and compares the result against the decoded signature bytes using
+/// constant-time comparison via [`subtle::ConstantTimeEq`].
+///
+/// # Returns
+/// * `Ok(true)` — signature matches.
+/// * `Ok(false)` — signature does not match (tampered token).
+/// * `Err(InvalidFormat)` — token cannot be parsed as a 3-part JWT.
+pub fn verify_jwt_hs256(token: &str, secret: &[u8]) -> Result<bool, McpAuthError> {
+    // Locate the two '.' separators without allocating.
+    let first_dot = token.find('.').ok_or(McpAuthError::InvalidFormat)?;
+    let second_dot = token[first_dot + 1..]
+        .find('.')
+        .map(|p| first_dot + 1 + p)
+        .ok_or(McpAuthError::InvalidFormat)?;
+
+    // Ensure no third '.' (extra segments).
+    if token[second_dot + 1..].contains('.') {
+        return Err(McpAuthError::InvalidFormat);
+    }
+
+    let header_b64 = &token[..first_dot];
+    let payload_b64 = &token[first_dot + 1..second_dot];
+    let sig_b64 = &token[second_dot + 1..];
+
+    let sig_bytes = base64url_decode(sig_b64)?;
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let computed_mac = hmac_sha256(secret, signing_input.as_bytes());
+
+    Ok(computed_mac.as_slice().ct_eq(&sig_bytes).into())
+}
+
+/// Full MCP OAuth token validation pipeline.
+///
+/// 1. Verify the HS256 signature (reject tampered tokens).
+/// 2. Parse the claims from the payload.
+/// 3. Validate claims (audience, expiry, issuer, nbf).
+///
+/// Returns the parsed claims on success.
+///
+/// # Example
+/// ```ignore
+/// use gobrowse_core::mcp::validate_mcp_oauth_token;
+///
+/// let claims = validate_mcp_oauth_token(
+///     token,
+///     b"shared-secret",
+///     "https://idp.test/",
+///     &["mcp://my-server"],
+///     1_700_000_000,
+/// )?;
+/// ```
+pub fn validate_mcp_oauth_token(
+    token: &str,
+    secret: &[u8],
+    expected_issuer: &str,
+    expected_audiences: &[&str],
+    now: i64,
+) -> Result<McpTokenClaims, McpAuthError> {
+    // 1. Verify signature.
+    if !verify_jwt_hs256(token, secret)? {
+        return Err(McpAuthError::InvalidSignature);
+    }
+
+    // 2. Parse claims from the (now-trusted) payload.
+    let (_, payload, _) = parse_jwt_unverified(token)?;
+
+    // 3. Normalize `aud` — JWT allows either a string or an array.
+    let aud = match &payload["aud"] {
+        serde_json::Value::String(s) => vec![s.clone()],
+        serde_json::Value::Array(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+        _ => return Err(McpAuthError::InvalidFormat),
+    };
+
+    let claims = McpTokenClaims {
+        iss: payload["iss"]
+            .as_str()
+            .ok_or(McpAuthError::InvalidFormat)?
+            .to_string(),
+        aud,
+        exp: payload["exp"].as_i64().ok_or(McpAuthError::InvalidFormat)?,
+        nbf: payload["nbf"].as_i64(),
+        sub: payload["sub"]
+            .as_str()
+            .ok_or(McpAuthError::InvalidFormat)?
+            .to_string(),
+    };
+
+    // 4. Validate claims.
+    validate_jwt_claims(&claims, expected_issuer, expected_audiences, now)?;
+
+    Ok(claims)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,5 +877,426 @@ mod tests {
         let check = validate_audience_binding("test_tool", &target, &["example.com"]);
         assert_eq!(check.status, DiagnosticStatus::Fail);
         assert!(check.detail.contains("no host"));
+    }
+
+    // ── MCP OAuth HS256 mock-conformance tests ──────────────────
+
+    /// Build a complete HS256-signed JWT string from header JSON,
+    /// payload JSON, and a shared secret.
+    ///
+    /// Steps: base64url-no-pad each part, join with '.',
+    /// append HMAC-SHA256 signature (also base64url-no-pad).
+    fn make_hs256_jwt(
+        header: &serde_json::Value,
+        payload: &serde_json::Value,
+        secret: &[u8],
+    ) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(payload).unwrap());
+
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let sig = hmac_sha256(secret, signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(sig);
+
+        format!("{header_b64}.{payload_b64}.{sig_b64}")
+    }
+
+    /// Standard JWT header for HS256 tokens.
+    fn hs256_header() -> serde_json::Value {
+        serde_json::json!({"alg": "HS256", "typ": "JWT"})
+    }
+
+    /// All HS256 JWT tests share this secret.
+    const TEST_SECRET: &[u8] = b"shared-secret-for-mcp-oauth-tests";
+
+    // ── happy path ──────────────────────────────────────────────
+
+    #[test]
+    fn valid_hs256_token_passes_validation() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert!(result.is_ok(), "expected Ok but got {result:?}");
+        let claims = result.unwrap();
+        assert_eq!(claims.iss, "https://idp.test/");
+        assert_eq!(claims.aud, vec!["mcp://my-server"]);
+        assert_eq!(claims.exp, now + 3600);
+        assert_eq!(claims.sub, "user-42");
+        assert!(claims.nbf.is_none());
+    }
+
+    #[test]
+    fn token_with_nbf_passes_when_now_is_after_nbf() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "nbf": now - 60,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert!(result.is_ok(), "expected Ok but got {result:?}");
+    }
+
+    // ── signature checks ────────────────────────────────────────
+
+    #[test]
+    fn tampered_signature_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        // Tamper the *decoded* signature bytes so base64url remains valid.
+        let second_dot = token.rfind('.').unwrap();
+        let sig_b64 = &token[second_dot + 1..];
+        let mut sig_bytes = URL_SAFE_NO_PAD.decode(sig_b64).unwrap();
+        if let Some(b) = sig_bytes.last_mut() {
+            *b ^= 0x01;
+        }
+        let tampered_sig_b64 = URL_SAFE_NO_PAD.encode(&sig_bytes);
+        let token = format!("{}.{tampered_sig_b64}", &token[..second_dot]);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidSignature);
+    }
+
+    #[test]
+    fn wrong_secret_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            b"wrong-secret",
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidSignature);
+    }
+
+    // ── temporal checks ─────────────────────────────────────────
+
+    #[test]
+    fn expired_token_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now - 1,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::Expired);
+    }
+
+    #[test]
+    fn not_yet_valid_token_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "nbf": now + 60,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::NotYetValid);
+    }
+
+    #[test]
+    fn token_valid_at_exact_exp_boundary() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        // At exactly `exp == now`, the token is still valid
+        // (exp is inclusive per our implementation: exp >= now).
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert!(result.is_ok(), "expected Ok but got {result:?}");
+    }
+
+    // ── audience checks ─────────────────────────────────────────
+
+    #[test]
+    fn audience_mismatch_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["other-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::AudienceMismatch);
+    }
+
+    #[test]
+    fn token_with_multiple_audiences_accepts_if_any_matches() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["other", "mcp://my-server", "third"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert!(result.is_ok(), "expected Ok but got {result:?}");
+    }
+
+    // ── issuer checks ───────────────────────────────────────────
+
+    #[test]
+    fn issuer_mismatch_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://evil.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::IssuerMismatch);
+    }
+
+    // ── format checks ───────────────────────────────────────────
+
+    #[test]
+    fn malformed_token_is_rejected() {
+        let result = validate_mcp_oauth_token(
+            "not-a-jwt",
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            1_700_000_000,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
+    }
+
+    #[test]
+    fn token_with_four_parts_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let mut token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        token.push_str(".extra");
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
+    }
+
+    #[test]
+    fn token_with_non_base64url_signature_is_rejected() {
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload).unwrap());
+        // Signature with invalid base64url chars.
+        let token = format!("{header_b64}.{payload_b64}.!!!not-valid!!!");
+
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert_eq!(result.unwrap_err(), McpAuthError::InvalidFormat);
+    }
+
+    // ── parse_jwt_unverified unit tests ─────────────────────────
+
+    #[test]
+    fn parse_jwt_unverified_extracts_all_three_parts() {
+        let header = hs256_header();
+        let payload = serde_json::json!({"sub": "test"});
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        let (h, p, sig) = parse_jwt_unverified(&token).unwrap();
+        assert_eq!(h["alg"], "HS256");
+        assert_eq!(p["sub"], "test");
+        assert!(!sig.is_empty(), "signature should not be empty");
+    }
+
+    // ── verify_jwt_hs256 unit tests ─────────────────────────────
+
+    #[test]
+    fn verify_jwt_hs256_detects_valid_signature() {
+        let header = hs256_header();
+        let payload = serde_json::json!({"sub": "test"});
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+
+        assert!(verify_jwt_hs256(&token, TEST_SECRET).unwrap());
+    }
+
+    #[test]
+    fn verify_jwt_hs256_detects_invalid_signature() {
+        let header = hs256_header();
+        let payload = serde_json::json!({"sub": "test"});
+
+        let header_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&header).unwrap());
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_string(&payload).unwrap());
+        let sig_b64 = URL_SAFE_NO_PAD.encode([0u8; 32]);
+        let token = format!("{header_b64}.{payload_b64}.{sig_b64}");
+
+        assert!(!verify_jwt_hs256(&token, TEST_SECRET).unwrap());
+    }
+
+    #[test]
+    fn verify_jwt_hs256_rejects_malformed_token() {
+        assert_eq!(
+            verify_jwt_hs256("not-a-jwt", TEST_SECRET).unwrap_err(),
+            McpAuthError::InvalidFormat
+        );
+    }
+
+    // ── audit: audience binding vs oauth tokens ─────────────────
+
+    #[test]
+    fn audience_binding_and_oauth_token_are_independent_pass() {
+        // Prove that the old static audience check and the new
+        // OAuth token validation are independent and can both Pass
+        // for a valid configuration.
+
+        // 1. Static audience binding (passing).
+        let target = Url::parse("https://api.example.com").unwrap();
+        let static_check = validate_audience_binding("test_tool", &target, &["api.example.com"]);
+        assert_eq!(static_check.status, DiagnosticStatus::Pass);
+
+        // 2. OAuth token validation (independent, also passing).
+        let now: i64 = 1_700_000_000;
+        let header = hs256_header();
+        let payload = serde_json::json!({
+            "iss": "https://idp.test/",
+            "aud": ["mcp://my-server"],
+            "exp": now + 3600,
+            "sub": "user-42"
+        });
+        let token = make_hs256_jwt(&header, &payload, TEST_SECRET);
+        let result = validate_mcp_oauth_token(
+            &token,
+            TEST_SECRET,
+            "https://idp.test/",
+            &["mcp://my-server"],
+            now,
+        );
+        assert!(result.is_ok(), "oauth token validation failed: {result:?}");
     }
 }

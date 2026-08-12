@@ -1061,10 +1061,13 @@ name = "gobrowse-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "criterion",
  "futures-util",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
  "thiserror 2.0.20",
  "time",
  "tokio",
