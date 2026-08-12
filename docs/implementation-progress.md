@@ -57,11 +57,13 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - `audit_events` is append-only, so tests rely on FK cascades; no `DELETE` of audit rows.
 
 ## Remaining gates (genuinely NOT provable in this environment despite maximal simulation)
-- **Real Podman-specific userns** (`--userns=keep-id` rootless): the docker shim strips it; only real Podman can prove the rootless UID mapping. Sandbox HARDENING is proven via docker; the Podman-specific USERNS CLAIM is not.
-- **MCP OAuth matrix / real-server conformance / JWKS token validation** — needs real OIDC IdPs (mcp.rs banner).
+- **Real Podman-specific userns** (`--userns=keep-id` rootless): the docker shim strips it; only real Podman can prove the rootless UID mapping (and rootless setup requires persistent `/etc/subuid`+`/etc/subgid` config, which the no-permanent-changes constraint forbids). Sandbox HARDENING is proven via docker; the Podman-specific USERNS CLAIM is not.
+- **MCP OAuth matrix / real-server conformance / JWKS token validation** — needs real OIDC IdPs (mcp.rs banner); building a mock-IdP + JWKS client would be net-new product dressed as evidence, excluded as dishonest.
 - **OIDC/WebAuthn auth** — user-excluded; needs real providers.
 - **Browser/connectors/media adapter tests** — user-excluded; needs real browser/adapter runtimes.
-- **Compose cold-start smoke** — technically possible against the running docker daemon but costs ~10 min + a pgvector pull for marginal coverage beyond `doctor` + migration gates; intentionally deferred.
+
+## Compose cold-start smoke (proven ephemerally 2026-08-12)
+- `docker compose -p gobrowse-smoke up --build -d` with `GOBROWSE_PORT=8181` (isolated project name + port override) on the running docker daemon: the full Dockerfile (Trunk WASM release build + `cargo build --release -p gobrowse-server`) succeeded, both containers started, `/health/ready` returned `{"status":"ready","version":"0.1.0"}`, and `/api/v1/auth/me` returned `401` (unauthenticated API denial). The smoke project was then `down -v`'d (volume + networks removed); the pre-existing deployment on port 8080 was untouched throughout. The smoke image + build cache were pruned afterward (~7.5 GB reclaimed, disk returned to 21G free). This closes the "Config/health/migrations: Compose cold-start" gate row.
 
 ## Completed Milestone (auth/webhook/MCP subset)
 
