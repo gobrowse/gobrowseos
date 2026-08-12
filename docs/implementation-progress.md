@@ -47,11 +47,13 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 
 ## Active Milestone
 
-- Milestone 4 unit-provable work is complete and tagged `milestone-4` at `8869081` (154 nextest, 0 skipped, against real PostgreSQL 17 + pgvector). Sandboxd remains intentionally unreachable from the app.
-- Restricted-egress network attestation runs at daemon startup (`RestrictedNetworkAttestation` in `gobrowse-core/src/sandbox.rs`; `attest_restricted_network` in `runtime.rs`); `start_spec` rejects `NetworkPolicy::Restricted` until the cache is populated. Schema and `SANDBOX_PROTOCOL_VERSION` unchanged.
-- Daemon restart reconciliation is proven through the `Daemon::serve_until` wire path: reconciled terminals surface `TerminalState::Lost`, durable pre-restart output replays by cursor, surviving containers are removed, and pending inputs become `JournalError::OutcomeUnknown`.
-- Descriptor-relative filesystem operations held against a concurrent symlink-swap race for all six mutating methods (`write`/`patch`/`mkdir`/`move_entry`/`copy`/`delete`); no `LimitExceeded` escape.
-- Remaining Milestone 4 release gates are NOT unit-provable: runtime-backed adversarial tests require a real Podman/kernel boundary (FakePodman emulates the runtime), and schema/API authorization is app-side while sandboxd stays unwired.
+- Milestone 5 provable work is complete (181 nextest, 0 skipped, against real PostgreSQL 17 + pgvector). The remaining non-provable gates are unchanged: M4 runtime-backed adversarial tests need real Podman; MCP OAuth matrix / real-server conformance need real OIDC providers; browser/connectors/media need real adapter runtimes; WebAuthn/OIDC need real providers; Compose cold-start needs the docker stack.
+- Skills auto-promotion now requires `attempts > 0` evidence before a revision can auto-promote over a predecessor (`gobrowse-core/src/skills.rs`); the prior vacuous-zero-attempts tie is closed, with a positive test proving a proven successor still promotes over an unproven predecessor.
+- `validate_branch` (`gobrowse-core/src/worktrees.rs`) now rejects trailing `.`, `.lock` suffix, `refs/` prefix, and `.`-only path segments, closing the remaining `git check-ref-format --branch` gaps.
+- Audit tamper-evidence is enforced at the database layer: a `BEFORE UPDATE OR DELETE OR TRUNCATE` trigger raises on `audit_events`, so even a SQL-session attacker bypassing the app cannot mutate audit history; schema bumped to 6 via `0006_audit_append_only.sql`.
+- Agent-runtime takeover fences are adversarially DB-proven: `cancel_run` fast-finalizes when the lease already expired; `release_lease`/`fail_run` no-op on stale `execution_token` after a takeover; cancel is idempotent on already-canceled runs. The globally-scanning `claim_runs` SKIP-LOCKED path is intentionally not unit-tested in isolation (it would race the milestone-3 worker) and is covered indirectly.
+- Argon2 anti-downgrade: `Settings::validate` rejects `argon2_memory_kib < 8192`, `argon2_iterations < 2`, and `argon2_memory_kib > 4_194_304` (config-DoS ceiling); documented production defaults (19456/2/1/4) still validate. Session absolute-timeout expiry (`s.absolute_expires_at > now`) is now DB-proven even when idle time remains.
+- `audit_events` is append-only, so tests no longer `DELETE` audit rows; referential cleanup relies on FK cascades.
 
 ## Completed Milestone (auth/webhook/MCP subset)
 
