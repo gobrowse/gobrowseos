@@ -44,7 +44,7 @@ const OPAD: u8 = 0x5c;
 ///
 /// # Safety
 /// Pure safe Rust. No `unsafe` code.
-fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
     // Step 1-2: normalize key to exactly blocksize bytes
     let mut key_block = [0u8; SHA256_BLOCK_SIZE];
 
@@ -99,7 +99,7 @@ pub fn verify_signature_with_payload(secret: &[u8], payload: &[u8], signatures: 
 }
 
 /// Lowercase hex encoding for a byte slice.
-fn hex_encode(bytes: &[u8]) -> String {
+pub fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 

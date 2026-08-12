@@ -15,6 +15,7 @@ pub mod realtime;
 pub mod run_api;
 pub mod vault;
 pub mod vault_api;
+pub mod webhook_scheduler;
 pub mod webhooks;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};

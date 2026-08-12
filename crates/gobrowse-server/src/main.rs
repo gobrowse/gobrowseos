@@ -2,7 +2,9 @@ use std::{path::PathBuf, process::ExitCode};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use gobrowse_server::{AppState, config::Settings, db, doctor, embedding, router, run_api};
+use gobrowse_server::{
+    AppState, config::Settings, db, doctor, embedding, router, run_api, webhook_scheduler,
+};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
@@ -142,6 +144,14 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         state.clone(),
         cancellation.child_token(),
     ));
+    let webhook_scheduler_worker = if state.settings.features.webhook_scheduler_enabled {
+        Some(tokio::spawn(webhook_scheduler::run_worker(
+            state.clone(),
+            cancellation.child_token(),
+        )))
+    } else {
+        None
+    };
     let shutdown = cancellation.clone();
     let result = axum::serve(listener, router(state))
         .with_graceful_shutdown(async move {
@@ -162,6 +172,13 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         .is_err()
     {
         error!("run worker did not stop before the shutdown deadline");
+    }
+    if let Some(worker) = webhook_scheduler_worker
+        && tokio::time::timeout(Settings::shutdown_timeout(), worker)
+            .await
+            .is_err()
+    {
+        error!("webhook scheduler worker did not stop before the shutdown deadline");
     }
     result
 }

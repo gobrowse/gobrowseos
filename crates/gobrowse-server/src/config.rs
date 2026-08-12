@@ -116,7 +116,7 @@ impl Default for AuthSettings {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct FeatureSettings {
     pub sandbox: bool,
     pub browser: bool,
@@ -128,6 +128,32 @@ pub struct FeatureSettings {
     pub local_embeddings: bool,
     #[serde(default)]
     pub local_models: bool,
+    #[serde(default)]
+    pub webhook_scheduler_enabled: bool,
+    #[serde(default = "default_webhook_scheduler_max_attempts")]
+    pub webhook_scheduler_max_attempts: u32,
+}
+
+impl Default for FeatureSettings {
+    fn default() -> Self {
+        Self {
+            sandbox: false,
+            browser: false,
+            messaging: false,
+            voice: false,
+            media: false,
+            lsp: false,
+            otel: false,
+            local_embeddings: false,
+            local_models: false,
+            webhook_scheduler_enabled: false,
+            webhook_scheduler_max_attempts: default_webhook_scheduler_max_attempts(),
+        }
+    }
+}
+
+const fn default_webhook_scheduler_max_attempts() -> u32 {
+    5
 }
 
 #[derive(Debug, Clone, Deserialize)]
