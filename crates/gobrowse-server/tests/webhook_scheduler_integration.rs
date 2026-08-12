@@ -574,3 +574,200 @@ async fn signature_is_validated_over_canonical_payload_at_enqueue() {
     server.abort();
     cleanup(&pool, webhook_id, profile_id).await;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Test 6: crashed worker running row is reclaimed on restart
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn crashed_worker_running_row_is_reclaimed_on_restart() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+    let delivery_id = format!("crash-reclaim-{}", Uuid::now_v7());
+
+    // Insert a delivery row that looks like a crashed worker left it 'running'
+    // with an expired lease and attempts=1 (within max_attempts).
+    sqlx::query(
+        "INSERT INTO webhook_deliveries \
+         (webhook_id, delivery_id, status, attempts, next_attempt_at, target_url, \
+          secret_key, lease_expires_at) \
+         VALUES ($1,$2,'running',1,NULL,$3,$4,now() - interval '1 minute')",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .bind("http://127.0.0.1:1/deliver")
+    .bind(&secret)
+    .execute(&pool)
+    .await
+    .expect("insert crashed running delivery");
+
+    // Verify it is 'running' before reaping.
+    let before: String = sqlx::query_scalar(
+        "SELECT status FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read before status");
+    assert_eq!(before, "running");
+
+    // Recover stuck deliveries — should re-queue (attempts=1 < max=5).
+    let reclaimed = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
+        .await
+        .expect("recover_stuck_deliveries");
+    assert!(reclaimed > 0, "reaper must reclaim the stuck row");
+
+    // Verify it is now 'queued' with lease cleared.
+    let row = sqlx::query(
+        "SELECT status, lease_expires_at FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read after reaper");
+    let status: String = row.get("status");
+    let lease: Option<time::OffsetDateTime> = row.get("lease_expires_at");
+    assert_eq!(status, "queued", "reaper should re-queue the stuck row");
+    assert!(lease.is_none(), "reaper must clear the lease");
+
+    // Now claim_deliveries should pick it up.
+    let owner = format!("test-{}", Uuid::now_v7());
+    let claimed_all = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("claim after reaper");
+    let claimed = claimed_all
+        .iter()
+        .find(|c| c.delivery_id == delivery_id)
+        .expect("must claim re-queued delivery");
+
+    // Attempts should be 2 (was 1, claim increments).
+    assert_eq!(claimed.attempts, 2, "claim increments attempts to 2");
+
+    // Verify the row is 'running' with a fresh future lease.
+    let row2 = sqlx::query(
+        "SELECT status, attempts, lease_expires_at FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read after claim");
+    let status2: String = row2.get("status");
+    let attempts2: i32 = row2.get("attempts");
+    let lease2: time::OffsetDateTime = row2.get("lease_expires_at");
+
+    assert_eq!(status2, "running");
+    assert_eq!(attempts2, 2);
+    let now = time::OffsetDateTime::now_utc();
+    assert!(
+        lease2 > now,
+        "lease_expires_at must be in the future after re-claim"
+    );
+
+    // Running the reaper again must NOT re-claim this row (lease still valid).
+    let reclaimed2 = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
+        .await
+        .expect("second recover");
+    assert_eq!(
+        reclaimed2, 0,
+        "reaper must not touch delivery with a valid lease"
+    );
+
+    // Another claim must return zero rows for this webhook_id.
+    let claimed_again = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("second claim");
+    let mine_again: Vec<_> = claimed_again
+        .iter()
+        .filter(|c| c.webhook_id == webhook_id)
+        .collect();
+    assert!(
+        mine_again.is_empty(),
+        "second claim must not include the already-running row"
+    );
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 7: crashed worker running row dead-letters after max_attempts
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn crashed_worker_running_row_dead_letters_after_max_attempts() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+    let delivery_id = format!("crash-dead-{}", Uuid::now_v7());
+
+    // Insert a delivery that looks like a crashed worker: status='running',
+    // expired lease, attempts at max (5).
+    sqlx::query(
+        "INSERT INTO webhook_deliveries \
+         (webhook_id, delivery_id, status, attempts, next_attempt_at, target_url, \
+          secret_key, lease_expires_at) \
+         VALUES ($1,$2,'running',5,NULL,$3,$4,now() - interval '1 minute')",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .bind("http://127.0.0.1:1/deliver")
+    .bind(&secret)
+    .execute(&pool)
+    .await
+    .expect("insert dead-letter candidate");
+
+    // Recover stuck deliveries — must dead-letter because attempts >= max.
+    let reclaimed = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
+        .await
+        .expect("recover_stuck_deliveries");
+    assert!(reclaimed > 0, "reaper must dead-letter the exhausted row");
+
+    // Verify status is 'failed' (dead-lettered).
+    let row = sqlx::query(
+        "SELECT status, last_error, lease_expires_at, next_attempt_at \
+         FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read dead-lettered row");
+
+    let status: String = row.get("status");
+    let last_error: String = row.get("last_error");
+    let lease: Option<time::OffsetDateTime> = row.get("lease_expires_at");
+    let next: Option<time::OffsetDateTime> = row.get("next_attempt_at");
+
+    assert_eq!(status, "failed", "max_attempts exceeded → status='failed'");
+    assert_eq!(last_error, "lease expired", "last_error set by reaper");
+    assert!(lease.is_none(), "lease cleared by reaper");
+    assert!(next.is_none(), "next_attempt_at cleared by reaper");
+
+    // Verify the row is NOT picked up by claim_deliveries (it's 'failed').
+    let owner = format!("test-{}", Uuid::now_v7());
+    let claimed_all = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("claim after dead-letter");
+    let mine: Vec<_> = claimed_all
+        .iter()
+        .filter(|c| c.webhook_id == webhook_id)
+        .collect();
+    assert!(mine.is_empty(), "dead-lettered row must not be re-claimed");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}

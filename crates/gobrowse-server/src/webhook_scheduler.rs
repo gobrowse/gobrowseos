@@ -31,6 +31,10 @@ const DELIVERY_TIMEOUT_SECS: u64 = 5;
 /// Maximum backoff interval in seconds (cap).
 const MAX_BACKOFF_SECS: f64 = 60.0;
 
+/// Worker lease duration in seconds. A running delivery whose lease expires
+/// is considered crashed and is reclaimed by the reaper.
+pub const LEASE_SECONDS: i64 = 120;
+
 /// A delivery row claimed for outbound processing.
 #[derive(Debug)]
 pub struct ClaimedDelivery {
@@ -78,6 +82,10 @@ pub async fn run_worker(state: AppState, shutdown: CancellationToken) {
                 }
             }
             _ = scan.tick(), if tasks.len() < MAX_CONCURRENT => {
+                // Reap stuck deliveries before claiming new work.
+                if let Err(error) = recover_stuck_deliveries(&state.pool, max_attempts).await {
+                    error!(error=%error, "webhook stuck-delivery reaper failed");
+                }
                 let limit = (MAX_CONCURRENT - tasks.len()) as i64;
                 match claim_deliveries(&state.pool, &owner, limit).await {
                     Ok(claimed) => {
@@ -127,12 +135,14 @@ pub async fn claim_deliveries(
          LIMIT $1 \
          FOR UPDATE SKIP LOCKED) \
          UPDATE webhook_deliveries d \
-         SET status='running', attempts=d.attempts+1, next_attempt_at=NULL \
+         SET status='running', attempts=d.attempts+1, next_attempt_at=NULL, \
+             lease_expires_at=clock_timestamp() + make_interval(secs => $2) \
          FROM candidates c \
          WHERE d.webhook_id=c.webhook_id AND d.delivery_id=c.delivery_id \
          RETURNING d.webhook_id, d.delivery_id, d.target_url, d.secret_key, d.attempts",
     )
     .bind(limit)
+    .bind(LEASE_SECONDS as f64)
     .fetch_all(pool)
     .await?;
 
@@ -146,6 +156,46 @@ pub async fn claim_deliveries(
             attempts: row.get("attempts"),
         })
         .collect())
+}
+
+/// Reclaim deliveries whose worker lease has expired (crashed worker).
+///
+/// Mirrors `embedding::reclaim_expired`:
+/// - Dead-letter deliveries that have exhausted `max_attempts`.
+/// - Re-queue deliveries that still have attempts remaining.
+///
+/// Returns the total number of rows reclaimed (dead-lettered + re-queued).
+pub async fn recover_stuck_deliveries(
+    pool: &PgPool,
+    max_attempts: u32,
+) -> Result<u64, sqlx::Error> {
+    // Dead-letter: max attempts reached, transition to 'failed'.
+    let dead = sqlx::query(
+        "UPDATE webhook_deliveries \
+         SET status='failed', lease_expires_at=NULL, \
+             last_error='lease expired', last_response_code=NULL, next_attempt_at=NULL \
+         WHERE status='running' \
+           AND lease_expires_at < now() \
+           AND attempts >= $1",
+    )
+    .bind(max_attempts as i32)
+    .execute(pool)
+    .await?;
+
+    // Re-queue: still within max_attempts, make immediately claimable.
+    // No backoff — this is crash recovery, not a delivery failure.
+    let requeue = sqlx::query(
+        "UPDATE webhook_deliveries \
+         SET status='queued', lease_expires_at=NULL, next_attempt_at=clock_timestamp() \
+         WHERE status='running' \
+           AND lease_expires_at < now() \
+           AND attempts < $1",
+    )
+    .bind(max_attempts as i32)
+    .execute(pool)
+    .await?;
+
+    Ok(dead.rows_affected() + requeue.rows_affected())
 }
 
 /// POST the canonical outbound payload to the target URL with HMAC signature.
@@ -217,7 +267,8 @@ pub async fn persist_outcome(
     if outcome.success {
         let result = sqlx::query(
             "UPDATE webhook_deliveries \
-             SET status='succeeded', last_response_code=$1, next_attempt_at=NULL \
+             SET status='succeeded', last_response_code=$1, next_attempt_at=NULL, \
+                 lease_expires_at=NULL \
              WHERE webhook_id=$2 AND delivery_id=$3",
         )
         .bind(outcome.response_code.map(|c| c as i32))
@@ -232,7 +283,8 @@ pub async fn persist_outcome(
     } else if !outcome.retryable {
         let result = sqlx::query(
             "UPDATE webhook_deliveries \
-             SET status='failed', last_response_code=$1, last_error=$2, next_attempt_at=NULL \
+             SET status='failed', last_response_code=$1, last_error=$2, next_attempt_at=NULL, \
+                 lease_expires_at=NULL \
              WHERE webhook_id=$3 AND delivery_id=$4",
         )
         .bind(outcome.response_code.map(|c| c as i32))
@@ -264,7 +316,8 @@ pub async fn persist_outcome(
         let result = sqlx::query(
             "UPDATE webhook_deliveries \
              SET status=$1, last_response_code=$2, last_error=$3, \
-                 next_attempt_at=COALESCE($4, next_attempt_at) \
+                 next_attempt_at=COALESCE($4, next_attempt_at), \
+                 lease_expires_at=NULL \
              WHERE webhook_id=$5 AND delivery_id=$6",
         )
         .bind(new_status)
