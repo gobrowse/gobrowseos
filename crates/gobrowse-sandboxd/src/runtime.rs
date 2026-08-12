@@ -3685,8 +3685,8 @@ esac
     // volumes, PTY journal, and the full PodmanRuntime machinery) and
     // instead shell out to the shim directly. The shim translates
     // `start_spec`-equivalent argv, stripping docker-unsupported flags:
-    //   --userns=keep-id  → dropped (docker has no equivalent; rootless
-    //                        is handled at the daemon level)
+    //   --userns=keep-id  → translated to --user=1000:1000 (non-root
+    //                        security-equivalent mapping for docker)
     //   --pid=private     → dropped (docker defaults to private PID ns)
     //   --uts=private     → dropped (docker defaults to private UTS ns)
     //   --image-volume=ignore → dropped (docker has no --image-volume)
@@ -3719,7 +3719,8 @@ tmp=$(mktemp)\n\
 trap 'rm -f \"$tmp\"' EXIT\n\
 for arg do\n\
     case \"$arg\" in\n\
-        --userns=keep-id|--pid=private|--uts=private|--image-volume=ignore|--http-proxy=false) ;;\n\
+        --userns=keep-id) printf '%s\\0' --user=1000:1000 >> \"$tmp\" ;;\n\
+        --pid=private|--uts=private|--image-volume=ignore|--http-proxy=false) ;;\n\
         *) printf '%s\\0' \"$arg\" >> \"$tmp\" ;;\n\
     esac\n\
 done\n\
@@ -3776,6 +3777,7 @@ exec xargs -0 -a \"$tmp\" /usr/bin/docker\n";
         cmd.args([
             "run",
             "--rm",
+            "--userns=keep-id",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
@@ -3945,6 +3947,42 @@ exec xargs -0 -a \"$tmp\" /usr/bin/docker\n";
         assert!(
             stdout.contains("PUB_UNREACHABLE"),
             "public IP (1.1.1.1) should be unreachable with --network=none. stdout={stdout}"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
+    async fn docker_backed_container_runs_as_non_root_uid() {
+        // Proves the sandboxed process is non-root (the keep-id security
+        // goal); does NOT prove the rootless UID-mapping mechanism itself,
+        // which requires real Podman + /etc/subuid.
+        require_docker_boundary();
+        let shim = DockerShim::new();
+        DockerShim::ensure_alpine_image();
+
+        let output = docker_run(&shim, "id -u; id -g").output().await.unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "id command failed: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly 2 lines (uid, gid), got: {stdout:?}"
+        );
+        let uid: u32 = lines[0].trim().parse().expect("uid line not a number");
+        let gid: u32 = lines[1].trim().parse().expect("gid line not a number");
+        assert_eq!(
+            uid, 1000,
+            "container must run as non-root uid 1000, got {uid}"
+        );
+        assert_eq!(
+            gid, 1000,
+            "container must run as non-root gid 1000, got {gid}"
         );
     }
 }
