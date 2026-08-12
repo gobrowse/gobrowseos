@@ -29,7 +29,7 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 5);
+    assert_eq!(row.get::<i64, _>("schema_version"), 6);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
