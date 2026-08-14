@@ -2,6 +2,17 @@
 
 This file is the durable handoff record for work after the `milestone-1` tag at commit `c49d3a6`.
 
+## Current Continuation Checkpoint (2026-08-14)
+
+- **Active milestone:** production hardening of the Tasks/Activity Ledger and webhook scheduler; this is not a release completion claim.
+- **Completed in this checkpoint:** profile-scoped session rotation; MCP wire-version selection; fenced outbound-webhook delivery leases; workspace-scoped task CRUD/state transitions; durable activity replay; database-enforced task/agent/dependency tenancy; activity and repair-quarantine append-only triggers; restricted human-attributed activity notes.
+- **Migrations:** `0009_webhook_delivery_fencing.sql` through `0012_webhook_lease_check.sql`; expected schema version is now **12**. The remote private deployment remains at schema version **3** and has not received these changes.
+- **Validation:** `cargo fmt --all -- --check` and `CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --all-features -- -D warnings` pass locally. `cargo-nextest` is unavailable locally, and database-backed integration tests therefore remain pending CI/throwaway PostgreSQL execution. No release or deployment claim is made from mock/compile-only coverage.
+- **Security/reliability review:** fixed cross-profile ADMIN/OWNER session rotation, stale webhook outcome writes, task/activity cross-workspace links, immutable-ledger forgery via public lifecycle events, activity cursor commit ordering, migration self-parent upgrade safety, and malformed non-running webhook leases. Full live-PostgreSQL validation remains required.
+- **Remote storage checkpoint:** Docker `data-root` was safely migrated to `/mnt/volume_1786741375931/gobrowse/docker-data`; a SHA-256-verified pre-migration PostgreSQL dump is on the same persistent volume. The prior `/var/lib/docker` copy is retained for rollback. App health, PostgreSQL schema 3, `gobrowse doctor`, and `gobrowse security audit` were verified afterward. Expected vault/TLS configuration warnings remain. `/opt/gobrowse-os` is a deployment source snapshot without `.git`, so remote Git commit verification/deployment is pending a Git-backed checkout on the persistent volume.
+- **Active worktrees:** integration `agent/orchestrator-mcp`; specialist branches under `/home/mateo/Downloads/gobrowseos-worktrees/` are retained as review evidence. Coding worktrees used isolated branches.
+- **Next task:** run the complete CI matrix with real PostgreSQL, then implement the next reviewed release blocker (Skills revision/promotion API and database integrity) without enabling sandboxd or untrusted MCP execution.
+
 ## Release State
 
 - Milestone 1 and Milestone 2 remain tagged and their backups are retained. Milestone 3 implementation commit `7ee7ff6` is deployed privately and verified.
