@@ -283,3 +283,110 @@ fn print_checks(checks: &[doctor::Check], json: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gobrowse_server::config::{
+        AuthSettings, DatabaseSettings, FeatureSettings, HttpSettings, ObservabilitySettings,
+        Settings, VaultSettings,
+    };
+    use secrecy::SecretString;
+
+    fn base_test_settings() -> Settings {
+        Settings {
+            http: HttpSettings {
+                public_origin: url::Url::parse("http://localhost:8080").expect("valid URL"),
+                secure_cookies: false,
+                ..Default::default()
+            },
+            database: DatabaseSettings {
+                url: SecretString::from("postgres://test/placeholder"),
+                max_connections: 2,
+            },
+            auth: AuthSettings::default(),
+            vault: VaultSettings::default(),
+            features: FeatureSettings::default(),
+            observability: ObservabilitySettings::default(),
+        }
+    }
+
+    #[test]
+    fn security_checks_passes_for_https_origin_with_secure_cookies() {
+        let mut settings = base_test_settings();
+        settings.http.public_origin =
+            url::Url::parse("https://gobrowse.example.com").expect("valid URL");
+        settings.http.secure_cookies = true;
+        let checks = security_checks(&settings);
+        let cookie_check = checks
+            .iter()
+            .find(|c| c.name == "Secure cookies")
+            .expect("Secure cookies check exists");
+        assert!(
+            matches!(cookie_check.status, doctor::Status::Pass),
+            "expected Pass for HTTPS+secure_cookies, got {:?}",
+            cookie_check.status
+        );
+    }
+
+    #[test]
+    fn security_checks_fails_for_plain_http_non_localhost_production_origin() {
+        let mut settings = base_test_settings();
+        settings.http.public_origin =
+            url::Url::parse("http://gobrowse.example.com").expect("valid URL");
+        settings.http.secure_cookies = false;
+        let checks = security_checks(&settings);
+        let cookie_check = checks
+            .iter()
+            .find(|c| c.name == "Secure cookies")
+            .expect("Secure cookies check exists");
+        assert!(
+            matches!(cookie_check.status, doctor::Status::Fail),
+            "expected Fail for non-localhost HTTP, got {:?}",
+            cookie_check.status
+        );
+    }
+
+    #[test]
+    fn security_checks_warns_for_localhost_http_dev_origin() {
+        let settings = base_test_settings(); // default: http://localhost:8080
+        let checks = security_checks(&settings);
+        let cookie_check = checks
+            .iter()
+            .find(|c| c.name == "Secure cookies")
+            .expect("Secure cookies check exists");
+        assert!(
+            matches!(cookie_check.status, doctor::Status::Warn),
+            "expected Warn for localhost HTTP, got {:?}",
+            cookie_check.status
+        );
+    }
+
+    #[test]
+    fn security_checks_warns_when_vault_unconfigured_and_sandbox_enabled() {
+        let mut settings = base_test_settings();
+        settings.features.sandbox = true;
+        // No vault master key configured (default)
+        let checks = security_checks(&settings);
+
+        let vault_check = checks
+            .iter()
+            .find(|c| c.name == "Credential vault")
+            .expect("Credential vault check exists");
+        assert!(
+            matches!(vault_check.status, doctor::Status::Warn),
+            "expected Warn for unconfigured vault, got {:?}",
+            vault_check.status
+        );
+
+        let sandbox_check = checks
+            .iter()
+            .find(|c| c.name == "Sandbox boundary")
+            .expect("Sandbox boundary check exists");
+        assert!(
+            matches!(sandbox_check.status, doctor::Status::Warn),
+            "expected Warn for sandbox enabled, got {:?}",
+            sandbox_check.status
+        );
+    }
+}

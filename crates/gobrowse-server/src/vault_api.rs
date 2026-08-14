@@ -291,3 +291,53 @@ fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, AppError> {
     }
     Ok(hosts)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_hosts_lowercases_trims_dedups_and_strips_trailing_dots() {
+        let result = normalize_hosts(vec![
+            "  Example.COM.".into(),
+            "example.com".into(),
+            "host".into(),
+        ])
+        .expect("normalize should succeed for valid hosts");
+        assert_eq!(result, vec!["example.com", "host"]);
+    }
+
+    #[test]
+    fn normalize_hosts_rejects_invalid_chars_excessive_count_and_length() {
+        // Host with invalid character (colon from http://)
+        let result = normalize_hosts(vec!["http://evil.com".into()]);
+        assert!(
+            result.is_err(),
+            "hosts with http:// prefix should be rejected"
+        );
+
+        // Host with invalid character (slash)
+        let result = normalize_hosts(vec!["evil.com/path".into()]);
+        assert!(
+            result.is_err(),
+            "hosts with path separators should be rejected"
+        );
+
+        // Host with space
+        let result = normalize_hosts(vec!["evil host.com".into()]);
+        assert!(result.is_err(), "hosts with spaces should be rejected");
+
+        // 21 distinct hosts (exceeds 20 limit)
+        let too_many: Vec<String> = (0..21).map(|i| format!("host{i}.example.com")).collect();
+        let result = normalize_hosts(too_many);
+        assert!(result.is_err(), "more than 20 hosts should be rejected");
+
+        // Host exceeding 253 characters
+        let long_host = format!("{}.example.com", "a".repeat(250)); // ~253+ chars
+        let result = normalize_hosts(vec![long_host]);
+        assert!(
+            result.is_err(),
+            "hosts longer than 253 characters should be rejected"
+        );
+    }
+}

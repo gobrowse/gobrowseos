@@ -331,3 +331,63 @@ fn require_admin(user: &AuthenticatedUser) -> Result<(), AppError> {
         Err(AppError::Forbidden)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_config() -> CreateConfigurationRequest {
+        CreateConfigurationRequest {
+            display_name: "Test Embedding".into(),
+            provider_type: "openai_compatible".into(),
+            base_url: Url::parse("https://api.example.com/v1").expect("valid URL"),
+            secret_reference: None,
+            model_reference: "text-embedding-test".into(),
+            dimensions: 1536,
+            activate: false,
+        }
+    }
+
+    #[test]
+    fn validate_configuration_rejects_dimensions_out_of_range_and_bad_provider_type() {
+        // dimensions = 0 (below 1..=16000 range)
+        let mut config = base_config();
+        config.dimensions = 0;
+        assert!(
+            validate_configuration(&config).is_err(),
+            "dimensions=0 should be rejected"
+        );
+
+        // dimensions = 16_001 (above 1..=16000 range)
+        let mut config = base_config();
+        config.dimensions = 16_001;
+        assert!(
+            validate_configuration(&config).is_err(),
+            "dimensions=16001 should be rejected"
+        );
+
+        // dimensions = 16_000 (valid boundary)
+        let mut config = base_config();
+        config.dimensions = 16_000;
+        assert!(
+            validate_configuration(&config).is_ok(),
+            "dimensions=16000 should be accepted"
+        );
+
+        // dimensions = 1 (valid boundary)
+        let mut config = base_config();
+        config.dimensions = 1;
+        assert!(
+            validate_configuration(&config).is_ok(),
+            "dimensions=1 should be accepted"
+        );
+
+        // bad provider_type
+        let mut config = base_config();
+        config.provider_type = "anthropic".into();
+        assert!(
+            validate_configuration(&config).is_err(),
+            "non-ollama/openai provider_type should be rejected"
+        );
+    }
+}

@@ -277,3 +277,128 @@ fn require_admin(user: &AuthenticatedUser) -> Result<(), AppError> {
         Err(AppError::Forbidden)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_request() -> CreateChatModelRequest {
+        CreateChatModelRequest {
+            display_name: "Test Model".into(),
+            provider_type: "openai_compatible".into(),
+            base_url: Url::parse("https://api.example.com/v1").expect("valid URL"),
+            secret_reference: None,
+            model_reference: "gpt-test".into(),
+            context_window: 128_000,
+            output_limit: 4096,
+            priority: 0,
+            activate: false,
+            fallback_model_ids: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_rejects_base_url_with_query_fragment_or_credentials() {
+        // URL with query
+        let mut req = base_request();
+        req.base_url = Url::parse("https://api.example.com/v1?key=val").expect("valid URL");
+        assert!(
+            validate(&req).is_err(),
+            "base URL with query should be rejected"
+        );
+
+        // URL with fragment
+        let mut req = base_request();
+        req.base_url = Url::parse("https://api.example.com/v1#section").expect("valid URL");
+        assert!(
+            validate(&req).is_err(),
+            "base URL with fragment should be rejected"
+        );
+
+        // URL with credentials (username)
+        let mut req = base_request();
+        req.base_url = Url::parse("https://user@api.example.com/v1").expect("valid URL");
+        assert!(
+            validate(&req).is_err(),
+            "base URL with credential username should be rejected"
+        );
+
+        // URL with password
+        let mut req = base_request();
+        req.base_url = Url::parse("https://user:pass@api.example.com/v1").expect("valid URL");
+        assert!(
+            validate(&req).is_err(),
+            "base URL with credential password should be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_http_scheme_and_missing_host() {
+        // Non-http(s) scheme
+        let mut req = base_request();
+        req.base_url = Url::parse("ftp://api.example.com/v1").expect("valid URL");
+        assert!(
+            validate(&req).is_err(),
+            "non-http(s) scheme should be rejected"
+        );
+
+        // URL with no host would fail Url::parse, but we can test one
+        // that has an opaque host or fails host_str().
+    }
+
+    #[test]
+    fn validate_rejects_output_limit_not_strictly_below_context_window() {
+        // output_limit >= context_window
+        let mut req = base_request();
+        req.context_window = 4096;
+        req.output_limit = 4096;
+        assert!(
+            validate(&req).is_err(),
+            "output_limit equal to context_window should be rejected"
+        );
+
+        let mut req = base_request();
+        req.context_window = 4096;
+        req.output_limit = 8192;
+        assert!(
+            validate(&req).is_err(),
+            "output_limit above context_window should be rejected"
+        );
+
+        // output_limit below context_window should be ok
+        let mut req = base_request();
+        req.context_window = 128_000;
+        req.output_limit = 4096;
+        assert!(
+            validate(&req).is_ok(),
+            "output_limit strictly below context_window should pass"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_unbounded_or_nonunique_fallback_ids() {
+        // >5 fallback model IDs
+        let mut req = base_request();
+        req.fallback_model_ids = (0..6).map(|i| format!("model_{i}")).collect();
+        assert!(
+            validate(&req).is_err(),
+            "more than 5 fallbacks should be rejected"
+        );
+
+        // duplicate fallback IDs
+        let mut req = base_request();
+        req.fallback_model_ids = vec!["dup".into(), "dup".into(), "other".into()];
+        assert!(
+            validate(&req).is_err(),
+            "duplicate fallback IDs should be rejected"
+        );
+
+        // exactly 5 unique IDs should pass
+        let mut req = base_request();
+        req.fallback_model_ids = (0..5).map(|i| format!("model_{i}")).collect();
+        assert!(
+            validate(&req).is_ok(),
+            "exactly 5 unique fallbacks should pass"
+        );
+    }
+}

@@ -122,10 +122,9 @@ mod tests {
 
     #[tokio::test]
     async fn database_error_returns_500_with_masked_message() {
-        let db_err =
-            AppError::Database(sqlx::Error::Configuration(Box::new(std::io::Error::other(
-                "config error",
-            ))));
+        let db_err = AppError::Database(sqlx::Error::Configuration(Box::new(
+            std::io::Error::other("config error"),
+        )));
         let (status, api_error) = extract(db_err.into_response()).await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(api_error.code, "internal");

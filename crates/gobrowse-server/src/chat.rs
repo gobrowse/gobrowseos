@@ -469,4 +469,90 @@ mod tests {
             [Ok(ModelEvent::Usage { .. }), Ok(ModelEvent::Completed)]
         ));
     }
+
+    #[tokio::test]
+    async fn oversized_event_aborts_after_four_megabyte_cap() {
+        // Two 3 MiB chunks: first is under the 4 MiB cumulative cap,
+        // second pushes received_bytes over cap → InvalidResponse.
+        let chunk_a = Bytes::from(vec![b'A'; 3 * 1024 * 1024]);
+        let chunk_b = Bytes::from(vec![b'B'; 3 * 1024 * 1024]);
+        let state = ProviderStreamState {
+            stream: Box::pin(stream::iter([Ok(chunk_a), Ok(chunk_b)])),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "openai_compatible".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        let results = stream::unfold(state, next_provider_event)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(ProviderError::InvalidResponse)));
+    }
+
+    #[tokio::test]
+    async fn malformed_json_line_returns_invalid_response() {
+        let state = ProviderStreamState {
+            stream: Box::pin(stream::iter([Ok(Bytes::from_static(
+                b"data: {not-json}\n\n",
+            ))])),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "openai_compatible".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        let results = stream::unfold(state, next_provider_event)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(ProviderError::InvalidResponse)));
+    }
+
+    #[tokio::test]
+    async fn openai_done_sentinel_emits_completed_exactly_once() {
+        let state = ProviderStreamState {
+            stream: Box::pin(stream::iter([Ok(Bytes::from_static(b"data: [DONE]\n\n"))])),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "openai_compatible".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        let results = stream::unfold(state, next_provider_event)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            results.len(),
+            1,
+            "expected exactly one Completed event, got {results:?}"
+        );
+        assert!(matches!(results[0], Ok(ModelEvent::Completed)));
+    }
+
+    #[tokio::test]
+    async fn midstream_disconnect_with_pending_sse_drains_or_errors() {
+        // Stream delivers a partial SSE data line (no terminating newline)
+        // then ends.  The pending incomplete JSON must trigger an error.
+        let state = ProviderStreamState {
+            stream: Box::pin(stream::iter([Ok(Bytes::from_static(
+                br#"data: {"choices":[{"delta":{"content":"partial"#,
+            ))])),
+            buffer: vec![],
+            pending: VecDeque::new(),
+            provider_type: "openai_compatible".into(),
+            sse_data: String::new(),
+            received_bytes: 0,
+            completed: false,
+        };
+        let results = stream::unfold(state, next_provider_event)
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], Err(ProviderError::InvalidResponse)));
+    }
 }

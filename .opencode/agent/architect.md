@@ -1,7 +1,7 @@
 ---
 description: System architect for Edge OS platform design
 mode: subagent
-model: opencode-go/glm-5.2
+model: openai/gpt-5.6-sol
 permission:
   read: allow
   glob: allow

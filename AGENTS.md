@@ -41,3 +41,11 @@ Precedence: typed defaults → `config.toml` → `GOBROWSE__` env vars (e.g. `GO
 - Release gates tracked as tags `milestone-N`; `docs/roadmap.md` defines what each milestone must prove.
 - Root is `repository = "https://github.com/gobrowse-os/gobrowse-os"` in Cargo.toml, but the repo lives at a different URL — do not change code to match.
 - `deny.toml` explicitly ignores two advisories (RUSTSEC-2024-0436, RUSTSEC-2026-0173) via Leptos; do not "fix" them by bumping pinned deps without checking the ignore rationale.
+
+## Pi Agent Resource and Plan Rules
+
+- Keep this Pi setup and any agent-added runtime within a strict 100 MB budget. Do not add local databases, Docker, browser engines, persistent daemons, or heavyweight packages. Prefer the existing tools and lazily started services.
+- Treat a user prompt beginning exactly with `[PLAN]` as **Read-Only Architecture Mode**.
+- In `[PLAN]` mode, do not call `bash` or `edit`, and do not call `write` except for one final write to the repository-root `PLAN.md`. Do not modify source code, tests, configuration, dependencies, or any other file.
+- In `[PLAN]` mode, inspect only with read-only tools as needed. Produce the complete architecture, dependency/impact analysis, implementation checklist, validation steps, and open questions in that one `PLAN.md` write.
+- Immediately stop after writing `PLAN.md`: make no further tool calls and emit no implementation or follow-up response.
