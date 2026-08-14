@@ -12,11 +12,89 @@ pub const CURRENT_PROTOCOL_VERSION: &str = "2026-07-28";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum McpProtocolEra {
+    #[serde(rename = "2026-07-28")]
     Modern20260728,
+    #[serde(rename = "2025-11-25")]
     Legacy20251125,
+    #[serde(rename = "2025-06-18")]
     Legacy20250618,
+    #[serde(rename = "2025-03-26")]
     Legacy20250326,
+    #[serde(rename = "2024-11-05")]
     Legacy20241105,
+}
+
+/// Protocol versions implemented by Gobrowse, in local preference order.
+pub const SUPPORTED_PROTOCOL_ERAS: [McpProtocolEra; 5] = [
+    McpProtocolEra::Modern20260728,
+    McpProtocolEra::Legacy20251125,
+    McpProtocolEra::Legacy20250618,
+    McpProtocolEra::Legacy20250326,
+    McpProtocolEra::Legacy20241105,
+];
+
+impl McpProtocolEra {
+    /// Return the exact date-based version identifier used on the wire.
+    pub const fn wire_version(self) -> &'static str {
+        match self {
+            Self::Modern20260728 => CURRENT_PROTOCOL_VERSION,
+            Self::Legacy20251125 => "2025-11-25",
+            Self::Legacy20250618 => "2025-06-18",
+            Self::Legacy20250326 => "2025-03-26",
+            Self::Legacy20241105 => "2024-11-05",
+        }
+    }
+
+    /// Map a wire version to its isolated protocol adapter.
+    pub fn from_wire_version(version: &str) -> Option<Self> {
+        SUPPORTED_PROTOCOL_ERAS
+            .into_iter()
+            .find(|era| era.wire_version() == version)
+    }
+
+    /// Whether this version uses stateless per-request metadata rather than
+    /// the legacy `initialize` handshake.
+    pub const fn is_modern(self) -> bool {
+        matches!(self, Self::Modern20260728)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum McpVersionSelectionError {
+    #[error("server did not advertise any MCP protocol versions")]
+    NoVersionsAdvertised,
+    #[error("server and client do not share a supported MCP protocol version")]
+    NoMutuallySupportedVersion,
+}
+
+/// Select the locally preferred protocol adapter advertised by a server.
+///
+/// This handles both `server/discover`'s `supportedVersions` and the
+/// `UnsupportedProtocolVersionError.data.supported` list. Unknown versions
+/// are ignored rather than interpreted as date strings: a version is usable
+/// only when Gobrowse has an explicit wire adapter for it. The caller must
+/// dispatch legacy selections through initialization rather than retrying a
+/// modern request with legacy wire semantics.
+///
+/// # Errors
+/// Returns [`McpVersionSelectionError::NoVersionsAdvertised`] for an empty
+/// server list, or [`McpVersionSelectionError::NoMutuallySupportedVersion`]
+/// when the list contains no version implemented by Gobrowse.
+pub fn select_protocol_version(
+    server_supported: &[impl AsRef<str>],
+) -> Result<McpProtocolEra, McpVersionSelectionError> {
+    if server_supported.is_empty() {
+        return Err(McpVersionSelectionError::NoVersionsAdvertised);
+    }
+
+    SUPPORTED_PROTOCOL_ERAS
+        .into_iter()
+        .find(|era| {
+            server_supported
+                .iter()
+                .any(|version| version.as_ref() == era.wire_version())
+        })
+        .ok_or(McpVersionSelectionError::NoMutuallySupportedVersion)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -672,6 +750,73 @@ mod tests {
             "description": "a test tool",
             "inputSchema": input_schema
         })
+    }
+
+    // ── protocol version selection tests ──────────────────────
+
+    #[test]
+    fn protocol_eras_map_to_exact_wire_versions() {
+        let cases = [
+            (McpProtocolEra::Modern20260728, "2026-07-28"),
+            (McpProtocolEra::Legacy20251125, "2025-11-25"),
+            (McpProtocolEra::Legacy20250618, "2025-06-18"),
+            (McpProtocolEra::Legacy20250326, "2025-03-26"),
+            (McpProtocolEra::Legacy20241105, "2024-11-05"),
+        ];
+
+        for (era, wire_version) in cases {
+            assert_eq!(era.wire_version(), wire_version);
+            assert_eq!(McpProtocolEra::from_wire_version(wire_version), Some(era));
+            assert_eq!(
+                serde_json::to_string(&era).unwrap(),
+                format!("\"{wire_version}\"")
+            );
+            assert_eq!(
+                serde_json::from_str::<McpProtocolEra>(&format!("\"{wire_version}\"")).unwrap(),
+                era
+            );
+        }
+
+        assert!(McpProtocolEra::Modern20260728.is_modern());
+        assert!(!McpProtocolEra::Legacy20251125.is_modern());
+        assert_eq!(McpProtocolEra::from_wire_version("2099-01-01"), None);
+    }
+
+    #[test]
+    fn protocol_selection_uses_local_preference_not_server_order() {
+        let server_supported = vec![
+            "2025-03-26".to_string(),
+            "2024-11-05".to_string(),
+            CURRENT_PROTOCOL_VERSION.to_string(),
+        ];
+
+        assert_eq!(
+            select_protocol_version(&server_supported).unwrap(),
+            McpProtocolEra::Modern20260728
+        );
+    }
+
+    #[test]
+    fn protocol_selection_can_dispatch_to_a_legacy_adapter() {
+        let server_supported = ["unknown-future-version", "2025-06-18", "2025-03-26"];
+
+        assert_eq!(
+            select_protocol_version(&server_supported).unwrap(),
+            McpProtocolEra::Legacy20250618
+        );
+    }
+
+    #[test]
+    fn protocol_selection_distinguishes_empty_and_incompatible_lists() {
+        let empty: [&str; 0] = [];
+        assert_eq!(
+            select_protocol_version(&empty).unwrap_err(),
+            McpVersionSelectionError::NoVersionsAdvertised
+        );
+        assert_eq!(
+            select_protocol_version(&["2099-01-01", "1.0"]).unwrap_err(),
+            McpVersionSelectionError::NoMutuallySupportedVersion
+        );
     }
 
     // ── validate_tool_schema tests ─────────────────────────────
