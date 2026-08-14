@@ -100,6 +100,18 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .expect("create skill");
     sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids,evaluation,promoted) VALUES ($1,$2,1,'content','tester','legacy',$3,$4,true)")
         .bind(revision_id).bind(skill_id).bind(vec![Uuid::nil()]).bind(serde_json::json!({"malformed": true})).execute(&mut connection).await.expect("insert legacy malformed revision");
+    let evaluation_cases = [
+        serde_json::json!({"deterministic_checks_passed":true,"attempts":0,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0}),
+        serde_json::json!({"deterministic_checks_passed":true,"attempts":0,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0,"user_corrections":0,"extra":true}),
+        serde_json::json!({"deterministic_checks_passed":"yes","attempts":0,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0,"user_corrections":0}),
+        serde_json::json!({"deterministic_checks_passed":true,"attempts":1000001,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0,"user_corrections":0}),
+    ];
+    let mut evaluation_ids = Vec::new();
+    for (index, value) in evaluation_cases.iter().enumerate() {
+        let id = Uuid::now_v7();
+        evaluation_ids.push((id, value.clone()));
+        sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,evaluation) VALUES ($1,$2,$3,'invalid-eval','tester','legacy',$4)").bind(id).bind(skill_id).bind((index+2) as i64).bind(value).execute(&mut connection).await.expect("insert malformed evaluation");
+    }
     let other_profile = Uuid::now_v7();
     let workspace = Uuid::now_v7();
     let other_workspace = Uuid::now_v7();
@@ -121,6 +133,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .await
         .expect("deleted source");
     let duplicate_skill = Uuid::now_v7();
+    let duplicate_revision = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'duplicate-source','')",
     )
@@ -129,14 +142,17 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     .execute(&mut connection)
     .await
     .expect("duplicate skill");
-    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(duplicate_skill).bind(vec![source,source]).execute(&mut connection).await.expect("duplicate source");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(duplicate_revision).bind(duplicate_skill).bind(vec![source,source]).execute(&mut connection).await.expect("duplicate source");
     let inaccessible_skill = Uuid::now_v7();
+    let inaccessible_revision = Uuid::now_v7();
     sqlx::query("INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'inaccessible-source','')").bind(inaccessible_skill).bind(profile_id).execute(&mut connection).await.expect("inaccessible skill");
-    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(inaccessible_skill).bind(vec![missing_source,cross_source]).execute(&mut connection).await.expect("inaccessible sources");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(inaccessible_revision).bind(inaccessible_skill).bind(vec![missing_source,cross_source]).execute(&mut connection).await.expect("inaccessible sources");
     let workspace_skill = Uuid::now_v7();
+    let workspace_revision = Uuid::now_v7();
     sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'workspace-source','')").bind(workspace_skill).bind(profile_id).bind(workspace).execute(&mut connection).await.expect("workspace skill");
-    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(workspace_skill).bind(vec![source,wrong_source,deleted_source]).execute(&mut connection).await.expect("workspace sources");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(workspace_revision).bind(workspace_skill).bind(vec![source,wrong_source,deleted_source]).execute(&mut connection).await.expect("workspace sources");
     let oversized_skill = Uuid::now_v7();
+    let oversized_revision = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'oversized-source','')",
     )
@@ -156,7 +172,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
             .expect("oversized conversation");
         oversized.push(id);
     }
-    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(oversized_skill).bind(&oversized).execute(&mut connection).await.expect("oversized sources");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(oversized_revision).bind(oversized_skill).bind(&oversized).execute(&mut connection).await.expect("oversized sources");
     let active_skill = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'active-canonical','')",
@@ -202,6 +218,17 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .await
         .expect("read schema version");
     assert_eq!(version, 15);
+    for (id, original) in &evaluation_ids {
+        let live: Option<serde_json::Value> =
+            sqlx::query_scalar("SELECT evaluation FROM skill_revisions WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut connection)
+                .await
+                .expect("cleared evaluation");
+        assert!(live.is_none());
+        let quarantined: serde_json::Value = sqlx::query_scalar("SELECT original_evaluation FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(id).fetch_one(&mut connection).await.expect("original evaluation");
+        assert_eq!(&quarantined, original);
+    }
     let (evaluation, sources): (Option<serde_json::Value>, Vec<Uuid>) = sqlx::query_as(
         "SELECT evaluation,source_conversation_ids FROM skill_revisions WHERE id=$1",
     )
@@ -220,9 +247,27 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     let workspace_sources: Vec<Uuid> = sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='workspace-source')")
         .fetch_one(&mut connection).await.expect("workspace repair");
     assert_eq!(workspace_sources, vec![source]);
-    let oversized_count: i64 = sqlx::query_scalar("SELECT cardinality(source_conversation_ids) FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='oversized-source')")
-        .fetch_one(&mut connection).await.expect("oversized repair");
-    assert_eq!(oversized_count, 100);
+    let (duplicate_original, duplicate_repaired): (Vec<Uuid>,Vec<Uuid>) = sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(duplicate_revision).fetch_one(&mut connection).await.expect("duplicate quarantine");
+    assert_eq!(duplicate_original, vec![source, source]);
+    assert_eq!(duplicate_repaired, vec![source]);
+    let (inaccessible_original, inaccessible_repaired): (Vec<Uuid>,Vec<Uuid>) = sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(inaccessible_revision).fetch_one(&mut connection).await.expect("inaccessible quarantine");
+    assert_eq!(inaccessible_original, vec![missing_source, cross_source]);
+    assert!(inaccessible_repaired.is_empty());
+    let (workspace_original, workspace_repaired): (Vec<Uuid>,Vec<Uuid>) = sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(workspace_revision).fetch_one(&mut connection).await.expect("workspace quarantine");
+    assert_eq!(
+        workspace_original,
+        vec![source, wrong_source, deleted_source]
+    );
+    assert_eq!(workspace_repaired, vec![source]);
+    let repaired_oversized: Vec<Uuid> =
+        sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE id=$1")
+            .bind(oversized_revision)
+            .fetch_one(&mut connection)
+            .await
+            .expect("oversized repair");
+    assert_eq!(repaired_oversized, oversized[..100].to_vec());
+    let oversized_original: Vec<Uuid> = sqlx::query_scalar("SELECT original_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(oversized_revision).fetch_one(&mut connection).await.expect("oversized original");
+    assert_eq!(oversized_original, oversized);
     let promoted_canonical: i64 = sqlx::query_scalar("SELECT revision FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='active-canonical') AND promoted")
         .fetch_one(&mut connection).await.expect("active repair");
     assert_eq!(promoted_canonical, 1);
@@ -253,6 +298,10 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     .await
     .expect("promotion quarantine count");
     assert!(promotion_repairs >= 3);
+    for promoted_skill in [skill_id, active_skill, none_skill] {
+        let record: i64 = sqlx::query_scalar("SELECT count(*) FROM skill_integrity_quarantine WHERE skill_id=$1 AND issue='promotion_state_mismatch'").bind(promoted_skill).fetch_one(&mut connection).await.expect("per-skill promotion quarantine");
+        assert_eq!(record, 1);
+    }
     let quarantine_id: i64 = sqlx::query_scalar(
         "SELECT id FROM skill_revision_integrity_quarantine WHERE revision_id=$1 LIMIT 1",
     )
@@ -267,6 +316,40 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
             .await
             .is_err()
     );
+    let skill_quarantine_id:i64=sqlx::query_scalar("INSERT INTO skill_integrity_quarantine (skill_id,profile_id,name,issue,detail) VALUES ($1,$2,'q','test','{}') RETURNING id").bind(skill_id).bind(profile_id).fetch_one(&mut connection).await.expect("insert skill quarantine");
+    assert!(
+        sqlx::query("UPDATE skill_integrity_quarantine SET issue='tampered' WHERE id=$1")
+            .bind(skill_quarantine_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM skill_integrity_quarantine WHERE id=$1")
+            .bind(skill_quarantine_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("TRUNCATE skill_integrity_quarantine")
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE skill_revision_integrity_quarantine SET issue='tampered' WHERE id=$1")
+            .bind(quarantine_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("TRUNCATE skill_revision_integrity_quarantine")
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
     let valid = serde_json::json!({"deterministic_checks_passed":true,"attempts":1,"successful_attempts":1,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0});
     sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
         .bind(&valid)
@@ -274,6 +357,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .execute(&mut connection)
         .await
         .expect("record first evaluation");
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,2,'bad','tester','bad',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(vec![Uuid::nil()]).execute(&mut connection).await.is_err());
     assert!(
         sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
             .bind(serde_json::json!({"tampered":true}))
@@ -900,6 +984,32 @@ async fn deployed_schema_v3_upgrades_to_v15() {
             .await
             .is_err()
     );
+    let other_profile = Uuid::now_v7();
+    let other_workspace = Uuid::now_v7();
+    let cross_source = Uuid::now_v7();
+    let wrong_source = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'v3-other-profile')")
+        .bind(other_profile)
+        .execute(&mut connection)
+        .await
+        .expect("other profile");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'v3 other workspace')")
+        .bind(other_workspace)
+        .bind(other_profile)
+        .execute(&mut connection)
+        .await
+        .expect("other workspace");
+    sqlx::query("INSERT INTO conversations (id,profile_id,title) VALUES ($1,$2,'cross source')")
+        .bind(cross_source)
+        .bind(other_profile)
+        .execute(&mut connection)
+        .await
+        .expect("cross source");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'wrong source')").bind(wrong_source).bind(profile_id).bind(other_workspace).execute(&mut connection).await.expect("wrong source");
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,2,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(vec![cross_source]).execute(&mut connection).await.is_err());
+    let workspace_skill = Uuid::now_v7();
+    sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'v3-scoped','')").bind(workspace_skill).bind(profile_id).bind(workspace_id).execute(&mut connection).await.expect("v3 scoped skill");
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(workspace_skill).bind(vec![wrong_source]).execute(&mut connection).await.is_err());
     assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,2,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(vec![Uuid::nil()]).execute(&mut connection).await.is_err());
     let mut divergence = connection.begin().await.expect("begin divergence");
     sqlx::query("UPDATE skill_revisions SET promoted=true WHERE id=$1")

@@ -1,5 +1,7 @@
 mod common;
 
+use std::sync::Arc;
+
 use axum::{
     Router,
     body::Body,
@@ -20,6 +22,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use time::{Duration, OffsetDateTime};
+use tokio::sync::Barrier;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -427,6 +430,18 @@ async fn insert_workspace(pool: &PgPool, profile_id: Uuid, owner_id: Uuid) -> Uu
     workspace_id
 }
 
+async fn wait_for_lock_waiters(pool: &PgPool, query_prefix: &str, minimum: i64) {
+    let pattern = format!("{query_prefix}%");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type='Lock' AND query LIKE $1 AND pid <> pg_backend_pid()")
+                .bind(&pattern).fetch_one(pool).await.expect("lock waiter query");
+            if count >= minimum { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.expect("lock waiter timeout");
+}
+
 async fn skill_side_effect_counts(pool: &PgPool, skill_id: Uuid) -> (i64, i64, i64) {
     let revisions: i64 =
         sqlx::query_scalar("SELECT count(*) FROM skill_revisions WHERE skill_id=$1")
@@ -575,6 +590,73 @@ async fn workspace_skill_roles_and_tenants_are_enforced() {
 }
 
 #[tokio::test]
+async fn workspace_member_with_viewer_access_receives_forbidden_on_mutation() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "visible-viewer-member").await;
+    let (owner, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    sqlx::query(
+        "INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'VIEWER')",
+    )
+    .bind(workspace)
+    .bind(member)
+    .execute(&pool)
+    .await
+    .expect("viewer membership");
+    let (skill_id, _) = insert_skill_fixture(
+        &pool,
+        profile_id,
+        Some(workspace),
+        "visible-viewer",
+        "manual",
+    )
+    .await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let (status, _) = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/skills/{skill_id}/history"),
+        &member_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let before = skill_side_effect_counts(&pool, skill_id).await;
+    for (path, body) in [
+        (
+            format!("/api/v1/skills/{skill_id}/revisions"),
+            json!({"content":"x","reason":"x","source_conversation_ids":[]}),
+        ),
+        (
+            format!("/api/v1/skills/{skill_id}/revisions/1/evaluate"),
+            json!({"evaluation":valid_evaluation(1)}),
+        ),
+        (
+            format!("/api/v1/skills/{skill_id}/revisions/1/promote"),
+            json!({"reason":"x"}),
+        ),
+        (
+            format!("/api/v1/skills/{skill_id}/rollback"),
+            json!({"target_revision":1,"reason":"x"}),
+        ),
+    ] {
+        let (status, _) = request_json(&app, Method::POST, &path, &member_cookie, Some(body)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+}
+
+#[tokio::test]
 async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
@@ -595,6 +677,11 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
         "manual",
     )
     .await;
+    let foreign_profile = profile(&pool, "nonmember-foreign").await;
+    let (_foreign_owner, foreign_cookie) = create_session(&pool, foreign_profile, "OWNER").await;
+    let (foreign_skill, _) =
+        insert_skill_fixture(&pool, foreign_profile, None, "foreign-skill", "manual").await;
+    let missing_skill = Uuid::now_v7();
     let app = router(
         AppState::new(pool.clone(), test_settings(&url))
             .await
@@ -602,22 +689,51 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
     );
     let before = skill_side_effect_counts(&pool, skill_id).await;
     for cookie in [&member_cookie, &viewer_cookie] {
-        for (method, path, body) in [
-            (
-                Method::GET,
-                format!("/api/v1/skills/{skill_id}/history"),
-                None,
-            ),
-            (
-                Method::POST,
-                format!("/api/v1/skills/{skill_id}/revisions"),
-                Some(json!({"content":"x","reason":"x","source_conversation_ids":[]})),
-            ),
-        ] {
-            let (status, _) = request_json(&app, method, &path, cookie, body).await;
-            assert_eq!(status, StatusCode::NOT_FOUND);
+        for target in [skill_id, missing_skill, foreign_skill] {
+            for (method, path, body) in [
+                (
+                    Method::GET,
+                    format!("/api/v1/skills/{target}/history"),
+                    None,
+                ),
+                (
+                    Method::POST,
+                    format!("/api/v1/skills/{target}/revisions"),
+                    Some(json!({"content":"x","reason":"x","source_conversation_ids":[]})),
+                ),
+                (
+                    Method::POST,
+                    format!("/api/v1/skills/{target}/revisions/1/evaluate"),
+                    Some(json!({"evaluation":valid_evaluation(1)})),
+                ),
+                (
+                    Method::POST,
+                    format!("/api/v1/skills/{target}/revisions/1/promote"),
+                    Some(json!({"reason":"x"})),
+                ),
+                (
+                    Method::POST,
+                    format!("/api/v1/skills/{target}/rollback"),
+                    Some(json!({"target_revision":1,"reason":"x"})),
+                ),
+            ] {
+                let (status, response) = request_json(&app, method, &path, cookie, body).await;
+                assert_eq!(status, StatusCode::NOT_FOUND);
+                assert_eq!(response["code"], "not_found");
+                assert_eq!(response["message"], "resource not found");
+            }
         }
     }
+    let (foreign_status, foreign_response) = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/skills/{foreign_skill}/history"),
+        &foreign_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(foreign_status, StatusCode::OK);
+    assert!(foreign_response.is_array());
     assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
 }
 
@@ -663,6 +779,12 @@ async fn evaluating_manually_promoted_revision_returns_promoted_true() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["promoted"], true);
+    let persisted: (bool, Option<i64>) = sqlx::query_as("SELECT r.promoted,s.active_revision FROM skill_revisions r JOIN skills s ON s.id=r.skill_id WHERE r.id=(SELECT id FROM skill_revisions WHERE skill_id=$1 AND revision=1)").bind(skill_id).fetch_one(&pool).await.expect("persisted promotion");
+    assert_eq!(persisted, (true, Some(1)));
+    let evaluated_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action='skill.evaluated' AND resource_id=(SELECT id::text FROM skill_revisions WHERE skill_id=$1 AND revision=1) AND outcome='success'").bind(skill_id).fetch_one(&pool).await.expect("evaluation audit");
+    assert_eq!(evaluated_audits, 1);
+    let automatic_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE action='skill.automatically_promoted' AND resource_id=(SELECT id::text FROM skill_revisions WHERE skill_id=$1 AND revision=1)").bind(skill_id).fetch_one(&pool).await.expect("automatic audit");
+    assert_eq!(automatic_audits, 0);
 }
 
 #[tokio::test]
@@ -766,9 +888,11 @@ async fn duplicate_and_inaccessible_skill_sources_return_validation() {
             .await
             .expect("state"),
     );
+    let before_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.revision_created' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("audit baseline");
     for ids in [
-        vec![Uuid::nil(), Uuid::nil()],
-        vec![Uuid::now_v7(), Uuid::now_v7()],
+        vec![valid_source, valid_source],
+        vec![Uuid::nil()],
+        vec![Uuid::now_v7()],
         vec![deleted_source],
         vec![cross_profile],
         vec![wrong_workspace],
@@ -784,54 +908,68 @@ async fn duplicate_and_inaccessible_skill_sources_return_validation() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
     assert_eq!(skill_side_effect_counts(&pool, skill_id).await.0, 1);
+    let after_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.revision_created' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("audit final");
+    assert_eq!(after_audits, before_audits);
 }
 
 #[tokio::test]
 async fn automatic_promotion_requires_recorded_non_regression() {
-    let previous = SkillEvaluation {
-        deterministic_checks_passed: true,
-        attempts: 10,
-        successful_attempts: 9,
-        steps: 1,
-        retries: 0,
-        errors: 1,
-        duration_ms: 1,
-        user_corrections: 1,
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
     };
-    for current in [
-        SkillEvaluation {
-            attempts: 0,
-            ..previous.clone()
-        },
-        SkillEvaluation {
-            deterministic_checks_passed: false,
-            ..previous.clone()
-        },
-        SkillEvaluation {
-            successful_attempts: 8,
-            ..previous.clone()
-        },
-        SkillEvaluation {
-            errors: 2,
-            ..previous.clone()
-        },
-        SkillEvaluation {
-            user_corrections: 2,
-            ..previous.clone()
-        },
-    ] {
-        assert!(!current.can_auto_promote_over(&previous));
-    }
-    assert!(
-        SkillEvaluation {
-            successful_attempts: 10,
-            ..previous
-        }
-        .can_auto_promote_over(&SkillEvaluation {
-            successful_attempts: 9,
-            ..previous
-        })
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "automatic-api").await;
+    let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
     );
+    let (status,created)=request_json(&app,Method::POST,"/api/v1/skills",&cookie,Some(json!({"name":"automatic","content":"v1","reason":"initial","promotion_policy":"automatic","source_conversation_ids":[]}))).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let skill_id = Uuid::parse_str(created["id"].as_str().expect("skill")).expect("uuid");
+    let baseline = json!({"deterministic_checks_passed":true,"attempts":10,"successful_attempts":9,"steps":1,"retries":0,"errors":1,"duration_ms":1,"user_corrections":1});
+    let (status, response) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions/1/evaluate"),
+        &cookie,
+        Some(json!({"evaluation":baseline})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["promoted"], true);
+    let cases = [
+        json!({"deterministic_checks_passed":true,"attempts":0,"successful_attempts":0,"steps":1,"retries":0,"errors":1,"duration_ms":1,"user_corrections":0}),
+        json!({"deterministic_checks_passed":false,"attempts":10,"successful_attempts":10,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0}),
+        json!({"deterministic_checks_passed":true,"attempts":10,"successful_attempts":8,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0}),
+        json!({"deterministic_checks_passed":true,"attempts":10,"successful_attempts":9,"steps":1,"retries":0,"errors":2,"duration_ms":1,"user_corrections":0}),
+        json!({"deterministic_checks_passed":true,"attempts":10,"successful_attempts":9,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":2}),
+        json!({"deterministic_checks_passed":true,"attempts":10,"successful_attempts":10,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0}),
+    ];
+    for (offset, evidence) in cases.into_iter().enumerate() {
+        let (status,revision)=request_json(&app,Method::POST,&format!("/api/v1/skills/{skill_id}/revisions"),&cookie,Some(json!({"content":format!("v{}",offset+2),"reason":"case","source_conversation_ids":[]}))).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let number = revision["revision"].as_i64().expect("revision");
+        let (status, response) = request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions/{number}/evaluate"),
+            &cookie,
+            Some(json!({"evaluation":evidence})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["promoted"], offset == 5);
+    }
+    let state:(i64,i64)=sqlx::query_as("SELECT active_revision,(SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted)").bind(skill_id).fetch_one(&pool).await.expect("promotion state");
+    assert_eq!(state, (6, 6));
+    let eval_audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.evaluated' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("evaluation audits");
+    assert_eq!(eval_audits, 7);
+    let auto_audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.automatically_promoted' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("automatic audits");
+    assert_eq!(auto_audits, 2);
 }
 
 #[tokio::test]
@@ -866,6 +1004,49 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
             .await
             .is_err()
     );
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET evaluation=NULL WHERE id=$1")
+            .bind(revision_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let deleted = Uuid::now_v7();
+    let cross = Uuid::now_v7();
+    let source_profile = profile(&pool, "raw-source-profile").await;
+    let workspace = insert_workspace(
+        &pool,
+        profile_id,
+        sqlx::query_scalar("SELECT id FROM users WHERE primary_profile_id=$1 LIMIT 1")
+            .bind(profile_id)
+            .fetch_one(&pool)
+            .await
+            .expect("owner"),
+    )
+    .await;
+    let wrong_workspace = insert_workspace(
+        &pool,
+        source_profile,
+        create_session(&pool, source_profile, "OWNER").await.0,
+    )
+    .await;
+    let scoped_skill =
+        insert_skill_fixture(&pool, profile_id, Some(workspace), "raw-scoped", "manual")
+            .await
+            .0;
+    sqlx::query("INSERT INTO conversations (id,profile_id,title,status) VALUES ($1,$2,'deleted','deleted'),($3,$4,'cross','active')").bind(deleted).bind(profile_id).bind(cross).bind(source_profile).execute(&pool).await.expect("raw source rows");
+    let missing = Uuid::now_v7();
+    for ids in [
+        vec![Uuid::nil()],
+        vec![Uuid::nil(), Uuid::nil()],
+        vec![missing],
+        vec![deleted],
+        vec![cross],
+    ] {
+        assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(ids).execute(&pool).await.is_err());
+    }
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_workspace]).execute(&pool).await.is_err());
+    let _ = wrong_workspace;
     assert!(
         sqlx::query("UPDATE skill_revisions SET source_conversation_ids=$1 WHERE id=$2")
             .bind(vec![Uuid::nil()])
@@ -963,7 +1144,7 @@ async fn concurrent_revision_fixture() {
     let _lock = common::acquire_test_lock(&url).await;
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "revision-race").await;
-    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
     let (skill_id, _) =
         insert_skill_fixture(&pool, profile_id, None, "revision-race", "manual").await;
     let app = router(
@@ -971,7 +1152,7 @@ async fn concurrent_revision_fixture() {
             .await
             .expect("state"),
     );
-    let request = |app: Router, cookie: String| async move {
+    let request = move |app: Router, cookie: String| async move {
         request_json(
             &app,
             Method::POST,
@@ -981,8 +1162,33 @@ async fn concurrent_revision_fixture() {
         )
         .await
     };
-    let first = tokio::spawn(request(app.clone(), cookie.clone()));
-    let second = tokio::spawn(request(app, cookie));
+    let mut control = pool.begin().await.expect("profile control");
+    sqlx::query("SELECT id FROM profiles WHERE id=$1 FOR UPDATE")
+        .bind(profile_id)
+        .fetch_one(&mut *control)
+        .await
+        .expect("lock profile");
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier.clone();
+    let first = tokio::spawn({
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            first_barrier.wait().await;
+            request(app, cookie).await
+        }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move {
+            second_barrier.wait().await;
+            request(app, cookie).await
+        }
+    });
+    barrier.wait().await;
+    wait_for_lock_waiters(&pool, "SELECT id FROM profiles WHERE id=", 2).await;
+    control.commit().await.expect("release profile");
     let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         (first.await.expect("first"), second.await.expect("second"))
     })
@@ -998,6 +1204,8 @@ async fn concurrent_revision_fixture() {
     .await
     .expect("revisions");
     assert_eq!(revisions, vec![1, 2, 3]);
+    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.revision_created' AND outcome='success'").bind(owner).bind(profile_id).fetch_one(&pool).await.expect("revision audits");
+    assert_eq!(audits, 2);
 }
 async fn concurrent_evaluation_fixture() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
@@ -1006,7 +1214,7 @@ async fn concurrent_evaluation_fixture() {
     let _lock = common::acquire_test_lock(&url).await;
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "evaluation-race").await;
-    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
     let (skill_id, _) =
         insert_skill_fixture(&pool, profile_id, None, "evaluation-race", "manual").await;
     let app = router(
@@ -1014,7 +1222,7 @@ async fn concurrent_evaluation_fixture() {
             .await
             .expect("state"),
     );
-    let request = |app: Router, cookie: String| async move {
+    let request = move |app: Router, cookie: String| async move {
         request_json(
             &app,
             Method::POST,
@@ -1024,8 +1232,33 @@ async fn concurrent_evaluation_fixture() {
         )
         .await
     };
-    let first = tokio::spawn(request(app.clone(), cookie.clone()));
-    let second = tokio::spawn(request(app, cookie));
+    let mut control = pool.begin().await.expect("profile control");
+    sqlx::query("SELECT id FROM profiles WHERE id=$1 FOR UPDATE")
+        .bind(profile_id)
+        .fetch_one(&mut *control)
+        .await
+        .expect("lock profile");
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier.clone();
+    let first = tokio::spawn({
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            first_barrier.wait().await;
+            request(app, cookie).await
+        }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move {
+            second_barrier.wait().await;
+            request(app, cookie).await
+        }
+    });
+    barrier.wait().await;
+    wait_for_lock_waiters(&pool, "SELECT id FROM profiles WHERE id=", 2).await;
+    control.commit().await.expect("release profile");
     let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         (first.await.expect("first"), second.await.expect("second"))
     })
@@ -1042,6 +1275,8 @@ async fn concurrent_evaluation_fixture() {
     .await
     .expect("count");
     assert_eq!(count, 1);
+    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.evaluated' AND outcome='success'").bind(owner).bind(profile_id).fetch_one(&pool).await.expect("evaluation audits");
+    assert_eq!(audits, 1);
 }
 async fn concurrent_promotion_fixture() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
@@ -1050,7 +1285,7 @@ async fn concurrent_promotion_fixture() {
     let _lock = common::acquire_test_lock(&url).await;
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "promotion-race").await;
-    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
     let (skill_id, _) =
         insert_skill_fixture(&pool, profile_id, None, "promotion-race", "manual").await;
     sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason) VALUES ($1,$2,2,'x','x','x')").bind(Uuid::now_v7()).bind(skill_id).execute(&pool).await.expect("revision");
@@ -1059,7 +1294,7 @@ async fn concurrent_promotion_fixture() {
             .await
             .expect("state"),
     );
-    let request = |app: Router, cookie: String, revision: i64| async move {
+    let request = move |app: Router, cookie: String, revision: i64| async move {
         request_json(
             &app,
             Method::POST,
@@ -1069,8 +1304,33 @@ async fn concurrent_promotion_fixture() {
         )
         .await
     };
-    let first = tokio::spawn(request(app.clone(), cookie.clone(), 1));
-    let second = tokio::spawn(request(app, cookie, 2));
+    let mut control = pool.begin().await.expect("profile control");
+    sqlx::query("SELECT id FROM profiles WHERE id=$1 FOR UPDATE")
+        .bind(profile_id)
+        .fetch_one(&mut *control)
+        .await
+        .expect("lock profile");
+    let barrier = Arc::new(Barrier::new(3));
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier.clone();
+    let first = tokio::spawn({
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            first_barrier.wait().await;
+            request(app, cookie, 1).await
+        }
+    });
+    let second = tokio::spawn({
+        let app = app.clone();
+        async move {
+            second_barrier.wait().await;
+            request(app, cookie, 2).await
+        }
+    });
+    barrier.wait().await;
+    wait_for_lock_waiters(&pool, "SELECT id FROM profiles WHERE id=", 2).await;
+    control.commit().await.expect("release profile");
     let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         (first.await.expect("first"), second.await.expect("second"))
     })
@@ -1084,6 +1344,8 @@ async fn concurrent_promotion_fixture() {
         row.get::<i64, _>("active_revision"),
         row.get::<i64, _>("promoted_revision")
     );
+    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.promoted' AND outcome='success'").bind(owner).bind(profile_id).fetch_one(&pool).await.expect("promotion audits");
+    assert_eq!(audits, 2);
 }
 async fn concurrent_source_delete_fixture() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
@@ -1121,7 +1383,7 @@ async fn concurrent_source_delete_fixture() {
         )
         .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_lock_waiters(&pool, "SELECT c.id FROM conversations c", 1).await;
     sqlx::query("DELETE FROM conversations WHERE id=$1")
         .bind(conversation)
         .execute(&mut *deletion)
@@ -1141,6 +1403,8 @@ async fn concurrent_source_delete_fixture() {
             .expect("revisions"),
         1
     );
+    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.revision_created' AND outcome='success'").bind(owner).bind(profile_id).fetch_one(&pool).await.expect("source audits");
+    assert_eq!(audits, 0);
 }
 async fn concurrent_revocation_fixture() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
@@ -1188,7 +1452,7 @@ async fn concurrent_revocation_fixture() {
         )
         .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    wait_for_lock_waiters(&pool, "SELECT access FROM workspace_memberships", 1).await;
     sqlx::query("DELETE FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2")
         .bind(workspace)
         .bind(editor)
@@ -1209,4 +1473,6 @@ async fn concurrent_revocation_fixture() {
             .expect("revisions"),
         1
     );
+    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.revision_created' AND outcome='success'").bind(editor).bind(profile_id).fetch_one(&pool).await.expect("revocation audits");
+    assert_eq!(audits, 0);
 }

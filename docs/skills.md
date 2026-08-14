@@ -12,10 +12,13 @@ workspace Skill, workspace members can read; `OWNER` and `EDITOR` membership can
 revise or evaluate; profile `OWNER`/`ADMIN` can promote or roll back. Workspace
 membership is resolved before mutation privilege: nonexistent, foreign-profile,
 and same-profile nonmember resources all return `404`, while a visible member
-without sufficient write privilege receives `403`. Resources outside the
+(including global `MEMBER` with workspace `VIEWER` access) without sufficient
+write privilege receives `403`. Resources outside the
 authenticated profile are deliberately reported as not found. Evaluation
 responses report the revision's persisted `promoted` state, including a revision
-that was promoted before its evidence was recorded.
+that was promoted before its evidence was recorded. Concurrent lifecycle
+operations serialize on profile/workspace, membership, Skill, and source locks;
+acceptance races use bounded lock-wait synchronization rather than timing sleeps.
 
 Lists are metadata-only and bounded to 200 records. Revision content is returned
 only by the explicit authorized history operation. Successful create, revision,

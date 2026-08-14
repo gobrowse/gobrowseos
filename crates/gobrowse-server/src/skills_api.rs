@@ -626,16 +626,10 @@ async fn authorize_scope(
     if write && user.role == "VIEWER" {
         return Err(AppError::Forbidden);
     }
-    let allowed = if write {
-        matches!(access.as_deref(), Some("OWNER" | "EDITOR"))
-    } else {
-        true
-    };
-    if allowed {
-        Ok(())
-    } else {
-        Err(AppError::NotFound)
+    if !write || matches!(access.as_deref(), Some("OWNER" | "EDITOR")) {
+        return Ok(());
     }
+    Err(AppError::Forbidden)
 }
 
 async fn fetch_skill_in_tx(
