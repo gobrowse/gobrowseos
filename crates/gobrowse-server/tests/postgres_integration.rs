@@ -100,6 +100,97 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .expect("create skill");
     sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids,evaluation,promoted) VALUES ($1,$2,1,'content','tester','legacy',$3,$4,true)")
         .bind(revision_id).bind(skill_id).bind(vec![Uuid::nil()]).bind(serde_json::json!({"malformed": true})).execute(&mut connection).await.expect("insert legacy malformed revision");
+    let other_profile = Uuid::now_v7();
+    let workspace = Uuid::now_v7();
+    let other_workspace = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'skills-v14-other')")
+        .bind(other_profile)
+        .execute(&mut connection)
+        .await
+        .expect("other profile");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'same workspace'),($3,$4,'other workspace')").bind(workspace).bind(profile_id).bind(other_workspace).bind(other_profile).execute(&mut connection).await.expect("workspaces");
+    let source = Uuid::now_v7();
+    let wrong_source = Uuid::now_v7();
+    let deleted_source = Uuid::now_v7();
+    let cross_source = Uuid::now_v7();
+    let missing_source = Uuid::now_v7();
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'source'),($4,$2,$5,'wrong'),($6,$2,NULL,'deleted'),($7,$8,NULL,'cross')").bind(source).bind(profile_id).bind(workspace).bind(wrong_source).bind(other_workspace).bind(deleted_source).bind(cross_source).bind(other_profile).execute(&mut connection).await.expect("source fixtures");
+    sqlx::query("UPDATE conversations SET status='deleted' WHERE id=$1")
+        .bind(deleted_source)
+        .execute(&mut connection)
+        .await
+        .expect("deleted source");
+    let duplicate_skill = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'duplicate-source','')",
+    )
+    .bind(duplicate_skill)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("duplicate skill");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(duplicate_skill).bind(vec![source,source]).execute(&mut connection).await.expect("duplicate source");
+    let inaccessible_skill = Uuid::now_v7();
+    sqlx::query("INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'inaccessible-source','')").bind(inaccessible_skill).bind(profile_id).execute(&mut connection).await.expect("inaccessible skill");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(inaccessible_skill).bind(vec![missing_source,cross_source]).execute(&mut connection).await.expect("inaccessible sources");
+    let workspace_skill = Uuid::now_v7();
+    sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'workspace-source','')").bind(workspace_skill).bind(profile_id).bind(workspace).execute(&mut connection).await.expect("workspace skill");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(workspace_skill).bind(vec![source,wrong_source,deleted_source]).execute(&mut connection).await.expect("workspace sources");
+    let oversized_skill = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'oversized-source','')",
+    )
+    .bind(oversized_skill)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("oversized skill");
+    let mut oversized = Vec::new();
+    for _ in 0..101 {
+        let id = Uuid::now_v7();
+        sqlx::query("INSERT INTO conversations (id,profile_id,title) VALUES ($1,$2,'oversized')")
+            .bind(id)
+            .bind(profile_id)
+            .execute(&mut connection)
+            .await
+            .expect("oversized conversation");
+        oversized.push(id);
+    }
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(Uuid::now_v7()).bind(oversized_skill).bind(&oversized).execute(&mut connection).await.expect("oversized sources");
+    let active_skill = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'active-canonical','')",
+    )
+    .bind(active_skill)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("active skill");
+    let active_one = Uuid::now_v7();
+    let active_two = Uuid::now_v7();
+    for (id, rev, promoted) in [(active_one, 1, false), (active_two, 2, true)] {
+        sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,promoted) VALUES ($1,$2,$3,'x','x','x',$4)").bind(id).bind(active_skill).bind(rev).bind(promoted).execute(&mut connection).await.expect("active revision");
+    }
+    sqlx::query("UPDATE skills SET active_revision=1 WHERE id=$1")
+        .bind(active_skill)
+        .execute(&mut connection)
+        .await
+        .expect("active pointer");
+    let none_skill = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'none-promoted','')",
+    )
+    .bind(none_skill)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("none skill");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason) VALUES ($1,$2,1,'x','x','x')").bind(Uuid::now_v7()).bind(none_skill).execute(&mut connection).await.expect("none revision");
+    sqlx::query("UPDATE skills SET active_revision=1 WHERE id=$1")
+        .bind(none_skill)
+        .execute(&mut connection)
+        .await
+        .expect("none pointer");
     sqlx::raw_sql(include_str!(
         "../migrations/0015_skill_lifecycle_hardening.sql"
     ))
@@ -120,6 +211,24 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     .expect("read repaired revision");
     assert!(evaluation.is_none());
     assert!(sources.is_empty());
+    let duplicate_sources: Vec<Uuid> = sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='duplicate-source')")
+        .fetch_one(&mut connection).await.expect("duplicate repair");
+    assert_eq!(duplicate_sources, vec![source]);
+    let inaccessible_sources: Vec<Uuid> = sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='inaccessible-source')")
+        .fetch_one(&mut connection).await.expect("inaccessible repair");
+    assert!(inaccessible_sources.is_empty());
+    let workspace_sources: Vec<Uuid> = sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='workspace-source')")
+        .fetch_one(&mut connection).await.expect("workspace repair");
+    assert_eq!(workspace_sources, vec![source]);
+    let oversized_count: i64 = sqlx::query_scalar("SELECT cardinality(source_conversation_ids) FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='oversized-source')")
+        .fetch_one(&mut connection).await.expect("oversized repair");
+    assert_eq!(oversized_count, 100);
+    let promoted_canonical: i64 = sqlx::query_scalar("SELECT revision FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='active-canonical') AND promoted")
+        .fetch_one(&mut connection).await.expect("active repair");
+    assert_eq!(promoted_canonical, 1);
+    let none_promoted: bool = sqlx::query_scalar("SELECT promoted FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='none-promoted')")
+        .fetch_one(&mut connection).await.expect("none promotion repair");
+    assert!(none_promoted);
     let active: i64 = sqlx::query_scalar("SELECT active_revision FROM skills WHERE id=$1")
         .bind(skill_id)
         .fetch_one(&mut connection)
@@ -134,6 +243,16 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     .await
     .expect("read revision quarantine");
     assert_eq!(quarantined, 2);
+    let repaired_sources: i64 = sqlx::query_scalar("SELECT count(*) FROM skill_revision_integrity_quarantine WHERE issue='invalid_source_conversation_ids'")
+        .fetch_one(&mut connection).await.expect("source quarantine count");
+    assert!(repaired_sources >= 4);
+    let promotion_repairs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM skill_integrity_quarantine WHERE issue='promotion_state_mismatch'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("promotion quarantine count");
+    assert!(promotion_repairs >= 3);
     let quarantine_id: i64 = sqlx::query_scalar(
         "SELECT id FROM skill_revision_integrity_quarantine WHERE revision_id=$1 LIMIT 1",
     )
@@ -385,7 +504,7 @@ async fn vault_round_trip_never_persists_plaintext() {
 }
 
 #[tokio::test]
-async fn schema_v3_safely_upgrades_permitted_v1_states() {
+async fn deployed_schema_v3_upgrades_to_v15() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -747,6 +866,55 @@ async fn schema_v3_safely_upgrades_permitted_v1_states() {
     .await
     .expect("read Skills source trigger");
     assert!(source_trigger);
+    let skill_id = Uuid::now_v7();
+    let revision_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'v3-upgrade-skill','')",
+    )
+    .bind(skill_id)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert upgraded skill");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason) VALUES ($1,$2,1,'content','owner','initial')")
+        .bind(revision_id).bind(skill_id).execute(&mut connection).await.expect("insert upgraded revision");
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET evaluation='{}' WHERE id=$1")
+            .bind(revision_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    let valid = serde_json::json!({"deterministic_checks_passed":true,"attempts":1,"successful_attempts":1,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0});
+    sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
+        .bind(&valid)
+        .bind(revision_id)
+        .execute(&mut connection)
+        .await
+        .expect("record upgraded evidence");
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
+            .bind(serde_json::json!({"tampered":true}))
+            .bind(revision_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,2,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(vec![Uuid::nil()]).execute(&mut connection).await.is_err());
+    let mut divergence = connection.begin().await.expect("begin divergence");
+    sqlx::query("UPDATE skill_revisions SET promoted=true WHERE id=$1")
+        .bind(revision_id)
+        .execute(&mut *divergence)
+        .await
+        .expect("set invalid promoted state");
+    assert!(divergence.commit().await.is_err());
+    sqlx::query("INSERT INTO skill_integrity_quarantine (skill_id,profile_id,name,issue,detail) VALUES ($1,$2,'q','upgrade','{}')").bind(skill_id).bind(profile_id).execute(&mut connection).await.expect("insert quarantine evidence");
+    assert!(
+        sqlx::query("UPDATE skill_integrity_quarantine SET issue='tampered'")
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
     connection.close().await.expect("close upgrade session");
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&pool)

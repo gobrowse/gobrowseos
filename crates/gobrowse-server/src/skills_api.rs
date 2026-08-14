@@ -403,7 +403,11 @@ async fn evaluate_revision(
         )
         .await?;
     }
-    let response = revision_response_from_row(&row, Some(evaluation), automatic)?;
+    let response = revision_response_from_row(
+        &row,
+        Some(evaluation),
+        row.get::<bool, _>("promoted") || automatic,
+    )?;
     tx.commit().await?;
     Ok(Json(response))
 }
@@ -609,9 +613,6 @@ async fn authorize_scope(
     if is_admin(user) {
         return Ok(());
     }
-    if write && user.role == "VIEWER" {
-        return Err(AppError::Forbidden);
-    }
     let access: Option<String> = sqlx::query_scalar(
         "SELECT access FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE",
     )
@@ -619,10 +620,16 @@ async fn authorize_scope(
     .bind(user.id)
     .fetch_optional(&mut **tx)
     .await?;
+    if access.is_none() {
+        return Err(AppError::NotFound);
+    }
+    if write && user.role == "VIEWER" {
+        return Err(AppError::Forbidden);
+    }
     let allowed = if write {
         matches!(access.as_deref(), Some("OWNER" | "EDITOR"))
     } else {
-        access.is_some()
+        true
     };
     if allowed {
         Ok(())

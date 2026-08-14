@@ -85,6 +85,43 @@ async fn skills_api_lifecycle_is_durable_metadata_only_and_audited() {
     .await;
     assert_eq!(status, StatusCode::OK, "{history}");
     assert_eq!(history[0]["content"], "procedure-v1");
+    let (status, revision) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions"),
+        &owner_cookie,
+        Some(json!({"content":"procedure-v2","reason":"improve","source_conversation_ids":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{revision}");
+    let (status, evaluated) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions/2/evaluate"),
+        &owner_cookie,
+        Some(json!({"evaluation":valid_evaluation(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{evaluated}");
+    let (status, promoted) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions/2/promote"),
+        &owner_cookie,
+        Some(json!({"reason":"release"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{promoted}");
+    let (status, rolled_back) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/rollback"),
+        &owner_cookie,
+        Some(json!({"target_revision":1,"reason":"rollback"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{rolled_back}");
+    assert_eq!(rolled_back["active_revision"], 1);
     let (status, denied) = request_json(
         &app,
         Method::POST,
@@ -353,4 +390,823 @@ async fn request_json(
         serde_json::from_slice(&bytes).expect("JSON response")
     };
     (status, value)
+}
+
+fn valid_evaluation(attempts: u32) -> Value {
+    json!({"deterministic_checks_passed":true,"attempts":attempts,"successful_attempts":attempts,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0})
+}
+
+async fn insert_skill_fixture(
+    pool: &PgPool,
+    profile_id: Uuid,
+    workspace_id: Option<Uuid>,
+    name: &str,
+    policy: &str,
+) -> (Uuid, Uuid) {
+    let skill_id = Uuid::now_v7();
+    let revision_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description,promotion_policy) VALUES ($1,$2,$3,$4,'fixture',$5)")
+        .bind(skill_id).bind(profile_id).bind(workspace_id).bind(name).bind(policy).execute(pool).await.expect("insert skill fixture");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason) VALUES ($1,$2,1,'fixture content','fixture','initial')")
+        .bind(revision_id).bind(skill_id).execute(pool).await.expect("insert revision fixture");
+    (skill_id, revision_id)
+}
+
+async fn insert_workspace(pool: &PgPool, profile_id: Uuid, owner_id: Uuid) -> Uuid {
+    let workspace_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title,created_by_user_id) VALUES ($1,$2,'Skills workspace',$3)")
+        .bind(workspace_id).bind(profile_id).bind(owner_id).execute(pool).await.expect("insert workspace");
+    sqlx::query(
+        "INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'OWNER')",
+    )
+    .bind(workspace_id)
+    .bind(owner_id)
+    .execute(pool)
+    .await
+    .expect("insert owner membership");
+    workspace_id
+}
+
+async fn skill_side_effect_counts(pool: &PgPool, skill_id: Uuid) -> (i64, i64, i64) {
+    let revisions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM skill_revisions WHERE skill_id=$1")
+            .bind(skill_id)
+            .fetch_one(pool)
+            .await
+            .expect("revision count");
+    let evaluated: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM skill_revisions WHERE skill_id=$1 AND evaluation IS NOT NULL",
+    )
+    .bind(skill_id)
+    .fetch_one(pool)
+    .await
+    .expect("evaluation count");
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE resource_id=$1 AND outcome='success'",
+    )
+    .bind(skill_id.to_string())
+    .fetch_one(pool)
+    .await
+    .expect("audit count");
+    (revisions, evaluated, audits)
+}
+
+#[tokio::test]
+async fn profile_global_skill_mutations_require_owner_or_admin() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "global-role-test").await;
+    let (_owner, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (_member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let (_viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
+    let (skill_id, _revision_id) =
+        insert_skill_fixture(&pool, profile_id, None, "global-role", "manual").await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let before = skill_side_effect_counts(&pool, skill_id).await;
+    for cookie in [&member_cookie, &viewer_cookie] {
+        for (method, path, body) in [
+            (
+                Method::POST,
+                "/api/v1/skills",
+                json!({"name":"blocked","content":"x","reason":"x","source_conversation_ids":[]}),
+            ),
+            (
+                Method::POST,
+                &format!("/api/v1/skills/{skill_id}/revisions"),
+                json!({"content":"x","reason":"x","source_conversation_ids":[]}),
+            ),
+            (
+                Method::POST,
+                &format!("/api/v1/skills/{skill_id}/revisions/1/evaluate"),
+                json!({"evaluation":valid_evaluation(1)}),
+            ),
+            (
+                Method::POST,
+                &format!("/api/v1/skills/{skill_id}/revisions/1/promote"),
+                json!({"reason":"x"}),
+            ),
+            (
+                Method::POST,
+                &format!("/api/v1/skills/{skill_id}/rollback"),
+                json!({"target_revision":1,"reason":"x"}),
+            ),
+        ] {
+            let (status, _) = request_json(&app, method, path, cookie, Some(body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+    }
+}
+
+#[tokio::test]
+async fn workspace_skill_roles_and_tenants_are_enforced() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "workspace-role-test").await;
+    let (owner, owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (editor, editor_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let (viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    sqlx::query("INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'EDITOR'),($1,$3,'VIEWER')").bind(workspace).bind(editor).bind(viewer).execute(&pool).await.expect("memberships");
+    let (skill_id, _) = insert_skill_fixture(
+        &pool,
+        profile_id,
+        Some(workspace),
+        "workspace-role",
+        "manual",
+    )
+    .await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions"),
+        &editor_cookie,
+        Some(json!({"content":"editor","reason":"edit","source_conversation_ids":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions"),
+        &viewer_cookie,
+        Some(json!({"content":"viewer","reason":"edit","source_conversation_ids":[]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions/1/promote"),
+        &editor_cookie,
+        Some(json!({"reason":"no"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let foreign_profile = profile(&pool, "foreign-workspace-profile").await;
+    let (_, foreign_cookie) = create_session(&pool, foreign_profile, "OWNER").await;
+    let (status, _) = request_json(
+        &app,
+        Method::GET,
+        &format!("/api/v1/skills/{skill_id}/history"),
+        &foreign_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let _ = owner_cookie;
+}
+
+#[tokio::test]
+async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "workspace-nonmember-test").await;
+    let (owner, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (_member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let (_viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    let (skill_id, _) = insert_skill_fixture(
+        &pool,
+        profile_id,
+        Some(workspace),
+        "private-workspace",
+        "manual",
+    )
+    .await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let before = skill_side_effect_counts(&pool, skill_id).await;
+    for cookie in [&member_cookie, &viewer_cookie] {
+        for (method, path, body) in [
+            (
+                Method::GET,
+                format!("/api/v1/skills/{skill_id}/history"),
+                None,
+            ),
+            (
+                Method::POST,
+                format!("/api/v1/skills/{skill_id}/revisions"),
+                Some(json!({"content":"x","reason":"x","source_conversation_ids":[]})),
+            ),
+        ] {
+            let (status, _) = request_json(&app, method, &path, cookie, body).await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+    }
+    assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+}
+
+#[tokio::test]
+async fn evaluating_manually_promoted_revision_returns_promoted_true() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "promoted-response-test").await;
+    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, None, "promoted-response", "manual").await;
+    let mut promotion_tx = pool.begin().await.expect("promotion transaction");
+    sqlx::query("UPDATE skill_revisions SET promoted=true WHERE skill_id=$1 AND revision=1")
+        .bind(skill_id)
+        .execute(&mut *promotion_tx)
+        .await
+        .expect("promote fixture");
+    sqlx::query("UPDATE skills SET active_revision=1 WHERE id=$1")
+        .bind(skill_id)
+        .execute(&mut *promotion_tx)
+        .await
+        .expect("activate fixture");
+    promotion_tx
+        .commit()
+        .await
+        .expect("commit fixture promotion");
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let (status, response) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions/1/evaluate"),
+        &cookie,
+        Some(json!({"evaluation":valid_evaluation(1)})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["promoted"], true);
+}
+
+#[tokio::test]
+async fn duplicate_skill_names_return_conflict_without_sql_details() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "duplicate-name-test").await;
+    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let body = json!({"name":"duplicate","content":"x","reason":"x","source_conversation_ids":[]});
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        &cookie,
+        Some(body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, error) =
+        request_json(&app, Method::POST, "/api/v1/skills", &cookie, Some(body)).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "conflict");
+    assert!(
+        !error
+            .to_string()
+            .contains("skills_profile_global_name_unique")
+    );
+    let workspace = insert_workspace(
+        &pool,
+        profile_id,
+        sqlx::query_scalar("SELECT id FROM users WHERE primary_profile_id=$1 LIMIT 1")
+            .bind(profile_id)
+            .fetch_one(&pool)
+            .await
+            .expect("owner id"),
+    )
+    .await;
+    let workspace_body = json!({"name":"workspace-duplicate","content":"x","reason":"x","workspace_id":workspace,"source_conversation_ids":[]});
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        &cookie,
+        Some(workspace_body.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, error) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/skills",
+        &cookie,
+        Some(workspace_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(error["code"], "conflict");
+}
+
+#[tokio::test]
+async fn duplicate_and_inaccessible_skill_sources_return_validation() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "source-validation-test").await;
+    let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, Some(workspace), "source-skill", "manual").await;
+    let valid_source = Uuid::now_v7();
+    let deleted_source = Uuid::now_v7();
+    let wrong_workspace = Uuid::now_v7();
+    let cross_profile = Uuid::now_v7();
+    let other_profile = profile(&pool, "source-foreign-profile").await;
+    let other_workspace = insert_workspace(
+        &pool,
+        other_profile,
+        create_session(&pool, other_profile, "OWNER").await.0,
+    )
+    .await;
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'valid'),($4,$2,$3,'deleted'),($5,$2,$6,'wrong'),($7,$8,NULL,'foreign')").bind(valid_source).bind(profile_id).bind(workspace).bind(deleted_source).bind(wrong_workspace).bind(other_workspace).bind(cross_profile).bind(other_profile).execute(&pool).await.expect("source cases");
+    sqlx::query("UPDATE conversations SET status='deleted' WHERE id=$1")
+        .bind(deleted_source)
+        .execute(&pool)
+        .await
+        .expect("delete source");
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    for ids in [
+        vec![Uuid::nil(), Uuid::nil()],
+        vec![Uuid::now_v7(), Uuid::now_v7()],
+        vec![deleted_source],
+        vec![cross_profile],
+        vec![wrong_workspace],
+    ] {
+        let (status, _) = request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions"),
+            &cookie,
+            Some(json!({"content":"x","reason":"x","source_conversation_ids":ids})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(skill_side_effect_counts(&pool, skill_id).await.0, 1);
+}
+
+#[tokio::test]
+async fn automatic_promotion_requires_recorded_non_regression() {
+    let previous = SkillEvaluation {
+        deterministic_checks_passed: true,
+        attempts: 10,
+        successful_attempts: 9,
+        steps: 1,
+        retries: 0,
+        errors: 1,
+        duration_ms: 1,
+        user_corrections: 1,
+    };
+    for current in [
+        SkillEvaluation {
+            attempts: 0,
+            ..previous.clone()
+        },
+        SkillEvaluation {
+            deterministic_checks_passed: false,
+            ..previous.clone()
+        },
+        SkillEvaluation {
+            successful_attempts: 8,
+            ..previous.clone()
+        },
+        SkillEvaluation {
+            errors: 2,
+            ..previous.clone()
+        },
+        SkillEvaluation {
+            user_corrections: 2,
+            ..previous.clone()
+        },
+    ] {
+        assert!(!current.can_auto_promote_over(&previous));
+    }
+    assert!(
+        SkillEvaluation {
+            successful_attempts: 10,
+            ..previous
+        }
+        .can_auto_promote_over(&SkillEvaluation {
+            successful_attempts: 9,
+            ..previous
+        })
+    );
+}
+
+#[tokio::test]
+async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "raw-sql-invariants").await;
+    let (skill_id, revision_id) =
+        insert_skill_fixture(&pool, profile_id, None, "raw-invariants", "manual").await;
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET evaluation='{}' WHERE id=$1")
+            .bind(revision_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
+        .bind(valid_evaluation(1))
+        .bind(revision_id)
+        .execute(&pool)
+        .await
+        .expect("valid evidence");
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
+            .bind(valid_evaluation(2))
+            .bind(revision_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET source_conversation_ids=$1 WHERE id=$2")
+            .bind(vec![Uuid::nil()])
+            .bind(revision_id)
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    let mut tx = pool.begin().await.expect("transaction");
+    sqlx::query("UPDATE skill_revisions SET promoted=true WHERE id=$1")
+        .bind(revision_id)
+        .execute(&mut *tx)
+        .await
+        .expect("promote in transaction");
+    assert!(tx.commit().await.is_err());
+    let _ = skill_id;
+}
+
+#[tokio::test]
+async fn skill_integrity_quarantines_reject_update_delete_and_truncate() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "quarantine-test").await;
+    let (skill_id, revision_id) =
+        insert_skill_fixture(&pool, profile_id, None, "quarantine", "manual").await;
+    sqlx::query("INSERT INTO skill_integrity_quarantine (skill_id,profile_id,name,issue,detail) VALUES ($1,$2,'q','test','{}')").bind(skill_id).bind(profile_id).execute(&pool).await.expect("insert skill quarantine");
+    sqlx::query("INSERT INTO skill_revision_integrity_quarantine (revision_id,skill_id,issue) VALUES ($1,$2,'test')").bind(revision_id).bind(skill_id).execute(&pool).await.expect("insert revision quarantine");
+    assert!(
+        sqlx::query("UPDATE skill_integrity_quarantine SET issue='x'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM skill_integrity_quarantine")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("TRUNCATE skill_integrity_quarantine")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE skill_revision_integrity_quarantine SET issue='x'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("DELETE FROM skill_revision_integrity_quarantine")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("TRUNCATE skill_revision_integrity_quarantine")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn concurrent_skill_revisions_receive_consecutive_numbers() {
+    concurrent_revision_fixture().await;
+}
+#[tokio::test]
+async fn concurrent_skill_evaluations_commit_once_and_conflict_once() {
+    concurrent_evaluation_fixture().await;
+}
+#[tokio::test]
+async fn concurrent_skill_promotions_leave_one_matching_active_revision() {
+    concurrent_promotion_fixture().await;
+}
+#[tokio::test]
+async fn source_deletion_wins_before_revision_commit_is_rejected() {
+    concurrent_source_delete_fixture().await;
+}
+#[tokio::test]
+async fn revoked_editor_cannot_commit_skill_revision() {
+    concurrent_revocation_fixture().await;
+}
+
+async fn concurrent_revision_fixture() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "revision-race").await;
+    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, None, "revision-race", "manual").await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let request = |app: Router, cookie: String| async move {
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions"),
+            &cookie,
+            Some(json!({"content":"race","reason":"race","source_conversation_ids":[]})),
+        )
+        .await
+    };
+    let first = tokio::spawn(request(app.clone(), cookie.clone()));
+    let second = tokio::spawn(request(app, cookie));
+    let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        (first.await.expect("first"), second.await.expect("second"))
+    })
+    .await
+    .expect("race timeout");
+    assert_eq!(one.0, StatusCode::CREATED);
+    assert_eq!(two.0, StatusCode::CREATED);
+    let revisions: Vec<i64> = sqlx::query_scalar(
+        "SELECT revision FROM skill_revisions WHERE skill_id=$1 ORDER BY revision",
+    )
+    .bind(skill_id)
+    .fetch_all(&pool)
+    .await
+    .expect("revisions");
+    assert_eq!(revisions, vec![1, 2, 3]);
+}
+async fn concurrent_evaluation_fixture() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "evaluation-race").await;
+    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, None, "evaluation-race", "manual").await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let request = |app: Router, cookie: String| async move {
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions/1/evaluate"),
+            &cookie,
+            Some(json!({"evaluation":valid_evaluation(1)})),
+        )
+        .await
+    };
+    let first = tokio::spawn(request(app.clone(), cookie.clone()));
+    let second = tokio::spawn(request(app, cookie));
+    let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        (first.await.expect("first"), second.await.expect("second"))
+    })
+    .await
+    .expect("race timeout");
+    let statuses = [one.0, two.0];
+    assert!(statuses.contains(&StatusCode::OK));
+    assert!(statuses.contains(&StatusCode::CONFLICT));
+    let count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM skill_revisions WHERE skill_id=$1 AND evaluation IS NOT NULL",
+    )
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count");
+    assert_eq!(count, 1);
+}
+async fn concurrent_promotion_fixture() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "promotion-race").await;
+    let (_owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, None, "promotion-race", "manual").await;
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason) VALUES ($1,$2,2,'x','x','x')").bind(Uuid::now_v7()).bind(skill_id).execute(&pool).await.expect("revision");
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let request = |app: Router, cookie: String, revision: i64| async move {
+        request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions/{revision}/promote"),
+            &cookie,
+            Some(json!({"reason":"race"})),
+        )
+        .await
+    };
+    let first = tokio::spawn(request(app.clone(), cookie.clone(), 1));
+    let second = tokio::spawn(request(app, cookie, 2));
+    let (one, two) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        (first.await.expect("first"), second.await.expect("second"))
+    })
+    .await
+    .expect("race timeout");
+    assert_eq!(one.0, StatusCode::OK);
+    assert_eq!(two.0, StatusCode::OK);
+    let row=sqlx::query("SELECT active_revision,(SELECT count(*) FROM skill_revisions WHERE skill_id=$1 AND promoted) AS promoted_count,(SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted) AS promoted_revision FROM skills WHERE id=$1").bind(skill_id).fetch_one(&pool).await.expect("state");
+    assert_eq!(row.get::<i64, _>("promoted_count"), 1);
+    assert_eq!(
+        row.get::<i64, _>("active_revision"),
+        row.get::<i64, _>("promoted_revision")
+    );
+}
+async fn concurrent_source_delete_fixture() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "source-race").await;
+    let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let conversation = Uuid::now_v7();
+    sqlx::query("INSERT INTO conversations (id,profile_id,title,created_by_user_id) VALUES ($1,$2,'race',$3)").bind(conversation).bind(profile_id).bind(owner).execute(&pool).await.expect("conversation");
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, None, "source-race", "manual").await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let mut deletion = pool.begin().await.expect("deletion tx");
+    sqlx::query("SELECT id FROM conversations WHERE id=$1 FOR UPDATE")
+        .bind(conversation)
+        .fetch_one(&mut *deletion)
+        .await
+        .expect("lock conversation");
+    let request_app = app.clone();
+    let request_cookie = cookie.clone();
+    let request_path = format!("/api/v1/skills/{skill_id}/revisions");
+    let request = tokio::spawn(async move {
+        request_json(
+            &request_app,
+            Method::POST,
+            &request_path,
+            &request_cookie,
+            Some(json!({"content":"x","reason":"source","source_conversation_ids":[conversation]})),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    sqlx::query("DELETE FROM conversations WHERE id=$1")
+        .bind(conversation)
+        .execute(&mut *deletion)
+        .await
+        .expect("delete conversation");
+    deletion.commit().await.expect("commit deletion");
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("race timeout")
+        .expect("request");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_revisions WHERE skill_id=$1")
+            .bind(skill_id)
+            .fetch_one(&pool)
+            .await
+            .expect("revisions"),
+        1
+    );
+}
+async fn concurrent_revocation_fixture() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "revocation-race").await;
+    let (owner, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (editor, editor_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    sqlx::query(
+        "INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'EDITOR')",
+    )
+    .bind(workspace)
+    .bind(editor)
+    .execute(&pool)
+    .await
+    .expect("editor membership");
+    let (skill_id, _) = insert_skill_fixture(
+        &pool,
+        profile_id,
+        Some(workspace),
+        "revocation-race",
+        "manual",
+    )
+    .await;
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let mut revocation = pool.begin().await.expect("revocation tx");
+    sqlx::query("SELECT workspace_id,user_id FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE").bind(workspace).bind(editor).fetch_one(&mut *revocation).await.expect("lock membership");
+    let request_app = app.clone();
+    let request_cookie = editor_cookie.clone();
+    let request_path = format!("/api/v1/skills/{skill_id}/revisions");
+    let request = tokio::spawn(async move {
+        request_json(
+            &request_app,
+            Method::POST,
+            &request_path,
+            &request_cookie,
+            Some(json!({"content":"x","reason":"revocation","source_conversation_ids":[]})),
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    sqlx::query("DELETE FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2")
+        .bind(workspace)
+        .bind(editor)
+        .execute(&mut *revocation)
+        .await
+        .expect("revoke");
+    revocation.commit().await.expect("commit revocation");
+    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(5), request)
+        .await
+        .expect("race timeout")
+        .expect("request");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM skill_revisions WHERE skill_id=$1")
+            .bind(skill_id)
+            .fetch_one(&pool)
+            .await
+            .expect("revisions"),
+        1
+    );
 }

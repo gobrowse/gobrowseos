@@ -26,8 +26,13 @@ conversation deletion; deletion and a concurrent revision insert serialize.
 
 Profile-global Skills are readable by authenticated users in the profile but can
 be created, revised, evaluated, promoted, or rolled back only by profile
-OWNER/ADMIN. Workspace membership continues to govern workspace access; only
-profile OWNER/ADMIN may promote or roll back. Duplicate names are the only
+OWNER/ADMIN. Workspace membership is checked before mutation privilege: a
+same-profile nonmember is indistinguishable from a nonexistent or foreign
+workspace Skill and receives 404; only a visible member with insufficient access
+receives 403. Workspace membership continues to govern workspace access; only
+profile OWNER/ADMIN may promote or roll back. Evaluation responses serialize
+persisted promotion state rather than merely whether this request auto-promoted.
+Duplicate names are the only
 expected database conflict mapped to HTTP 409. Invalid source IDs and evidence
 are HTTP 422, while unknown database and deferred integrity failures remain
 masked server errors.
