@@ -596,8 +596,8 @@ async fn crashed_worker_running_row_is_reclaimed_on_restart() {
     sqlx::query(
         "INSERT INTO webhook_deliveries \
          (webhook_id, delivery_id, status, attempts, next_attempt_at, target_url, \
-          secret_key, lease_expires_at) \
-         VALUES ($1,$2,'running',1,NULL,$3,$4,now() - interval '1 minute')",
+          secret_key, lease_token, lease_expires_at) \
+         VALUES ($1,$2,'running',1,NULL,$3,$4,gen_random_uuid(),now() - interval '1 minute')",
     )
     .bind(webhook_id)
     .bind(&delivery_id)
@@ -700,7 +700,104 @@ async fn crashed_worker_running_row_is_reclaimed_on_restart() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 7: crashed worker running row dead-letters after max_attempts
+// Test 7: stale worker outcome is fenced after crash recovery and reclaim
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+    let delivery_id = format!("stale-outcome-{}", Uuid::now_v7());
+    insert_queued_delivery(
+        &pool,
+        webhook_id,
+        &delivery_id,
+        "http://127.0.0.1:1/deliver",
+        &secret,
+    )
+    .await;
+
+    let owner = format!("test-{}", Uuid::now_v7());
+    let stale = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("initial claim")
+        .into_iter()
+        .find(|delivery| delivery.webhook_id == webhook_id && delivery.delivery_id == delivery_id)
+        .expect("must claim delivery");
+
+    // Deterministically simulate the old worker's lease expiring before the
+    // reaper makes the row available to a new worker.
+    sqlx::query(
+        "UPDATE webhook_deliveries SET lease_expires_at=clock_timestamp() - interval '1 second' \
+         WHERE webhook_id=$1 AND delivery_id=$2 AND lease_token=$3",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .bind(stale.lease_token)
+    .execute(&pool)
+    .await
+    .expect("expire stale lease");
+
+    let reclaimed = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
+        .await
+        .expect("recover stale lease");
+    assert!(reclaimed > 0, "reaper must reclaim the expired lease");
+
+    let current = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("reclaim delivery")
+        .into_iter()
+        .find(|delivery| delivery.webhook_id == webhook_id && delivery.delivery_id == delivery_id)
+        .expect("must claim recovered delivery");
+    assert_ne!(
+        stale.lease_token, current.lease_token,
+        "reclaim must issue a new lease identity"
+    );
+
+    let success = webhook_scheduler::DeliveryOutcome {
+        response_code: Some(200),
+        success: true,
+        retryable: false,
+        error: None,
+    };
+    webhook_scheduler::persist_outcome(&pool, &stale, &success, 5).await;
+
+    let row = sqlx::query(
+        "SELECT status, attempts, lease_token FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read fenced delivery");
+    assert_eq!(row.get::<String, _>("status"), "running");
+    assert_eq!(row.get::<i32, _>("attempts"), 2);
+    assert_eq!(row.get::<Uuid, _>("lease_token"), current.lease_token);
+
+    // The current worker's outcome is still accepted by the same fence.
+    webhook_scheduler::persist_outcome(&pool, &current, &success, 5).await;
+    let status: String = sqlx::query_scalar(
+        "SELECT status FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read completed delivery");
+    assert_eq!(status, "succeeded");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 8: crashed worker running row dead-letters after max_attempts
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -720,8 +817,8 @@ async fn crashed_worker_running_row_dead_letters_after_max_attempts() {
     sqlx::query(
         "INSERT INTO webhook_deliveries \
          (webhook_id, delivery_id, status, attempts, next_attempt_at, target_url, \
-          secret_key, lease_expires_at) \
-         VALUES ($1,$2,'running',5,NULL,$3,$4,now() - interval '1 minute')",
+          secret_key, lease_token, lease_expires_at) \
+         VALUES ($1,$2,'running',5,NULL,$3,$4,gen_random_uuid(),now() - interval '1 minute')",
     )
     .bind(webhook_id)
     .bind(&delivery_id)
@@ -737,7 +834,7 @@ async fn crashed_worker_running_row_dead_letters_after_max_attempts() {
         .expect("recover_stuck_deliveries");
     assert!(reclaimed > 0, "reaper must dead-letter the exhausted row");
 
-    // Verify status is 'failed' (dead-lettered).
+    // Verify status is 'dead' (dead-lettered).
     let row = sqlx::query(
         "SELECT status, last_error, lease_expires_at, next_attempt_at \
          FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
@@ -753,7 +850,7 @@ async fn crashed_worker_running_row_dead_letters_after_max_attempts() {
     let lease: Option<time::OffsetDateTime> = row.get("lease_expires_at");
     let next: Option<time::OffsetDateTime> = row.get("next_attempt_at");
 
-    assert_eq!(status, "failed", "max_attempts exceeded → status='failed'");
+    assert_eq!(status, "dead", "max_attempts exceeded → status='dead'");
     assert_eq!(last_error, "lease expired", "last_error set by reaper");
     assert!(lease.is_none(), "lease cleared by reaper");
     assert!(next.is_none(), "next_attempt_at cleared by reaper");
