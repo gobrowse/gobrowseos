@@ -1,6 +1,18 @@
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 use time::OffsetDateTime;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnknownPromotionPolicy;
+
+impl fmt::Display for UnknownPromotionPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("unknown promotion policy")
+    }
+}
+
+impl std::error::Error for UnknownPromotionPolicy {}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -9,6 +21,29 @@ pub enum PromotionPolicy {
     #[default]
     Propose,
     Automatic,
+}
+
+impl PromotionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Propose => "propose",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+impl FromStr for PromotionPolicy {
+    type Err = UnknownPromotionPolicy;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "manual" => Ok(Self::Manual),
+            "propose" => Ok(Self::Propose),
+            "automatic" => Ok(Self::Automatic),
+            _ => Err(UnknownPromotionPolicy),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +105,23 @@ mod tests {
             duration_ms: 0,
             user_corrections: 0,
         }
+    }
+
+    #[test]
+    fn promotion_policy_round_trips_database_names() {
+        for (policy, name) in [
+            (PromotionPolicy::Manual, "manual"),
+            (PromotionPolicy::Propose, "propose"),
+            (PromotionPolicy::Automatic, "automatic"),
+        ] {
+            assert_eq!(policy.as_str(), name);
+            assert_eq!(name.parse::<PromotionPolicy>(), Ok(policy));
+        }
+    }
+
+    #[test]
+    fn promotion_policy_rejects_unknown_database_name() {
+        assert!("unexpected".parse::<PromotionPolicy>().is_err());
     }
 
     // ── can_auto_promote_over ──────────────────────────────

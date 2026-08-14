@@ -33,8 +33,148 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 14);
+    assert_eq!(row.get::<i64, _>("schema_version"), 15);
     assert!(row.get::<bool, _>("vector_enabled"));
+}
+
+#[tokio::test]
+async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to test PostgreSQL");
+    gobrowse_server::db::migrate(&pool)
+        .await
+        .expect("install shared extensions");
+    let schema = format!("skills_v14_{}", Uuid::now_v7().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create isolated schema");
+    let mut connection = PgConnection::connect(&database_url)
+        .await
+        .expect("connect isolated session");
+    sqlx::query(&format!("SET search_path TO {schema},public"))
+        .execute(&mut connection)
+        .await
+        .expect("set isolated search path");
+    let migrations = [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_library_embeddings.sql"),
+        include_str!("../migrations/0003_chat_runs.sql"),
+        include_str!("../migrations/0004_login_attempts.sql"),
+        include_str!("../migrations/0005_webhooks.sql"),
+        include_str!("../migrations/0006_audit_append_only.sql"),
+        include_str!("../migrations/0007_webhook_scheduler.sql"),
+        include_str!("../migrations/0008_webhook_delivery_lease.sql"),
+        include_str!("../migrations/0009_webhook_delivery_fencing.sql"),
+        include_str!("../migrations/0010_task_integrity_activity_ledger.sql"),
+        include_str!("../migrations/0011_task_activity_hardening.sql"),
+        include_str!("../migrations/0012_webhook_lease_check.sql"),
+        include_str!("../migrations/0013_skill_integrity.sql"),
+        include_str!("../migrations/0014_skill_revision_immutability.sql"),
+    ];
+    for sql in migrations {
+        sqlx::raw_sql(sql)
+            .execute(&mut connection)
+            .await
+            .expect("install schema 14 migration");
+    }
+    let profile_id = Uuid::now_v7();
+    let skill_id = Uuid::now_v7();
+    let revision_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'skills-v14-repair')")
+        .bind(profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create profile");
+    sqlx::query("INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'repair','')")
+        .bind(skill_id)
+        .bind(profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create skill");
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids,evaluation,promoted) VALUES ($1,$2,1,'content','tester','legacy',$3,$4,true)")
+        .bind(revision_id).bind(skill_id).bind(vec![Uuid::nil()]).bind(serde_json::json!({"malformed": true})).execute(&mut connection).await.expect("insert legacy malformed revision");
+    sqlx::raw_sql(include_str!(
+        "../migrations/0015_skill_lifecycle_hardening.sql"
+    ))
+    .execute(&mut connection)
+    .await
+    .expect("upgrade schema 14 to 15");
+    let version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read schema version");
+    assert_eq!(version, 15);
+    let (evaluation, sources): (Option<serde_json::Value>, Vec<Uuid>) = sqlx::query_as(
+        "SELECT evaluation,source_conversation_ids FROM skill_revisions WHERE id=$1",
+    )
+    .bind(revision_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read repaired revision");
+    assert!(evaluation.is_none());
+    assert!(sources.is_empty());
+    let active: i64 = sqlx::query_scalar("SELECT active_revision FROM skills WHERE id=$1")
+        .bind(skill_id)
+        .fetch_one(&mut connection)
+        .await
+        .expect("read repaired active revision");
+    assert_eq!(active, 1);
+    let quarantined: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM skill_revision_integrity_quarantine WHERE revision_id=$1",
+    )
+    .bind(revision_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read revision quarantine");
+    assert_eq!(quarantined, 2);
+    let quarantine_id: i64 = sqlx::query_scalar(
+        "SELECT id FROM skill_revision_integrity_quarantine WHERE revision_id=$1 LIMIT 1",
+    )
+    .bind(revision_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read quarantine id");
+    assert!(
+        sqlx::query("DELETE FROM skill_revision_integrity_quarantine WHERE id=$1")
+            .bind(quarantine_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    let valid = serde_json::json!({"deterministic_checks_passed":true,"attempts":1,"successful_attempts":1,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0});
+    sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
+        .bind(&valid)
+        .bind(revision_id)
+        .execute(&mut connection)
+        .await
+        .expect("record first evaluation");
+    assert!(
+        sqlx::query("UPDATE skill_revisions SET evaluation=$1 WHERE id=$2")
+            .bind(serde_json::json!({"tampered":true}))
+            .bind(revision_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE skills SET active_revision=NULL WHERE id=$1")
+            .bind(skill_id)
+            .execute(&mut connection)
+            .await
+            .is_err()
+    );
+    connection.close().await.expect("close isolated session");
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("drop isolated schema");
 }
 
 #[tokio::test]
@@ -539,6 +679,74 @@ async fn schema_v3_safely_upgrades_permitted_v1_states() {
         .execute(&mut connection)
         .await;
     assert!(immutable.is_err(), "revision trigger must reject updates");
+    let migrations = [
+        (
+            "0004_login_attempts.sql",
+            include_str!("../migrations/0004_login_attempts.sql"),
+        ),
+        (
+            "0005_webhooks.sql",
+            include_str!("../migrations/0005_webhooks.sql"),
+        ),
+        (
+            "0006_audit_append_only.sql",
+            include_str!("../migrations/0006_audit_append_only.sql"),
+        ),
+        (
+            "0007_webhook_scheduler.sql",
+            include_str!("../migrations/0007_webhook_scheduler.sql"),
+        ),
+        (
+            "0008_webhook_delivery_lease.sql",
+            include_str!("../migrations/0008_webhook_delivery_lease.sql"),
+        ),
+        (
+            "0009_webhook_delivery_fencing.sql",
+            include_str!("../migrations/0009_webhook_delivery_fencing.sql"),
+        ),
+        (
+            "0010_task_integrity_activity_ledger.sql",
+            include_str!("../migrations/0010_task_integrity_activity_ledger.sql"),
+        ),
+        (
+            "0011_task_activity_hardening.sql",
+            include_str!("../migrations/0011_task_activity_hardening.sql"),
+        ),
+        (
+            "0012_webhook_lease_check.sql",
+            include_str!("../migrations/0012_webhook_lease_check.sql"),
+        ),
+        (
+            "0013_skill_integrity.sql",
+            include_str!("../migrations/0013_skill_integrity.sql"),
+        ),
+        (
+            "0014_skill_revision_immutability.sql",
+            include_str!("../migrations/0014_skill_revision_immutability.sql"),
+        ),
+        (
+            "0015_skill_lifecycle_hardening.sql",
+            include_str!("../migrations/0015_skill_lifecycle_hardening.sql"),
+        ),
+    ];
+    for (migration, sql) in migrations {
+        sqlx::raw_sql(sql)
+            .execute(&mut connection)
+            .await
+            .unwrap_or_else(|error| panic!("upgrade with {migration}: {error}"));
+    }
+    let final_schema: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read final schema version");
+    assert_eq!(final_schema, 15);
+    let source_trigger: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='skill_revisions_sources_valid')",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("read Skills source trigger");
+    assert!(source_trigger);
     connection.close().await.expect("close upgrade session");
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&pool)

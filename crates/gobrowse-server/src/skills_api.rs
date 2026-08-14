@@ -10,7 +10,7 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
 };
-use gobrowse_core::skills::SkillEvaluation;
+use gobrowse_core::skills::{PromotionPolicy, SkillEvaluation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{Postgres, Row, Transaction};
@@ -48,7 +48,7 @@ pub struct CreateSkillRequest {
     #[serde(default)]
     pub source_conversation_ids: Vec<Uuid>,
     #[serde(default)]
-    pub promotion_policy: Option<String>,
+    pub promotion_policy: Option<PromotionPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +95,7 @@ pub struct SkillResponse {
     pub name: String,
     pub description: String,
     pub active_revision: Option<i64>,
-    pub promotion_policy: String,
+    pub promotion_policy: PromotionPolicy,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -141,7 +141,7 @@ pub async fn list_skills(
 pub async fn create_skill(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut input): Json<CreateSkillRequest>,
+    Json(input): Json<CreateSkillRequest>,
 ) -> Result<(StatusCode, Json<SkillResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
     validate_skill_fields(
@@ -150,9 +150,8 @@ pub async fn create_skill(
         &input.content,
         &input.reason,
     )?;
-    normalize_ids(&mut input.source_conversation_ids)?;
-    let policy = input.promotion_policy.as_deref().unwrap_or("propose");
-    validate_policy(policy)?;
+    validate_ids(&input.source_conversation_ids)?;
+    let policy = input.promotion_policy.unwrap_or_default();
 
     let mut tx = state.pool.begin().await?;
     authorize_scope(&mut tx, &user, input.workspace_id, true, false).await?;
@@ -163,13 +162,6 @@ pub async fn create_skill(
         &input.source_conversation_ids,
     )
     .await?;
-    if input.workspace_id.is_none() {
-        sqlx::query("SELECT id FROM profiles WHERE id=$1 FOR UPDATE")
-            .bind(user.profile_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(AppError::NotFound)?;
-    }
     let now = OffsetDateTime::now_utc();
     let skill_id = Uuid::now_v7();
     sqlx::query(
@@ -181,10 +173,11 @@ pub async fn create_skill(
     .bind(input.workspace_id)
     .bind(input.name.trim())
     .bind(input.description.trim())
-    .bind(policy)
+    .bind(policy.as_str())
     .bind(now)
     .execute(&mut *tx)
-    .await?;
+    .await
+    .map_err(map_skill_insert_error)?;
     let _revision = insert_revision(
         &mut tx,
         &user,
@@ -216,7 +209,7 @@ pub async fn create_skill(
             name: input.name.trim().into(),
             description: input.description.trim().into(),
             active_revision: None,
-            promotion_policy: policy.into(),
+            promotion_policy: policy,
             created_at: now,
             updated_at: now,
         }),
@@ -245,12 +238,12 @@ async fn create_revision_inner(
     state: AppState,
     headers: HeaderMap,
     skill_id: Uuid,
-    mut input: CreateRevisionRequest,
+    input: CreateRevisionRequest,
     action: &str,
 ) -> Result<(StatusCode, Json<SkillRevisionResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
     validate_content_and_reason(&input.content, &input.reason)?;
-    normalize_ids(&mut input.source_conversation_ids)?;
+    validate_ids(&input.source_conversation_ids)?;
     let mut tx = state.pool.begin().await?;
     let (workspace_id, revision_number) = lock_skill(&mut tx, &user, skill_id, true, false).await?;
     validate_sources(&mut tx, &user, workspace_id, &input.source_conversation_ids).await?;
@@ -358,10 +351,13 @@ async fn evaluate_revision(
         .execute(&mut *tx)
         .await?;
 
-    let policy: String = sqlx::query_scalar("SELECT promotion_policy FROM skills WHERE id=$1")
-        .bind(skill_id)
-        .fetch_one(&mut *tx)
-        .await?;
+    let policy: PromotionPolicy =
+        sqlx::query_scalar::<_, String>("SELECT promotion_policy FROM skills WHERE id=$1")
+            .bind(skill_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .parse()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("unknown promotion policy")))?;
     let previous_value: Option<Option<Value>> = sqlx::query_scalar::<_, Option<Value>>(
         "SELECT evaluation FROM skill_revisions WHERE skill_id=$1 AND promoted AND revision<>$2",
     )
@@ -375,7 +371,7 @@ async fn evaluate_revision(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| AppError::Internal(anyhow::anyhow!(error)))?;
-    let automatic = policy == "automatic"
+    let automatic = policy == PromotionPolicy::Automatic
         && evaluation.deterministic_checks_passed
         && evaluation.attempts > 0
         && ((!has_previous && previous.is_none())
@@ -588,8 +584,15 @@ async fn authorize_scope(
     privileged: bool,
 ) -> Result<(), AppError> {
     if workspace_id.is_none() {
-        if write && user.role == "VIEWER" {
-            return Err(AppError::Forbidden);
+        if write {
+            sqlx::query("SELECT id FROM profiles WHERE id=$1 FOR UPDATE")
+                .bind(user.profile_id)
+                .fetch_optional(&mut **tx)
+                .await?
+                .ok_or(AppError::NotFound)?;
+            if !is_admin(user) {
+                return Err(AppError::Forbidden);
+            }
         }
         if privileged && !is_admin(user) {
             return Err(AppError::Forbidden);
@@ -675,20 +678,24 @@ async fn validate_sources(
     workspace_id: Option<Uuid>,
     ids: &[Uuid],
 ) -> Result<(), AppError> {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM conversations c WHERE c.profile_id=$1 AND c.id=ANY($2::uuid[]) \
+    let mut lock_ids = ids.to_vec();
+    lock_ids.sort_unstable();
+    let rows = sqlx::query(
+        "SELECT c.id FROM conversations c WHERE c.profile_id=$1 AND c.id=ANY($2::uuid[]) \
          AND c.status <> 'deleted' AND ($3::uuid IS NULL OR c.workspace_id=$3) \
          AND ($4 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$5) OR EXISTS( \
-             SELECT 1 FROM workspace_memberships m WHERE m.workspace_id=c.workspace_id AND m.user_id=$5))",
+             SELECT 1 FROM workspace_memberships m WHERE m.workspace_id=c.workspace_id AND m.user_id=$5)) \
+         ORDER BY c.id FOR KEY SHARE OF c",
     )
     .bind(user.profile_id)
-    .bind(ids)
+    .bind(&lock_ids)
     .bind(workspace_id)
     .bind(&user.role)
     .bind(user.id)
-    .fetch_one(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
-    if usize::try_from(count).ok() != Some(ids.len()) {
+    let found: Vec<Uuid> = rows.into_iter().map(|row| row.get("id")).collect();
+    if found != lock_ids {
         return Err(AppError::Validation(
             "source conversations must be accessible in the skill scope".into(),
         ));
@@ -704,7 +711,10 @@ fn row_to_skill(row: &sqlx::postgres::PgRow) -> Result<SkillResponse, AppError> 
         name: row.get("name"),
         description: row.get("description"),
         active_revision: row.get("active_revision"),
-        promotion_policy: row.get("promotion_policy"),
+        promotion_policy: row
+            .get::<String, _>("promotion_policy")
+            .parse()
+            .map_err(|_| AppError::Internal(anyhow::anyhow!("unknown promotion policy")))?,
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     })
@@ -776,16 +786,6 @@ fn validate_reason(reason: &str) -> Result<(), AppError> {
     Ok(())
 }
 
-fn validate_policy(policy: &str) -> Result<(), AppError> {
-    if matches!(policy, "manual" | "propose" | "automatic") {
-        Ok(())
-    } else {
-        Err(AppError::Validation(
-            "policy must be manual, propose, or automatic".into(),
-        ))
-    }
-}
-
 fn validate_evaluation(evaluation: &SkillEvaluation) -> Result<(), AppError> {
     if evaluation.attempts > MAX_EVALUATION_ATTEMPTS
         || evaluation.successful_attempts > evaluation.attempts
@@ -802,15 +802,32 @@ fn validate_evaluation(evaluation: &SkillEvaluation) -> Result<(), AppError> {
     Ok(())
 }
 
-fn normalize_ids(ids: &mut Vec<Uuid>) -> Result<(), AppError> {
+fn validate_ids(ids: &[Uuid]) -> Result<(), AppError> {
     if ids.len() > MAX_SOURCE_CONVERSATIONS || ids.iter().any(Uuid::is_nil) {
         return Err(AppError::Validation(
-            "too many or invalid source conversations".into(),
+            "source conversations must contain at most 100 unique non-nil IDs".into(),
         ));
     }
-    ids.sort_unstable();
-    ids.dedup();
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|window| window[0] == window[1]) {
+        return Err(AppError::Validation(
+            "source conversations must contain at most 100 unique non-nil IDs".into(),
+        ));
+    }
     Ok(())
+}
+
+fn map_skill_insert_error(error: sqlx::Error) -> AppError {
+    if let sqlx::Error::Database(database) = &error
+        && matches!(
+            database.constraint(),
+            Some("skills_profile_global_name_unique" | "skills_profile_id_workspace_id_name_key")
+        )
+    {
+        return AppError::Conflict("skill name already exists in this scope");
+    }
+    AppError::Database(error)
 }
 
 fn is_admin(user: &AuthenticatedUser) -> bool {
@@ -839,8 +856,7 @@ mod tests {
     #[test]
     fn ids_are_bounded_and_deduplicated() {
         let id = Uuid::now_v7();
-        let mut ids = vec![id, id];
-        normalize_ids(&mut ids).unwrap();
-        assert_eq!(ids, vec![id]);
+        let ids = vec![id, id];
+        assert!(validate_ids(&ids).is_err());
     }
 }
