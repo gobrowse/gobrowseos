@@ -13,6 +13,7 @@ pub mod library_api;
 pub mod model_api;
 pub mod realtime;
 pub mod run_api;
+pub mod task_api;
 pub mod vault;
 pub mod vault_api;
 pub mod webhook_scheduler;
@@ -85,6 +86,20 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/conversations",
             get(conversation_api::list_conversations).post(conversation_api::create_conversation),
+        )
+        .route(
+            "/workspaces/{workspace_id}/tasks",
+            get(task_api::list_tasks).post(task_api::create_task),
+        )
+        .route(
+            "/workspaces/{workspace_id}/activity",
+            get(task_api::list_activity).post(task_api::create_activity),
+        )
+        .route(
+            "/tasks/{id}",
+            get(task_api::get_task)
+                .patch(task_api::update_task)
+                .put(task_api::update_task),
         )
         .route(
             "/conversations/search",
