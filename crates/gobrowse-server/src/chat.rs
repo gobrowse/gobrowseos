@@ -288,29 +288,40 @@ async fn next_provider_event(
         if let Some(event) = state.pending.pop_front() {
             return Some((Ok(event), state));
         }
+        if state.completed {
+            return None;
+        }
         if let Some(newline) = state.buffer.iter().position(|byte| *byte == b'\n') {
             let line = state.buffer.drain(..=newline).collect::<Vec<_>>();
             match parse_provider_line(&mut state, &line) {
                 Ok(Some(event)) => return Some((Ok(event), state)),
                 Ok(None) => continue,
-                Err(error) => return Some((Err(error), state)),
+                Err(error) => {
+                    state.completed = true;
+                    return Some((Err(error), state));
+                }
             }
         }
         match state.stream.next().await {
             Some(Ok(chunk)) => {
                 state.received_bytes = state.received_bytes.saturating_add(chunk.len());
                 if state.received_bytes > 4 * 1024 * 1024 {
+                    state.completed = true;
                     return Some((Err(ProviderError::InvalidResponse), state));
                 }
                 state.buffer.extend_from_slice(&chunk);
             }
-            Some(Err(error)) => return Some((Err(map_transport_error(error)), state)),
+            Some(Err(error)) => {
+                state.completed = true;
+                return Some((Err(map_transport_error(error)), state));
+            }
             None if !state.buffer.is_empty() => {
                 let line = std::mem::take(&mut state.buffer);
                 match parse_provider_line(&mut state, &line) {
                     Ok(Some(event)) => return Some((Ok(event), state)),
                     Ok(None) if state.completed => continue,
                     Ok(None) | Err(_) => {
+                        state.completed = true;
                         return Some((Err(ProviderError::InvalidResponse), state));
                     }
                 }
@@ -318,10 +329,16 @@ async fn next_provider_event(
             None if !state.sse_data.is_empty() => match parse_provider_line(&mut state, b"") {
                 Ok(Some(event)) => return Some((Ok(event), state)),
                 Ok(None) if state.completed => continue,
-                Ok(None) | Err(_) => return Some((Err(ProviderError::InvalidResponse), state)),
+                Ok(None) | Err(_) => {
+                    state.completed = true;
+                    return Some((Err(ProviderError::InvalidResponse), state));
+                }
             },
             None if state.completed => return None,
-            None => return Some((Err(ProviderError::InvalidResponse), state)),
+            None => {
+                state.completed = true;
+                return Some((Err(ProviderError::InvalidResponse), state));
+            }
         }
     }
 }
