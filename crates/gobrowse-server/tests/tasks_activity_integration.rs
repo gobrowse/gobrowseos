@@ -81,11 +81,21 @@ async fn tasks_and_activity_are_durable_and_workspace_scoped() {
     assert_eq!(status, StatusCode::CREATED, "{task}");
     let task_id = uuid_field(&task, "id");
     assert_eq!(task["state"], "BACKLOG");
+    let (status, dependent_task) = request_json(
+        &app,
+        Method::POST,
+        &task_path,
+        &owner_cookie,
+        Some(json!({"title":"Dependent task","dependencies":[task_id]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{dependent_task}");
+    assert_eq!(dependent_task["dependencies"], json!([task_id]));
 
     let (status, viewer_tasks) =
         request_json(&app, Method::GET, &task_path, &viewer_cookie, None).await;
     assert_eq!(status, StatusCode::OK, "{viewer_tasks}");
-    assert_eq!(viewer_tasks.as_array().expect("task list").len(), 1);
+    assert_eq!(viewer_tasks.as_array().expect("task list").len(), 2);
     let (status, forbidden_activity) = request_json(
         &app,
         Method::POST,
@@ -158,10 +168,267 @@ async fn tasks_and_activity_are_durable_and_workspace_scoped() {
             .await
             .expect("count activity events");
     assert_eq!(
-        event_count, 3,
-        "create, explicit event, and state transition"
+        event_count, 4,
+        "two creates, explicit event, and state transition"
     );
     assert!(foreign_profile != profile_id);
+}
+
+#[tokio::test]
+async fn task_activity_constraints_reject_cross_workspace_and_mutation_sql() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping task integrity test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to test PostgreSQL");
+    db::migrate(&pool).await.expect("apply test migrations");
+    let (workspace_id, foreign_workspace_id, task_id, foreign_task_id, agent_id, foreign_agent_id) =
+        integrity_fixture(&pool).await;
+
+    let result = sqlx::query("UPDATE tasks SET parent_task_id=$1 WHERE id=$2")
+        .bind(foreign_task_id)
+        .bind(task_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "cross-workspace parent must be rejected");
+
+    let result = sqlx::query("UPDATE tasks SET assigned_agent_id=$1 WHERE id=$2")
+        .bind(foreign_agent_id)
+        .bind(task_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "cross-workspace agent must be rejected");
+
+    let result = sqlx::query("UPDATE agents SET parent_agent_id=$1 WHERE id=$2")
+        .bind(foreign_agent_id)
+        .bind(agent_id)
+        .execute(&pool)
+        .await;
+    assert!(
+        result.is_err(),
+        "cross-workspace parent agent must be rejected"
+    );
+
+    let result = sqlx::query(
+        "INSERT INTO task_dependencies (workspace_id,task_id,dependency_task_id,ordinal) VALUES ($1,$2,$3,0)",
+    )
+    .bind(workspace_id)
+    .bind(task_id)
+    .bind(foreign_task_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "cross-workspace dependency must be rejected"
+    );
+
+    let local_dependency_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO tasks (id,workspace_id,title,state) VALUES ($1,$2,'local dependency','BACKLOG')",
+    )
+    .bind(local_dependency_id)
+    .bind(workspace_id)
+    .execute(&pool)
+    .await
+    .expect("insert local dependency task");
+    sqlx::query(
+        "INSERT INTO task_dependencies (workspace_id,task_id,dependency_task_id,ordinal) VALUES ($1,$2,$3,0)",
+    )
+    .bind(workspace_id)
+    .bind(task_id)
+    .bind(local_dependency_id)
+    .execute(&pool)
+    .await
+    .expect("insert same-workspace dependency");
+    let dependencies: Vec<Uuid> = sqlx::query_scalar::<_, Option<Vec<Uuid>>>(
+        "SELECT array_agg(dependency_task_id ORDER BY ordinal) FROM task_dependencies WHERE task_id=$1",
+    )
+    .bind(task_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read normalized dependencies")
+    .expect("dependency array");
+    assert_eq!(dependencies, vec![local_dependency_id]);
+
+    let event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO activity_events (workspace_id,task_id,agent_id,kind,payload) \
+         VALUES ($1,$2,$3,'FILES_CHANGED','{}') RETURNING id",
+    )
+    .bind(workspace_id)
+    .bind(task_id)
+    .bind(agent_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert activity event");
+    let result = sqlx::query("UPDATE activity_events SET kind='TASK_UPDATED' WHERE id=$1")
+        .bind(event_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "activity updates must be rejected");
+    let result = sqlx::query("DELETE FROM activity_events WHERE id=$1")
+        .bind(event_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "activity deletes must be rejected");
+    let result = sqlx::query("TRUNCATE activity_events").execute(&pool).await;
+    assert!(result.is_err(), "activity truncation must be rejected");
+
+    let result = sqlx::query(
+        "INSERT INTO activity_events (workspace_id,task_id,kind,payload) VALUES ($1,$2,'FILES_CHANGED','{}')",
+    )
+    .bind(workspace_id)
+    .bind(foreign_task_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "cross-workspace activity task must be rejected"
+    );
+    let result = sqlx::query(
+        "INSERT INTO activity_events (workspace_id,agent_id,kind,payload) VALUES ($1,$2,'AGENT_STARTED','{}')",
+    )
+    .bind(workspace_id)
+    .bind(foreign_agent_id)
+    .execute(&pool)
+    .await;
+    assert!(
+        result.is_err(),
+        "cross-workspace activity agent must be rejected"
+    );
+    assert_ne!(workspace_id, foreign_workspace_id);
+}
+
+#[tokio::test]
+async fn activity_cursor_lock_orders_delayed_commits() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping activity ordering test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to test PostgreSQL");
+    db::migrate(&pool).await.expect("apply test migrations");
+    let (workspace_id, _, task_id, _, _, _) = integrity_fixture(&pool).await;
+
+    let mut first = pool.begin().await.expect("begin first event transaction");
+    let first_id: i64 = sqlx::query_scalar(
+        "INSERT INTO activity_events (workspace_id,task_id,kind,payload) VALUES ($1,$2,'FILES_CHANGED','{}') RETURNING id",
+    )
+    .bind(workspace_id)
+    .bind(task_id)
+    .fetch_one(&mut *first)
+    .await
+    .expect("insert first event");
+
+    let mut second = pool.begin().await.expect("begin second event transaction");
+    let second_can_lock: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, 0))")
+            .bind(workspace_id)
+            .fetch_one(&mut *second)
+            .await
+            .expect("probe workspace lock");
+    assert!(
+        !second_can_lock,
+        "second writer must wait for the workspace lock"
+    );
+
+    first.commit().await.expect("commit first event");
+    let second_id: i64 = sqlx::query_scalar(
+        "INSERT INTO activity_events (workspace_id,task_id,kind,payload) VALUES ($1,$2,'FILES_CHANGED','{}') RETURNING id",
+    )
+    .bind(workspace_id)
+    .bind(task_id)
+    .fetch_one(&mut *second)
+    .await
+    .expect("insert second event after first commit");
+    second.commit().await.expect("commit second event");
+    assert!(
+        first_id < second_id,
+        "activity cursor must follow commit order"
+    );
+
+    let replayed: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM activity_events WHERE workspace_id=$1 AND id>$2")
+            .bind(workspace_id)
+            .bind(first_id)
+            .fetch_one(&pool)
+            .await
+            .expect("replay events after first cursor");
+    assert_eq!(
+        replayed, 1,
+        "replay must not skip the delayed second commit"
+    );
+}
+
+async fn integrity_fixture(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid, Uuid, Uuid) {
+    let profile_id = Uuid::now_v7();
+    let user_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'task integrity profile')")
+        .bind(profile_id)
+        .execute(pool)
+        .await
+        .expect("create integrity profile");
+    sqlx::query(
+        "INSERT INTO users (id,email,display_name,password_hash,role,primary_profile_id) VALUES ($1,$2,'Integrity User','unused','OWNER',$3)",
+    )
+    .bind(user_id)
+    .bind(format!("{user_id}@example.test"))
+    .bind(profile_id)
+    .execute(pool)
+    .await
+    .expect("create integrity user");
+    let workspace_id = Uuid::now_v7();
+    let foreign_workspace_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO workspaces (id,profile_id,title,created_by_user_id) VALUES ($1,$3,'Integrity',$2),($4,$3,'Foreign integrity',$2)",
+    )
+    .bind(workspace_id)
+    .bind(user_id)
+    .bind(profile_id)
+    .bind(foreign_workspace_id)
+    .execute(pool)
+    .await
+    .expect("create integrity workspaces");
+    let agent_id = Uuid::now_v7();
+    let foreign_agent_id = Uuid::now_v7();
+    for (agent_id, workspace_id) in [
+        (agent_id, workspace_id),
+        (foreign_agent_id, foreign_workspace_id),
+    ] {
+        sqlx::query(
+            "INSERT INTO agents (id,workspace_id,name,kind,permissions,status) VALUES ($1,$2,'Integrity agent','coding','{}','paused')",
+        )
+        .bind(agent_id)
+        .bind(workspace_id)
+        .execute(pool)
+        .await
+        .expect("create integrity agent");
+    }
+    let task_id = Uuid::now_v7();
+    let foreign_task_id = Uuid::now_v7();
+    for (task_id, workspace_id) in [
+        (task_id, workspace_id),
+        (foreign_task_id, foreign_workspace_id),
+    ] {
+        sqlx::query("INSERT INTO tasks (id,workspace_id,title,state) VALUES ($1,$2,'Integrity task','BACKLOG')")
+            .bind(task_id)
+            .bind(workspace_id)
+            .execute(pool)
+            .await
+            .expect("create integrity task");
+    }
+    (
+        workspace_id,
+        foreign_workspace_id,
+        task_id,
+        foreign_task_id,
+        agent_id,
+        foreign_agent_id,
+    )
 }
 
 async fn create_session(pool: &PgPool, profile_id: Uuid, role: &str) -> (Uuid, String) {

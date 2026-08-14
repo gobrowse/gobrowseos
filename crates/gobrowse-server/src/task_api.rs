@@ -122,9 +122,11 @@ pub async fn list_tasks(
     authorize_workspace(&state, &user, workspace_id, false).await?;
     let state_filter = query.state.map(task_state_name);
     let rows = sqlx::query(
-        "SELECT id,workspace_id,parent_task_id,title,description,state,assigned_agent_id,dependencies,created_at,updated_at \
-         FROM tasks WHERE workspace_id=$1 AND ($2::text IS NULL OR state=$2) \
-         ORDER BY updated_at DESC,id DESC LIMIT $3",
+        "SELECT tasks.id,tasks.workspace_id,tasks.parent_task_id,tasks.title,tasks.description,tasks.state,tasks.assigned_agent_id, \
+         COALESCE((SELECT array_agg(dependency_task_id ORDER BY ordinal) FROM task_dependencies WHERE task_id=tasks.id), '{}'::uuid[]) AS dependencies, \
+         tasks.created_at,tasks.updated_at \
+         FROM tasks WHERE tasks.workspace_id=$1 AND ($2::text IS NULL OR tasks.state=$2) \
+         ORDER BY tasks.updated_at DESC,tasks.id DESC LIMIT $3",
     )
     .bind(workspace_id)
     .bind(state_filter)
@@ -145,21 +147,23 @@ pub async fn create_task(
     authorize_workspace(&state, &user, workspace_id, true).await?;
     validate_task_input(&input.title, &input.description, &input.dependencies)?;
     let task_state = input.state.unwrap_or(TaskState::Backlog);
-    validate_task_references(
-        &state.pool,
+    let id = Uuid::now_v7();
+    let now = OffsetDateTime::now_utc();
+    let mut tx = state.pool.begin().await?;
+    // Lock before task/reference row locks or writes; append_activity takes
+    // the same lock again before allocating the ledger cursor.
+    lock_activity_workspace(&mut tx, workspace_id).await?;
+    validate_task_references_in_transaction(
+        &mut tx,
         workspace_id,
         input.parent_task_id,
         input.assigned_agent_id,
         &input.dependencies,
     )
     .await?;
-
-    let id = Uuid::now_v7();
-    let now = OffsetDateTime::now_utc();
-    let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "INSERT INTO tasks (id,workspace_id,parent_task_id,title,description,state,assigned_agent_id,dependencies,created_at,updated_at) \
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9)",
+        "INSERT INTO tasks (id,workspace_id,parent_task_id,title,description,state,assigned_agent_id,created_at,updated_at) \
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8)",
     )
     .bind(id)
     .bind(workspace_id)
@@ -168,10 +172,21 @@ pub async fn create_task(
     .bind(&input.description)
     .bind(task_state_name(task_state))
     .bind(input.assigned_agent_id)
-    .bind(&input.dependencies)
     .bind(now)
     .execute(&mut *tx)
     .await?;
+    if !input.dependencies.is_empty() {
+        sqlx::query(
+            "INSERT INTO task_dependencies (workspace_id,task_id,dependency_task_id,ordinal) \
+             SELECT $1,$2,dependency_id,ordinal::integer-1 \
+             FROM unnest($3::uuid[]) WITH ORDINALITY AS dependency(dependency_id,ordinal)",
+        )
+        .bind(workspace_id)
+        .bind(id)
+        .bind(&input.dependencies)
+        .execute(&mut *tx)
+        .await?;
+    }
     append_activity(
         &mut tx,
         workspace_id,
@@ -259,7 +274,9 @@ pub async fn update_task(
     let now = OffsetDateTime::now_utc();
     let updated = sqlx::query(
         "UPDATE tasks SET title=$2,description=$3,state=$4,assigned_agent_id=$5,updated_at=$6 WHERE id=$1 \
-         RETURNING id,workspace_id,parent_task_id,title,description,state,assigned_agent_id,dependencies,created_at,updated_at",
+         RETURNING id,workspace_id,parent_task_id,title,description,state,assigned_agent_id, \
+         COALESCE((SELECT array_agg(dependency_task_id ORDER BY ordinal) FROM task_dependencies WHERE task_id=tasks.id), '{}'::uuid[]) AS dependencies, \
+         created_at,updated_at",
     )
     .bind(id)
     .bind(title)
@@ -352,15 +369,17 @@ pub async fn create_activity(
     require_writer(&user)?;
     authorize_workspace(&state, &user, workspace_id, true).await?;
     validate_activity(&input.kind, &input.payload)?;
-    validate_task_references(
-        &state.pool,
+    let mut tx = state.pool.begin().await?;
+    // Keep the workspace lock before reference checks and the ledger insert.
+    lock_activity_workspace(&mut tx, workspace_id).await?;
+    validate_task_references_in_transaction(
+        &mut tx,
         workspace_id,
         input.task_id,
         input.agent_id,
         &[],
     )
     .await?;
-    let mut tx = state.pool.begin().await?;
     let event = append_activity(
         &mut tx,
         workspace_id,
@@ -384,6 +403,17 @@ pub async fn create_activity(
     Ok((StatusCode::CREATED, Json(event)))
 }
 
+async fn lock_activity_workspace(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))")
+        .bind(workspace_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 async fn append_activity(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
@@ -392,6 +422,9 @@ async fn append_activity(
     kind: &str,
     payload: Value,
 ) -> Result<ActivityResponse, AppError> {
+    // This is intentionally also taken here: every activity writer must hold
+    // the workspace lock immediately before the INSERT that allocates a cursor.
+    lock_activity_workspace(tx, workspace_id).await?;
     let row = sqlx::query(
         "INSERT INTO activity_events (workspace_id,task_id,agent_id,kind,payload) \
          VALUES ($1,$2,$3,$4,$5) RETURNING id,workspace_id,task_id,agent_id,kind,payload,created_at",
@@ -406,8 +439,8 @@ async fn append_activity(
     Ok(row_to_activity(&row))
 }
 
-async fn validate_task_references(
-    pool: &sqlx::PgPool,
+async fn validate_task_references_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     parent_task_id: Option<Uuid>,
     assigned_agent_id: Option<Uuid>,
@@ -423,26 +456,6 @@ async fn validate_task_references(
             "a task parent cannot also be a dependency".into(),
         ));
     }
-    let mut tx = pool.begin().await?;
-    validate_task_references_in_transaction(
-        &mut tx,
-        workspace_id,
-        parent_task_id,
-        assigned_agent_id,
-        dependencies,
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn validate_task_references_in_transaction(
-    tx: &mut Transaction<'_, Postgres>,
-    workspace_id: Uuid,
-    parent_task_id: Option<Uuid>,
-    assigned_agent_id: Option<Uuid>,
-    dependencies: &[Uuid],
-) -> Result<(), AppError> {
     if dependencies.len() > MAX_DEPENDENCIES {
         return Err(AppError::Validation("too many task dependencies".into()));
     }
@@ -533,12 +546,33 @@ async fn authorized_task_in_transaction(
     id: Uuid,
     require_write: bool,
 ) -> Result<sqlx::postgres::PgRow, AppError> {
+    if require_write {
+        // Establish the documented workspace-lock-before-row-lock order.  The
+        // authorization predicate is repeated below after the lock is held.
+        let workspace_id: Uuid = sqlx::query_scalar(
+            "SELECT task.workspace_id FROM tasks task JOIN workspaces workspace ON workspace.id=task.workspace_id \
+             WHERE task.id=$1 AND workspace.profile_id=$2 \
+             AND ($4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=task.workspace_id AND member.user_id=$3 AND member.access IN ('OWNER','EDITOR')))",
+        )
+        .bind(id)
+        .bind(user.profile_id)
+        .bind(user.id)
+        .bind(&user.role)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or(AppError::NotFound)?;
+        lock_activity_workspace(tx, workspace_id).await?;
+    }
     let query = if require_write {
-        "SELECT task.id,task.workspace_id,task.parent_task_id,task.title,task.description,task.state,task.assigned_agent_id,task.dependencies,task.created_at,task.updated_at \
+        "SELECT task.id,task.workspace_id,task.parent_task_id,task.title,task.description,task.state,task.assigned_agent_id, \
+         COALESCE((SELECT array_agg(dependency_task_id ORDER BY ordinal) FROM task_dependencies WHERE task_id=task.id), '{}'::uuid[]) AS dependencies, \
+         task.created_at,task.updated_at \
          FROM tasks task JOIN workspaces workspace ON workspace.id=task.workspace_id WHERE task.id=$1 AND workspace.profile_id=$2 \
          AND ($4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=task.workspace_id AND member.user_id=$3 AND member.access IN ('OWNER','EDITOR'))) FOR UPDATE"
     } else {
-        "SELECT task.id,task.workspace_id,task.parent_task_id,task.title,task.description,task.state,task.assigned_agent_id,task.dependencies,task.created_at,task.updated_at \
+        "SELECT task.id,task.workspace_id,task.parent_task_id,task.title,task.description,task.state,task.assigned_agent_id, \
+         COALESCE((SELECT array_agg(dependency_task_id ORDER BY ordinal) FROM task_dependencies WHERE task_id=task.id), '{}'::uuid[]) AS dependencies, \
+         task.created_at,task.updated_at \
          FROM tasks task JOIN workspaces workspace ON workspace.id=task.workspace_id WHERE task.id=$1 AND workspace.profile_id=$2 \
          AND ($4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=task.workspace_id AND member.user_id=$3))"
     };
