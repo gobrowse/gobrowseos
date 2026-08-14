@@ -70,19 +70,39 @@ async fn create_user_with_password(
     role: &str,
 ) -> TestUser {
     let profile_id = Uuid::now_v7();
-    let user_id = Uuid::now_v7();
-    let password_hash = state
-        .passwords
-        .hash(password)
-        .await
-        .expect("hash test password");
-
     sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, $2)")
         .bind(profile_id)
         .bind(format!("{display_name}'s profile"))
         .execute(pool)
         .await
         .expect("create test profile");
+    create_user_in_profile_with_password(
+        pool,
+        state,
+        profile_id,
+        email,
+        display_name,
+        password,
+        role,
+    )
+    .await
+}
+
+async fn create_user_in_profile_with_password(
+    pool: &PgPool,
+    state: &AppState,
+    profile_id: Uuid,
+    email: &str,
+    display_name: &str,
+    password: &str,
+    role: &str,
+) -> TestUser {
+    let user_id = Uuid::now_v7();
+    let password_hash = state
+        .passwords
+        .hash(password)
+        .await
+        .expect("hash test password");
 
     sqlx::query(
         "INSERT INTO users (id, email, display_name, password_hash, role, primary_profile_id) \
@@ -461,6 +481,163 @@ async fn disabled_user_cannot_login_after_disable() {
         .execute(&pool)
         .await
         .expect("cleanup profile");
+}
+
+#[tokio::test]
+async fn admin_and_owner_rotation_is_limited_to_their_profile() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!(
+            "GOBROWSE_TEST_DATABASE_URL is unset; skipping session rotation integration test"
+        );
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("create app state");
+    let app = gobrowse_server::router(state.clone());
+
+    let admin = create_user_with_password(
+        &pool,
+        &state,
+        &format!("admin-{}@example.test", Uuid::now_v7().simple()),
+        "Profile Admin",
+        "long-enough-password",
+        "ADMIN",
+    )
+    .await;
+    let owner = create_user_in_profile_with_password(
+        &pool,
+        &state,
+        admin.profile_id,
+        &format!("owner-{}@example.test", Uuid::now_v7().simple()),
+        "Profile Owner",
+        "long-enough-password",
+        "OWNER",
+    )
+    .await;
+    let same_profile_target = create_user_in_profile_with_password(
+        &pool,
+        &state,
+        admin.profile_id,
+        &format!("same-{}@example.test", Uuid::now_v7().simple()),
+        "Same Profile Target",
+        "long-enough-password",
+        "MEMBER",
+    )
+    .await;
+    let cross_profile_target = create_user_with_password(
+        &pool,
+        &state,
+        &format!("cross-{}@example.test", Uuid::now_v7().simple()),
+        "Cross Profile Target",
+        "long-enough-password",
+        "MEMBER",
+    )
+    .await;
+
+    let admin_cookie = create_session(&pool, admin.user_id, 1).await;
+    let owner_cookie = create_session(&pool, owner.user_id, 1).await;
+    let same_profile_cookie = create_session(&pool, same_profile_target.user_id, 1).await;
+    let cross_profile_cookie = create_session(&pool, cross_profile_target.user_id, 1).await;
+
+    let (status, body) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/auth/rotate",
+        Some(serde_json::json!({"user_id": cross_profile_target.user_id})),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "admin must not rotate a cross-profile user: {body}"
+    );
+
+    let (status, body) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/auth/rotate",
+        Some(serde_json::json!({"user_id": cross_profile_target.user_id})),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "owner must not have an otherwise unsupported global rotation capability: {body}"
+    );
+
+    let (status, body) = request_json(
+        &app,
+        Method::GET,
+        "/api/v1/auth/me",
+        None,
+        Some(&cross_profile_cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "cross-profile target session must remain valid: {body}"
+    );
+
+    let (status, body) = request_json(
+        &app,
+        Method::POST,
+        "/api/v1/auth/rotate",
+        Some(serde_json::json!({"user_id": same_profile_target.user_id})),
+        Some(&admin_cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "admin should rotate a same-profile user: {body}"
+    );
+
+    let (status, body) = request_json(
+        &app,
+        Method::GET,
+        "/api/v1/auth/me",
+        None,
+        Some(&same_profile_cookie),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "same-profile target session must be invalidated: {body}"
+    );
+
+    sqlx::query("DELETE FROM sessions WHERE user_id = ANY($1)")
+        .bind(vec![
+            admin.user_id,
+            owner.user_id,
+            same_profile_target.user_id,
+            cross_profile_target.user_id,
+        ])
+        .execute(&pool)
+        .await
+        .expect("cleanup sessions");
+    sqlx::query("DELETE FROM users WHERE id = ANY($1)")
+        .bind(vec![
+            admin.user_id,
+            owner.user_id,
+            same_profile_target.user_id,
+            cross_profile_target.user_id,
+        ])
+        .execute(&pool)
+        .await
+        .expect("cleanup users");
+    sqlx::query("DELETE FROM profiles WHERE id = ANY($1)")
+        .bind(vec![admin.profile_id, cross_profile_target.profile_id])
+        .execute(&pool)
+        .await
+        .expect("cleanup profiles");
 }
 
 #[tokio::test]

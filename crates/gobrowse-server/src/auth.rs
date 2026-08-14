@@ -340,14 +340,18 @@ pub async fn rotate_sessions(
     if user.id != input.user_id && !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
         return Err(AppError::Forbidden);
     }
+    let mut tx = state.pool.begin().await?;
     let target_row = sqlx::query(
-        "SELECT id, primary_profile_id FROM users WHERE id = $1 AND disabled_at IS NULL",
+        "SELECT id, primary_profile_id FROM users WHERE id = $1 AND disabled_at IS NULL FOR UPDATE",
     )
     .bind(input.user_id)
-    .fetch_optional(&state.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(AppError::NotFound)?;
-    let mut tx = state.pool.begin().await?;
+    let target_profile_id: Uuid = target_row.get("primary_profile_id");
+    if user.id != input.user_id && user.profile_id != target_profile_id {
+        return Err(AppError::Forbidden);
+    }
     sqlx::query("UPDATE users SET auth_epoch = auth_epoch + 1 WHERE id = $1")
         .bind(input.user_id)
         .execute(&mut *tx)
@@ -355,7 +359,7 @@ pub async fn rotate_sessions(
     audit(
         &mut tx,
         Some(user.id),
-        Some(target_row.get("primary_profile_id")),
+        Some(target_profile_id),
         "auth.sessions_rotated",
         "user",
         Some(input.user_id.to_string()),
