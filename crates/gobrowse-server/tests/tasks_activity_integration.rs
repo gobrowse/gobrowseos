@@ -101,20 +101,72 @@ async fn tasks_and_activity_are_durable_and_workspace_scoped() {
         Method::POST,
         &format!("/api/v1/workspaces/{workspace_id}/activity"),
         &viewer_cookie,
-        Some(json!({"kind":"FILES_CHANGED","task_id":task_id,"payload":{}})),
+        Some(json!({"kind":"HUMAN_NOTE","task_id":task_id,"payload":{}})),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{forbidden_activity}");
+
+    for reserved_kind in [
+        "TASK_CREATED",
+        "TASK_ASSIGNED",
+        "AGENT_STARTED",
+        "AGENT_STOPPED",
+        "WORKTREE_CREATED",
+        "FILES_CHANGED",
+        "COMMIT_CREATED",
+        "TEST_STARTED",
+        "TEST_COMPLETED",
+        "BLOCKED",
+        "WAITING",
+        "MERGE_REQUESTED",
+        "MERGED",
+        "SKILL_CREATED",
+        "SKILL_UPDATED",
+        "BOOK_CREATED",
+        "BOOK_UPDATED",
+        "TASK_STATE_CHANGED",
+        "TASK_UPDATED",
+    ] {
+        let (status, response) = request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/workspaces/{workspace_id}/activity"),
+            &owner_cookie,
+            Some(json!({"kind":reserved_kind,"task_id":task_id,"payload":{}})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{reserved_kind}: {response}"
+        );
+    }
+    let (status, forged_note) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/workspaces/{workspace_id}/activity"),
+        &owner_cookie,
+        Some(json!({
+            "kind":"HUMAN_NOTE",
+            "task_id":task_id,
+            "agent_id":Uuid::now_v7(),
+            "payload":{}
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{forged_note}");
 
     let (status, activity) = request_json(
         &app,
         Method::POST,
         &format!("/api/v1/workspaces/{workspace_id}/activity"),
         &owner_cookie,
-        Some(json!({"kind":"FILES_CHANGED","task_id":task_id,"payload":{"path":"src/lib.rs"}})),
+        Some(json!({"kind":"HUMAN_NOTE","task_id":task_id,"payload":{"path":"src/lib.rs"}})),
     )
     .await;
     assert_eq!(status, StatusCode::CREATED, "{activity}");
+    assert_eq!(activity["actor_user_id"], owner_id.to_string());
+    assert_eq!(activity["agent_id"], Value::Null);
     let activity_id = activity["id"].as_i64().expect("activity id");
 
     let (status, invalid_transition) = request_json(
@@ -195,6 +247,12 @@ async fn task_activity_constraints_reject_cross_workspace_and_mutation_sql() {
         .await;
     assert!(result.is_err(), "cross-workspace parent must be rejected");
 
+    let result = sqlx::query("UPDATE tasks SET parent_task_id=$1 WHERE id=$1")
+        .bind(task_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "self-parent task must be rejected");
+
     let result = sqlx::query("UPDATE tasks SET assigned_agent_id=$1 WHERE id=$2")
         .bind(foreign_agent_id)
         .bind(task_id)
@@ -211,6 +269,12 @@ async fn task_activity_constraints_reject_cross_workspace_and_mutation_sql() {
         result.is_err(),
         "cross-workspace parent agent must be rejected"
     );
+
+    let result = sqlx::query("UPDATE agents SET parent_agent_id=$1 WHERE id=$1")
+        .bind(agent_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "self-parent agent must be rejected");
 
     let result = sqlx::query(
         "INSERT INTO task_dependencies (workspace_id,task_id,dependency_task_id,ordinal) VALUES ($1,$2,$3,0)",
@@ -275,6 +339,30 @@ async fn task_activity_constraints_reject_cross_workspace_and_mutation_sql() {
     assert!(result.is_err(), "activity deletes must be rejected");
     let result = sqlx::query("TRUNCATE activity_events").execute(&pool).await;
     assert!(result.is_err(), "activity truncation must be rejected");
+
+    let quarantine_id: i64 = sqlx::query_scalar(
+        "INSERT INTO task_integrity_quarantine (source_table,source_id,workspace_id,link_type,reason) \
+         VALUES ('tasks',$1,$2,'test','regression') RETURNING id",
+    )
+    .bind(task_id.to_string())
+    .bind(workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("insert quarantine evidence");
+    let result = sqlx::query("UPDATE task_integrity_quarantine SET reason='tampered' WHERE id=$1")
+        .bind(quarantine_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "quarantine updates must be rejected");
+    let result = sqlx::query("DELETE FROM task_integrity_quarantine WHERE id=$1")
+        .bind(quarantine_id)
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "quarantine deletes must be rejected");
+    let result = sqlx::query("TRUNCATE task_integrity_quarantine")
+        .execute(&pool)
+        .await;
+    assert!(result.is_err(), "quarantine truncation must be rejected");
 
     let result = sqlx::query(
         "INSERT INTO activity_events (workspace_id,task_id,kind,payload) VALUES ($1,$2,'FILES_CHANGED','{}')",
@@ -362,6 +450,97 @@ async fn activity_cursor_lock_orders_delayed_commits() {
         replayed, 1,
         "replay must not skip the delayed second commit"
     );
+}
+
+#[tokio::test]
+async fn revoked_editor_cannot_commit_task_creation_race() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping revoked-editor race test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to test PostgreSQL");
+    db::migrate(&pool).await.expect("apply test migrations");
+
+    let profile_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'revocation race profile')")
+        .bind(profile_id)
+        .execute(&pool)
+        .await
+        .expect("create race profile");
+    let (owner_id, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (editor_id, editor_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let workspace_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO workspaces (id,profile_id,title,created_by_user_id) VALUES ($1,$2,'Race',$3)",
+    )
+    .bind(workspace_id)
+    .bind(profile_id)
+    .bind(owner_id)
+    .execute(&pool)
+    .await
+    .expect("create race workspace");
+    sqlx::query(
+        "INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'OWNER'),($1,$3,'EDITOR')",
+    )
+    .bind(workspace_id)
+    .bind(owner_id)
+    .bind(editor_id)
+    .execute(&pool)
+    .await
+    .expect("create race memberships");
+
+    // Hold the membership row lock while the editor request enters its write
+    // transaction.  A pre-transaction authorization check would observe the
+    // old membership and still commit after this delete.
+    let mut revoke = pool.begin().await.expect("begin revocation transaction");
+    sqlx::query(
+        "SELECT access FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE",
+    )
+    .bind(workspace_id)
+    .bind(editor_id)
+    .fetch_one(&mut *revoke)
+    .await
+    .expect("lock editor membership");
+
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("create app state");
+    let app = router(state);
+    let task_path = format!("/api/v1/workspaces/{workspace_id}/tasks");
+    let request = tokio::spawn(async move {
+        request_json(
+            &app,
+            Method::POST,
+            &task_path,
+            &editor_cookie,
+            Some(json!({"title":"must not commit"})),
+        )
+        .await
+    });
+    tokio::task::yield_now().await;
+    sqlx::query("DELETE FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2")
+        .bind(workspace_id)
+        .bind(editor_id)
+        .execute(&mut *revoke)
+        .await
+        .expect("revoke editor");
+    revoke.commit().await.expect("commit revocation");
+
+    let (status, response) = request.await.expect("join editor request");
+    assert_ne!(
+        status,
+        StatusCode::CREATED,
+        "revoked editor committed: {response}"
+    );
+    let task_count: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks WHERE workspace_id=$1")
+        .bind(workspace_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count race tasks");
+    assert_eq!(task_count, 0, "revoked editor write must be rolled back");
 }
 
 async fn integrity_fixture(pool: &PgPool) -> (Uuid, Uuid, Uuid, Uuid, Uuid, Uuid) {

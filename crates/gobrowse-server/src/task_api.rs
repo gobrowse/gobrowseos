@@ -20,29 +20,7 @@ use crate::{
 
 const MAX_ACTIVITY_PAYLOAD_CHARS: usize = 100_000;
 const MAX_DEPENDENCIES: usize = 200;
-const ACTIVITY_KINDS: &[&str] = &[
-    "TASK_CREATED",
-    "TASK_ASSIGNED",
-    "AGENT_STARTED",
-    "AGENT_STOPPED",
-    "WORKTREE_CREATED",
-    "FILES_CHANGED",
-    "COMMIT_CREATED",
-    "TEST_STARTED",
-    "TEST_COMPLETED",
-    "BLOCKED",
-    "WAITING",
-    "MERGE_REQUESTED",
-    "MERGED",
-    "SKILL_CREATED",
-    "SKILL_UPDATED",
-    "BOOK_CREATED",
-    "BOOK_UPDATED",
-    // This is the server's task projection event; the core enum contains
-    // domain events emitted by agents, while task state is persisted here.
-    "TASK_STATE_CHANGED",
-    "TASK_UPDATED",
-];
+const HUMAN_NOTE_KIND: &str = "HUMAN_NOTE";
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTaskRequest {
@@ -90,6 +68,8 @@ pub struct TaskResponse {
 pub struct CreateActivityRequest {
     pub kind: String,
     pub task_id: Option<Uuid>,
+    // Kept in the wire type so attempts to forge an agent attribution are
+    // rejected rather than silently ignored.
     pub agent_id: Option<Uuid>,
     #[serde(default)]
     pub payload: Value,
@@ -107,6 +87,7 @@ pub struct ActivityResponse {
     pub workspace_id: Uuid,
     pub task_id: Option<Uuid>,
     pub agent_id: Option<Uuid>,
+    pub actor_user_id: Option<Uuid>,
     pub kind: String,
     pub payload: Value,
     pub created_at: OffsetDateTime,
@@ -144,15 +125,15 @@ pub async fn create_task(
 ) -> Result<(StatusCode, Json<TaskResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
     require_writer(&user)?;
-    authorize_workspace(&state, &user, workspace_id, true).await?;
     validate_task_input(&input.title, &input.description, &input.dependencies)?;
     let task_state = input.state.unwrap_or(TaskState::Backlog);
     let id = Uuid::now_v7();
     let now = OffsetDateTime::now_utc();
     let mut tx = state.pool.begin().await?;
-    // Lock before task/reference row locks or writes; append_activity takes
-    // the same lock again before allocating the ledger cursor.
-    lock_activity_workspace(&mut tx, workspace_id).await?;
+    // Authorization is repeated after the workspace lock.  Membership
+    // revocation takes the membership row lock, so the decision is serialized
+    // with the commit of this write transaction.
+    authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
     validate_task_references_in_transaction(
         &mut tx,
         workspace_id,
@@ -192,6 +173,7 @@ pub async fn create_task(
         workspace_id,
         Some(id),
         input.assigned_agent_id,
+        None,
         "TASK_CREATED",
         json!({"state": task_state_name(task_state), "title": input.title.trim()}),
     )
@@ -292,6 +274,7 @@ pub async fn update_task(
             workspace_id,
             Some(id),
             next_agent,
+            None,
             "TASK_STATE_CHANGED",
             json!({"from": task_state_name(old_state), "to": task_state_name(next_state)}),
         )
@@ -303,6 +286,7 @@ pub async fn update_task(
             workspace_id,
             Some(id),
             next_agent,
+            None,
             "TASK_ASSIGNED",
             json!({"assigned_agent_id": next_agent}),
         )
@@ -314,6 +298,7 @@ pub async fn update_task(
             workspace_id,
             Some(id),
             next_agent,
+            None,
             "TASK_UPDATED",
             json!({"title_changed": input.title.is_some(), "description_changed": input.description.is_some()}),
         )
@@ -348,7 +333,7 @@ pub async fn list_activity(
         ));
     }
     let rows = sqlx::query(
-        "SELECT id,workspace_id,task_id,agent_id,kind,payload,created_at FROM activity_events \
+        "SELECT id,workspace_id,task_id,agent_id,actor_user_id,kind,payload,created_at FROM activity_events \
          WHERE workspace_id=$1 AND id>$2 ORDER BY id LIMIT $3",
     )
     .bind(workspace_id)
@@ -367,25 +352,23 @@ pub async fn create_activity(
 ) -> Result<(StatusCode, Json<ActivityResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
     require_writer(&user)?;
-    authorize_workspace(&state, &user, workspace_id, true).await?;
     validate_activity(&input.kind, &input.payload)?;
+    if input.agent_id.is_some() {
+        return Err(AppError::Validation(
+            "human notes cannot attribute activity to an agent".into(),
+        ));
+    }
     let mut tx = state.pool.begin().await?;
-    // Keep the workspace lock before reference checks and the ledger insert.
-    lock_activity_workspace(&mut tx, workspace_id).await?;
-    validate_task_references_in_transaction(
-        &mut tx,
-        workspace_id,
-        input.task_id,
-        input.agent_id,
-        &[],
-    )
-    .await?;
+    authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
+    validate_task_references_in_transaction(&mut tx, workspace_id, input.task_id, None, &[])
+        .await?;
     let event = append_activity(
         &mut tx,
         workspace_id,
         input.task_id,
-        input.agent_id,
-        &input.kind,
+        None,
+        Some(user.id),
+        HUMAN_NOTE_KIND,
         input.payload,
     )
     .await?;
@@ -419,6 +402,7 @@ async fn append_activity(
     workspace_id: Uuid,
     task_id: Option<Uuid>,
     agent_id: Option<Uuid>,
+    actor_user_id: Option<Uuid>,
     kind: &str,
     payload: Value,
 ) -> Result<ActivityResponse, AppError> {
@@ -426,12 +410,13 @@ async fn append_activity(
     // the workspace lock immediately before the INSERT that allocates a cursor.
     lock_activity_workspace(tx, workspace_id).await?;
     let row = sqlx::query(
-        "INSERT INTO activity_events (workspace_id,task_id,agent_id,kind,payload) \
-         VALUES ($1,$2,$3,$4,$5) RETURNING id,workspace_id,task_id,agent_id,kind,payload,created_at",
+        "INSERT INTO activity_events (workspace_id,task_id,agent_id,actor_user_id,kind,payload) \
+         VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,workspace_id,task_id,agent_id,actor_user_id,kind,payload,created_at",
     )
     .bind(workspace_id)
     .bind(task_id)
     .bind(agent_id)
+    .bind(actor_user_id)
     .bind(kind)
     .bind(payload)
     .fetch_one(&mut **tx)
@@ -528,6 +513,43 @@ async fn authorize_workspace(
     Ok(())
 }
 
+/// Authorize a write while holding the workspace advisory lock.  The
+/// workspace row and then the membership row are locked in that order.  A
+/// concurrent membership revocation therefore either wins before this check,
+/// or waits until this transaction commits.
+async fn authorize_workspace_in_transaction(
+    tx: &mut Transaction<'_, Postgres>,
+    user: &crate::auth::AuthenticatedUser,
+    workspace_id: Uuid,
+    require_write: bool,
+) -> Result<(), AppError> {
+    lock_activity_workspace(tx, workspace_id).await?;
+    let workspace: Option<Uuid> =
+        sqlx::query_scalar("SELECT id FROM workspaces WHERE id=$1 AND profile_id=$2 FOR UPDATE")
+            .bind(workspace_id)
+            .bind(user.profile_id)
+            .fetch_optional(&mut **tx)
+            .await?;
+    if workspace.is_none() {
+        return Err(AppError::NotFound);
+    }
+    if !require_write || matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Ok(());
+    }
+    let access: Option<String> = sqlx::query_scalar(
+        "SELECT access FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE",
+    )
+    .bind(workspace_id)
+    .bind(user.id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if matches!(access.as_deref(), Some("OWNER" | "EDITOR")) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
+}
+
 async fn authorized_task(
     state: &AppState,
     user: &crate::auth::AuthenticatedUser,
@@ -547,21 +569,17 @@ async fn authorized_task_in_transaction(
     require_write: bool,
 ) -> Result<sqlx::postgres::PgRow, AppError> {
     if require_write {
-        // Establish the documented workspace-lock-before-row-lock order.  The
-        // authorization predicate is repeated below after the lock is held.
+        // Find the workspace without taking a resource lock, then acquire the
+        // workspace lock and reauthorize before locking the task row.
         let workspace_id: Uuid = sqlx::query_scalar(
-            "SELECT task.workspace_id FROM tasks task JOIN workspaces workspace ON workspace.id=task.workspace_id \
-             WHERE task.id=$1 AND workspace.profile_id=$2 \
-             AND ($4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=task.workspace_id AND member.user_id=$3 AND member.access IN ('OWNER','EDITOR')))",
+            "SELECT task.workspace_id FROM tasks task JOIN workspaces workspace ON workspace.id=task.workspace_id WHERE task.id=$1 AND workspace.profile_id=$2",
         )
         .bind(id)
         .bind(user.profile_id)
-        .bind(user.id)
-        .bind(&user.role)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or(AppError::NotFound)?;
-        lock_activity_workspace(tx, workspace_id).await?;
+        authorize_workspace_in_transaction(tx, user, workspace_id, true).await?;
     }
     let query = if require_write {
         "SELECT task.id,task.workspace_id,task.parent_task_id,task.title,task.description,task.state,task.assigned_agent_id, \
@@ -607,6 +625,7 @@ fn row_to_activity(row: &sqlx::postgres::PgRow) -> ActivityResponse {
         workspace_id: row.get("workspace_id"),
         task_id: row.get("task_id"),
         agent_id: row.get("agent_id"),
+        actor_user_id: row.get("actor_user_id"),
         kind: row.get("kind"),
         payload: row.get("payload"),
         created_at: row.get("created_at"),
@@ -653,8 +672,10 @@ fn validate_task_text(title: &str, description: &str) -> Result<(), AppError> {
 }
 
 fn validate_activity(kind: &str, payload: &Value) -> Result<(), AppError> {
-    if !ACTIVITY_KINDS.contains(&kind) {
-        return Err(AppError::Validation("unknown activity kind".into()));
+    if kind != HUMAN_NOTE_KIND {
+        return Err(AppError::Validation(
+            "only HUMAN_NOTE activity creation is supported".into(),
+        ));
     }
     if payload.to_string().chars().count() > MAX_ACTIVITY_PAYLOAD_CHARS {
         return Err(AppError::Validation("activity payload is too large".into()));
@@ -722,7 +743,8 @@ mod tests {
     #[test]
     fn activity_validation_rejects_unknown_kinds() {
         assert!(validate_activity("NOT_A_KIND", &json!({})).is_err());
-        assert!(validate_activity("TASK_CREATED", &json!({})).is_ok());
+        assert!(validate_activity("HUMAN_NOTE", &json!({})).is_ok());
+        assert!(validate_activity("TASK_CREATED", &json!({})).is_err());
     }
 
     #[test]

@@ -184,11 +184,11 @@ WHERE event.agent_id IS NOT NULL
 UPDATE tasks task
 SET parent_task_id = NULL
 WHERE task.parent_task_id IS NOT NULL
-  AND NOT EXISTS (
+  AND (task.parent_task_id = task.id OR NOT EXISTS (
       SELECT 1 FROM tasks parent
       WHERE parent.id = task.parent_task_id
         AND parent.workspace_id = task.workspace_id
-  );
+  ));
 UPDATE tasks task
 SET assigned_agent_id = NULL
 WHERE task.assigned_agent_id IS NOT NULL
@@ -200,11 +200,11 @@ WHERE task.assigned_agent_id IS NOT NULL
 UPDATE agents agent
 SET parent_agent_id = NULL
 WHERE agent.parent_agent_id IS NOT NULL
-  AND NOT EXISTS (
+  AND (agent.parent_agent_id = agent.id OR NOT EXISTS (
       SELECT 1 FROM agents parent
       WHERE parent.id = agent.parent_agent_id
         AND parent.workspace_id = agent.workspace_id
-  );
+  ));
 UPDATE activity_events event
 SET task_id = NULL
 WHERE event.task_id IS NOT NULL
@@ -243,6 +243,8 @@ ALTER TABLE agents ADD CONSTRAINT agents_parent_same_workspace_fk
     FOREIGN KEY (workspace_id, parent_agent_id)
     REFERENCES agents (workspace_id, id)
     ON DELETE SET NULL (parent_agent_id);
+ALTER TABLE agents ADD CONSTRAINT agents_parent_not_self_check
+    CHECK (parent_agent_id IS NULL OR parent_agent_id <> id);
 
 -- Activity references are RESTRICT, not SET NULL: immutable ledger rows must
 -- retain their subject and a parent cannot be deleted out from under history.

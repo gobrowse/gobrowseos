@@ -26,6 +26,7 @@ use gobrowse_server::{
 };
 use secrecy::SecretString;
 use sqlx::{PgPool, Row};
+use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -163,6 +164,45 @@ async fn cleanup(pool: &PgPool, webhook_id: Uuid, profile_id: Uuid) {
         .execute(pool)
         .await
         .ok();
+}
+
+#[tokio::test]
+async fn webhook_delivery_rejects_half_leases_for_every_status() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let (webhook_id, profile_id, _secret) = insert_webhook(&pool).await;
+    for (delivery_id, status, token, expires_at) in [
+        ("queued-token", "queued", Some(Uuid::now_v7()), None),
+        (
+            "queued-expiry",
+            "queued",
+            None,
+            Some(OffsetDateTime::now_utc()),
+        ),
+        ("running-token", "running", Some(Uuid::now_v7()), None),
+    ] {
+        let result = sqlx::query(
+            "INSERT INTO webhook_deliveries
+             (webhook_id,delivery_id,status,next_attempt_at,lease_token,lease_expires_at)
+             VALUES ($1,$2,$3,now(),$4,$5)",
+        )
+        .bind(webhook_id)
+        .bind(delivery_id)
+        .bind(status)
+        .bind(token)
+        .bind(expires_at)
+        .execute(&pool)
+        .await;
+        assert!(
+            result.is_err(),
+            "half lease {status}/{delivery_id} was accepted"
+        );
+    }
+    cleanup(&pool, webhook_id, profile_id).await;
 }
 
 // ────────────────────────────────────────────────────────────────────
