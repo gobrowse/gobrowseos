@@ -13,6 +13,7 @@ pub mod library_api;
 pub mod model_api;
 pub mod realtime;
 pub mod run_api;
+pub mod skills_api;
 pub mod task_api;
 pub mod vault;
 pub mod vault_api;
@@ -169,6 +170,36 @@ pub fn router(state: AppState) -> Router {
             "/library/books/{id}/history",
             get(library_api::book_history),
         )
+        .route(
+            "/skills",
+            get(skills_api::list_skills).post(skills_api::create_skill),
+        )
+        .route(
+            "/skills/{skill_id}/revisions",
+            get(skills_api::history).post(skills_api::create_revision),
+        )
+        .route("/skills/{skill_id}/history", get(skills_api::history))
+        .route(
+            "/skills/{skill_id}/propose",
+            post(skills_api::propose_revision),
+        )
+        .route(
+            "/skills/{skill_id}/revisions/{revision}/evaluate",
+            post(skills_api::evaluate),
+        )
+        .route(
+            "/skills/{skill_id}/evaluate",
+            post(skills_api::evaluate_skill),
+        )
+        .route(
+            "/skills/{skill_id}/revisions/{revision}/promote",
+            post(skills_api::promote),
+        )
+        .route(
+            "/skills/{skill_id}/promote",
+            post(skills_api::promote_skill),
+        )
+        .route("/skills/{skill_id}/rollback", post(skills_api::rollback))
         .route("/autobiography", get(autobiography_api::get_autobiography))
         .route(
             "/autobiography/policy",
