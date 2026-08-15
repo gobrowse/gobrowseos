@@ -38,6 +38,8 @@ pub mod lifecycle;
 pub mod model;
 #[path = "mcp/server.rs"]
 pub mod server;
+#[path = "mcp/stdio.rs"]
+pub mod stdio;
 #[path = "mcp/validation.rs"]
 pub mod validation;
 #[path = "mcp/wire.rs"]
