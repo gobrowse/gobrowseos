@@ -95,6 +95,18 @@ pub fn router(state: AppState) -> Router {
             get(worktree_api::list_worktrees).post(worktree_api::create_worktree),
         )
         .route(
+            "/workspaces/{workspace_id}/tasks",
+            get(task_api::list_tasks).post(task_api::create_task),
+        )
+        .route(
+            "/workspaces/{workspace_id}/activity",
+            get(task_api::list_activity).post(task_api::create_activity),
+        )
+        .route(
+            "/tasks/{id}",
+            get(task_api::get_task).patch(task_api::update_task),
+        )
+        .route(
             "/worktrees/{id}",
             get(worktree_api::get_worktree)
                 .patch(worktree_api::update_worktree)
