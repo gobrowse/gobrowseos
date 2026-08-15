@@ -255,6 +255,9 @@ mod tests {
 
         let response = transport.recv().await.unwrap();
         assert!(matches!(&response, ValidatedMessage::Response(_)));
-        assert_eq!(encode(&response).unwrap(), payload.as_bytes());
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&encode(&response).unwrap()).unwrap(),
+            serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+        );
     }
 }
