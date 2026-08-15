@@ -25,13 +25,23 @@ pub enum McpProtocolEra {
 }
 
 /// Protocol versions implemented by Gobrowse, in local preference order.
-pub const SUPPORTED_PROTOCOL_ERAS: [McpProtocolEra; 5] = [
+pub const SUPPORTED_PROTOCOL_ERAS: [McpProtocolEra; 2] = [
     McpProtocolEra::Modern20260728,
     McpProtocolEra::Legacy20251125,
-    McpProtocolEra::Legacy20250618,
-    McpProtocolEra::Legacy20250326,
-    McpProtocolEra::Legacy20241105,
 ];
+
+#[path = "mcp/capabilities.rs"]
+pub mod capabilities;
+#[path = "mcp/lifecycle.rs"]
+pub mod lifecycle;
+#[path = "mcp/model.rs"]
+pub mod model;
+#[path = "mcp/server.rs"]
+pub mod server;
+#[path = "mcp/validation.rs"]
+pub mod validation;
+#[path = "mcp/wire.rs"]
+pub mod wire;
 
 impl McpProtocolEra {
     /// Return the exact date-based version identifier used on the wire.
@@ -759,9 +769,6 @@ mod tests {
         let cases = [
             (McpProtocolEra::Modern20260728, "2026-07-28"),
             (McpProtocolEra::Legacy20251125, "2025-11-25"),
-            (McpProtocolEra::Legacy20250618, "2025-06-18"),
-            (McpProtocolEra::Legacy20250326, "2025-03-26"),
-            (McpProtocolEra::Legacy20241105, "2024-11-05"),
         ];
 
         for (era, wire_version) in cases {
@@ -798,11 +805,11 @@ mod tests {
 
     #[test]
     fn protocol_selection_can_dispatch_to_a_legacy_adapter() {
-        let server_supported = ["unknown-future-version", "2025-06-18", "2025-03-26"];
+        let server_supported = ["unknown-future-version", "2025-11-25"];
 
         assert_eq!(
             select_protocol_version(&server_supported).unwrap(),
-            McpProtocolEra::Legacy20250618
+            McpProtocolEra::Legacy20251125
         );
     }
 
