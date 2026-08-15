@@ -524,6 +524,10 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
         || (segments[0] & 0xfe00) == 0xfc00
         || (segments[0] & 0xffc0) == 0xfe80
         || (segments[0] & 0xffc0) == 0xfec0
+        || (segments[..6].iter().all(|segment| *segment == 0))
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b)
+        || (segments[0] == 0x2001 && segments[1] == 0)
+        || segments[0] == 0x2002
         || (segments[0] == 0x2001 && segments[1] == 0x0db8))
 }
 
@@ -627,6 +631,12 @@ mod tests {
             "fd00::1",
             "::ffff:127.0.0.1",
             "::ffff:1.1.1.1",
+            "::1.2.3.4",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b::7f00:1",
+            "64:ff9b:1::a9fe:a9fe",
+            "2001::1",
+            "2002:c000:0204::1",
         ] {
             assert!(
                 !is_public_destination(address.parse().unwrap()),

@@ -1,11 +1,13 @@
 //! Validated, pinned transport for outbound webhook attempts.
 //!
-//! This module deliberately keeps URL policy separate from delivery persistence:
-//! every attempt resolves and classifies its target immediately before opening a
-//! connection, and the approved addresses are pinned into the request client.
+//! Every attempt resolves and classifies its target immediately before opening
+//! a connection, and the approved addresses are pinned into that connection.
 
 use std::{
+    future::Future,
     net::{IpAddr, SocketAddr},
+    pin::Pin,
+    sync::Arc,
     time::Duration,
 };
 
@@ -20,6 +22,11 @@ const RESOLUTION_TIMEOUT: Duration = Duration::from_secs(2);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
+pub type ResolverFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Vec<SocketAddr>, TargetPolicyError>> + Send + 'a>>;
+pub type TransportFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<TransportResponse, TransportError>> + Send + 'a>>;
+
 fn has_userinfo(raw: &str, url: &Url) -> bool {
     if url.username() != "" || url.password().is_some() {
         return true;
@@ -30,7 +37,7 @@ fn has_userinfo(raw: &str, url: &Url) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TargetPolicyError {
+pub enum TargetPolicyError {
     InvalidUrl,
     UnsupportedScheme,
     HostRequired,
@@ -43,34 +50,125 @@ pub(crate) enum TargetPolicyError {
 }
 
 impl TargetPolicyError {
-    pub(crate) const fn code(self) -> &'static str {
-        match self {
-            Self::InvalidUrl => "target_policy_denied",
-            Self::UnsupportedScheme => "target_policy_denied",
-            Self::HostRequired => "target_policy_denied",
-            Self::UserInfoForbidden => "target_policy_denied",
-            Self::FragmentForbidden => "target_policy_denied",
-            Self::TooManyAddresses => "target_policy_denied",
-            Self::EmptyAddresses => "target_policy_denied",
-            Self::ResolutionFailed => "target_policy_denied",
-            Self::PrivateAddress => "target_policy_denied",
-        }
+    pub const fn code(self) -> &'static str {
+        "target_policy_denied"
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ValidatedOutboundTarget {
+pub struct ValidatedOutboundTarget {
     pub(crate) url: Url,
     pub(crate) host: String,
     pub(crate) addresses: Vec<SocketAddr>,
 }
 
+/// A resolver used immediately before each outbound attempt.
+pub trait OutboundResolver: Send + Sync {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolverFuture<'a>;
+}
+
+/// A transport that can send only an already validated and pinned target.
+pub trait OutboundTransport: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        target: &'a ValidatedOutboundTarget,
+        delivery_id: &'a str,
+        payload: &'a str,
+        signature: Option<&'a str>,
+    ) -> TransportFuture<'a>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportResponse {
+    pub status: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportError {
+    Timeout,
+    Connection,
+    Other,
+}
+
+impl TransportError {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Timeout => "target_timeout",
+            Self::Connection => "target_connection_failed",
+            Self::Other => "target_transport_failed",
+        }
+    }
+}
+
+/// Resolver/transport pair passed through every delivery task.
+#[derive(Clone)]
+pub struct WebhookDeliveryDeps {
+    pub resolver: Arc<dyn OutboundResolver>,
+    pub transport: Arc<dyn OutboundTransport>,
+}
+
+impl WebhookDeliveryDeps {
+    pub fn production() -> Self {
+        Self {
+            resolver: Arc::new(SystemResolver),
+            transport: Arc::new(PinnedHttpsTransport),
+        }
+    }
+}
+
+/// Tokio system resolver with a bounded lookup deadline and answer count.
+pub struct SystemResolver;
+
+impl OutboundResolver for SystemResolver {
+    fn resolve<'a>(&'a self, host: &'a str, port: u16) -> ResolverFuture<'a> {
+        Box::pin(async move {
+            let resolved = tokio::time::timeout(RESOLUTION_TIMEOUT, lookup_host((host, port)))
+                .await
+                .map_err(|_| TargetPolicyError::ResolutionFailed)?
+                .map_err(|_| TargetPolicyError::ResolutionFailed)?;
+            Ok(resolved.take(MAX_DNS_ANSWERS + 1).collect())
+        })
+    }
+}
+
+/// Reqwest transport with no proxy/redirect behavior and static address pins.
+pub struct PinnedHttpsTransport;
+
+impl OutboundTransport for PinnedHttpsTransport {
+    fn send<'a>(
+        &'a self,
+        target: &'a ValidatedOutboundTarget,
+        delivery_id: &'a str,
+        payload: &'a str,
+        signature: Option<&'a str>,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            let client = pinned_client(target).map_err(|_| TransportError::Other)?;
+            let mut request = client
+                .post(target.url.clone())
+                .header("X-Gobrowse-Delivery", delivery_id)
+                .body(payload.to_owned());
+            if let Some(signature) = signature {
+                request = request.header("X-Gobrowse-Signature", signature);
+            }
+            let response = request.send().await.map_err(|error| {
+                if error.is_timeout() {
+                    TransportError::Timeout
+                } else if error.is_connect() {
+                    TransportError::Connection
+                } else {
+                    TransportError::Other
+                }
+            })?;
+            Ok(TransportResponse {
+                status: response.status().as_u16(),
+            })
+        })
+    }
+}
+
 /// Parse and validate an outbound target against already-resolved addresses.
-///
-/// This pure entry point is used by deterministic tests and by the async DNS
-/// entry point below. Every address must be public; mixed DNS answers are
-/// rejected rather than partially accepted.
-pub(crate) fn validate_resolved_target(
+pub fn validate_resolved_target(
     raw: &str,
     addresses: &[SocketAddr],
 ) -> Result<ValidatedOutboundTarget, TargetPolicyError> {
@@ -114,7 +212,8 @@ pub(crate) fn validate_resolved_target(
 }
 
 /// Resolve and validate one target immediately before a delivery attempt.
-pub(crate) async fn resolve_target(
+pub async fn resolve_target_with<R: OutboundResolver + ?Sized>(
+    resolver: &R,
     raw: &str,
 ) -> Result<ValidatedOutboundTarget, TargetPolicyError> {
     if raw.len() > MAX_TARGET_URL_LENGTH {
@@ -139,23 +238,13 @@ pub(crate) async fn resolve_target(
     let addresses = match url.host() {
         Some(Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
         Some(Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
-        Some(Host::Domain(domain)) => {
-            let resolved = tokio::time::timeout(RESOLUTION_TIMEOUT, lookup_host((domain, port)))
-                .await
-                .map_err(|_| TargetPolicyError::ResolutionFailed)?
-                .map_err(|_| TargetPolicyError::ResolutionFailed)?;
-            let addresses: Vec<_> = resolved.take(MAX_DNS_ANSWERS + 1).collect();
-            addresses
-        }
+        Some(Host::Domain(domain)) => resolver.resolve(domain, port).await?,
         None => return Err(TargetPolicyError::HostRequired),
     };
     validate_resolved_target(raw, &addresses)
 }
 
-/// Build a no-proxy, no-redirect client pinned to this attempt's answers.
-pub(crate) fn pinned_client(
-    target: &ValidatedOutboundTarget,
-) -> Result<reqwest::Client, reqwest::Error> {
+fn pinned_client(target: &ValidatedOutboundTarget) -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
@@ -200,6 +289,8 @@ mod tests {
             "169.254.169.254:443",
             "[::1]:443",
             "[::ffff:127.0.0.1]:443",
+            "[64:ff9b::a9fe:a9fe]:443",
+            "[64:ff9b::7f00:1]:443",
         ] {
             let address = address.parse().expect("test address");
             assert!(validate_resolved_target("https://example.com/hook", &[address]).is_err());

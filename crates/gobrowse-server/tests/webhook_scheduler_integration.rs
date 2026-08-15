@@ -8,18 +8,16 @@
 
 mod common;
 
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
-use axum::{
-    Router,
-    body::Bytes,
-    http::{HeaderMap, StatusCode},
-    routing::post,
-};
 use gobrowse_server::{
     config::{
         AuthSettings, DatabaseSettings, FeatureSettings, HttpSettings, ObservabilitySettings,
         Settings, VaultSettings,
+    },
+    outbound_http::{
+        OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture, TransportResponse,
+        WebhookDeliveryDeps,
     },
     webhook_scheduler,
     webhooks::{hex_encode, hmac_sha256},
@@ -29,6 +27,73 @@ use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 use uuid::Uuid;
+
+#[derive(Clone, Debug)]
+struct RecordedRequest {
+    delivery_id: String,
+    payload: String,
+    signature: Option<String>,
+}
+
+#[derive(Clone)]
+struct FakeResolver {
+    address: SocketAddr,
+}
+
+impl OutboundResolver for FakeResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolverFuture<'a> {
+        let address = SocketAddr::new(self.address.ip(), port);
+        Box::pin(async move { Ok(vec![address]) })
+    }
+}
+
+#[derive(Clone)]
+struct FakeTransport {
+    status: u16,
+    requests: Arc<Mutex<Vec<RecordedRequest>>>,
+}
+
+impl OutboundTransport for FakeTransport {
+    fn send<'a>(
+        &'a self,
+        _target: &'a gobrowse_server::outbound_http::ValidatedOutboundTarget,
+        delivery_id: &'a str,
+        payload: &'a str,
+        signature: Option<&'a str>,
+    ) -> TransportFuture<'a> {
+        Box::pin(async move {
+            self.requests.lock().await.push(RecordedRequest {
+                delivery_id: delivery_id.to_owned(),
+                payload: payload.to_owned(),
+                signature: signature.map(str::to_owned),
+            });
+            Ok(TransportResponse {
+                status: self.status,
+            })
+        })
+    }
+}
+
+fn fake_deps(status: u16) -> (WebhookDeliveryDeps, Arc<Mutex<Vec<RecordedRequest>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    (
+        WebhookDeliveryDeps {
+            resolver: Arc::new(FakeResolver {
+                address: "1.1.1.1:443".parse().expect("public test address"),
+            }),
+            transport: Arc::new(FakeTransport {
+                status,
+                requests: requests.clone(),
+            }),
+        },
+        requests,
+    )
+}
+
+#[test]
+fn webhook_scheduler_is_disabled_by_default() {
+    assert!(!FeatureSettings::default().webhook_scheduler_enabled);
+}
 
 fn database_url() -> Option<String> {
     std::env::var("GOBROWSE_TEST_DATABASE_URL").ok()
@@ -274,39 +339,11 @@ async fn exponential_backoff_advances_next_attempt_at_on_retryable_failure() {
     let _lock = common::acquire_test_lock(&database_url).await;
     let pool = test_pool().await.expect("test pool after lock");
 
-    // Spin up a mock server that always returns 503 (retryable).
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock server");
-    let addr = listener.local_addr().expect("mock address");
-    let target_url = format!("http://{addr}/deliver");
-
-    // Track the signature header received.
-    let received_headers: Arc<Mutex<Option<HeaderMap>>> = Arc::new(Mutex::new(None));
-    let captured = received_headers.clone();
-
-    let server = tokio::spawn(async move {
-        let app = Router::new().route(
-            "/deliver",
-            post(move |headers: HeaderMap, _body: Bytes| async move {
-                let mut guard = captured.lock().await;
-                *guard = Some(headers);
-                (StatusCode::SERVICE_UNAVAILABLE, "down for maintenance")
-            }),
-        );
-        axum::serve(listener, app).await.expect("mock server");
-    });
+    let target_url = "https://hooks.example.test/deliver".to_owned();
 
     let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
     let delivery_id = format!("backoff-test-{}", Uuid::now_v7());
     insert_queued_delivery(&pool, webhook_id, &delivery_id, &target_url, &secret).await;
-
-    // Create a reqwest client.
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("reqwest client");
 
     // Claim and deliver (should get 503, retryable).
     let owner = format!("test-{}", Uuid::now_v7());
@@ -319,7 +356,8 @@ async fn exponential_backoff_advances_next_attempt_at_on_retryable_failure() {
         .expect("must claim own delivery");
     assert_eq!(claimed.attempts, 1, "attempts incremented by claim");
 
-    let outcome = webhook_scheduler::deliver_one(&http, claimed).await;
+    let (deps, requests) = fake_deps(503);
+    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
     assert!(!outcome.success, "503 should not be success");
     assert!(outcome.retryable, "503 should be retryable");
 
@@ -355,17 +393,14 @@ async fn exponential_backoff_advances_next_attempt_at_on_retryable_failure() {
         "next_attempt_at should be ~2s in the future, got {diff}"
     );
 
-    // Verify the signature was sent.
-    let headers_guard = received_headers.lock().await;
-    assert!(
-        headers_guard.is_some(),
-        "mock server should have received headers"
+    let requests = requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        1,
+        "fake transport should receive one request"
     );
-    let sig_header = headers_guard
-        .as_ref()
-        .and_then(|h| h.get("x-gobrowse-signature"))
-        .and_then(|v| v.to_str().ok())
-        .expect("X-Gobrowse-Signature header present");
+    let request = &requests[0];
+    let sig_header = request.signature.as_deref().expect("signature");
 
     let expected_payload = format!("{target_url}\n{delivery_id}");
     let expected_mac = hmac_sha256(&secret, expected_payload.as_bytes());
@@ -375,12 +410,67 @@ async fn exponential_backoff_advances_next_attempt_at_on_retryable_failure() {
         "outbound signature must match canonical payload"
     );
 
-    server.abort();
     cleanup(&pool, webhook_id, profile_id).await;
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 3: dead-letter after max_attempts
+// Test 3: denied targets are terminal and never transported
+
+#[tokio::test]
+async fn denied_target_is_terminal_without_transport_request() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+    let delivery_id = format!("denied-target-{}", Uuid::now_v7());
+    let target_url = "https://hooks.example.test/denied";
+    insert_queued_delivery(&pool, webhook_id, &delivery_id, target_url, &secret).await;
+    let owner = format!("test-{}", Uuid::now_v7());
+    let claimed = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("claim")
+        .into_iter()
+        .find(|delivery| delivery.delivery_id == delivery_id)
+        .expect("claim denied delivery");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let deps = WebhookDeliveryDeps {
+        resolver: Arc::new(FakeResolver {
+            address: "127.0.0.1:443".parse().expect("private test address"),
+        }),
+        transport: Arc::new(FakeTransport {
+            status: 200,
+            requests: requests.clone(),
+        }),
+    };
+    let outcome = webhook_scheduler::deliver_one_with(&deps, &claimed).await;
+    assert!(!outcome.success);
+    assert!(!outcome.retryable);
+    assert_eq!(outcome.error.as_deref(), Some("target_policy_denied"));
+    assert!(requests.lock().await.is_empty());
+    webhook_scheduler::persist_outcome(&pool, &claimed, &outcome, 5).await;
+    let row = sqlx::query(
+        "SELECT status, attempts, next_attempt_at, last_error FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read denied delivery");
+    assert_eq!(row.get::<String, _>("status"), "failed");
+    assert_eq!(row.get::<i32, _>("attempts"), 1);
+    assert!(
+        row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
+            .is_none()
+    );
+    assert_eq!(row.get::<String, _>("last_error"), "target_policy_denied");
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 4: dead-letter after max_attempts
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -392,31 +482,12 @@ async fn delivery_dead_letters_after_max_attempts() {
     let _lock = common::acquire_test_lock(&database_url).await;
     let pool = test_pool().await.expect("test pool after lock");
 
-    // Mock server returning 503.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock server");
-    let addr = listener.local_addr().expect("mock address");
-    let target_url = format!("http://{addr}/deliver");
-
-    let server = tokio::spawn(async move {
-        let app = Router::new().route(
-            "/deliver",
-            post(|| async { (StatusCode::SERVICE_UNAVAILABLE, "down") }),
-        );
-        axum::serve(listener, app).await.expect("mock server");
-    });
+    let target_url = "https://hooks.example.test/dead-letter".to_owned();
 
     let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
     let delivery_id = format!("dead-letter-test-{}", Uuid::now_v7());
     // Insert with attempts = max_attempts - 1 = 4 (so after claim, attempts=5 which >= max).
     insert_delivery_with_attempts(&pool, webhook_id, &delivery_id, &target_url, &secret, 4).await;
-
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("reqwest client");
 
     let owner = format!("test-{}", Uuid::now_v7());
     let claimed_all = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
@@ -430,7 +501,8 @@ async fn delivery_dead_letters_after_max_attempts() {
     // After claim, attempts should be 5 (4+1).
     assert_eq!(claimed.attempts, 5, "claim increments attempts from 4 to 5");
 
-    let outcome = webhook_scheduler::deliver_one(&http, claimed).await;
+    let (deps, _requests) = fake_deps(503);
+    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
     assert!(!outcome.success);
     assert!(outcome.retryable);
 
@@ -448,7 +520,6 @@ async fn delivery_dead_letters_after_max_attempts() {
     let status: String = row.get("status");
     assert_eq!(status, "dead", "max_attempts reached → status='dead'");
 
-    server.abort();
     cleanup(&pool, webhook_id, profile_id).await;
 }
 
@@ -465,27 +536,11 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
     let _lock = common::acquire_test_lock(&database_url).await;
     let pool = test_pool().await.expect("test pool after lock");
 
-    // Mock server returning 200.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock server");
-    let addr = listener.local_addr().expect("mock address");
-    let target_url = format!("http://{addr}/deliver");
-
-    let server = tokio::spawn(async move {
-        let app = Router::new().route("/deliver", post(|| async { (StatusCode::OK, "ok") }));
-        axum::serve(listener, app).await.expect("mock server");
-    });
+    let target_url = "https://hooks.example.test/success".to_owned();
 
     let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
     let delivery_id = format!("success-test-{}", Uuid::now_v7());
     insert_queued_delivery(&pool, webhook_id, &delivery_id, &target_url, &secret).await;
-
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("reqwest client");
 
     let owner = format!("test-{}", Uuid::now_v7());
     let claimed_all = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
@@ -496,7 +551,8 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
         .find(|c| c.delivery_id == delivery_id)
         .expect("must claim own delivery");
 
-    let outcome = webhook_scheduler::deliver_one(&http, claimed).await;
+    let (deps, _requests) = fake_deps(200);
+    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
     assert!(outcome.success, "200 should be success");
     assert_eq!(outcome.response_code, Some(200));
 
@@ -520,7 +576,6 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
     assert_eq!(last_code, Some(200));
     assert!(next_attempt.is_none(), "success clears next_attempt_at");
 
-    server.abort();
     cleanup(&pool, webhook_id, profile_id).await;
 }
 
@@ -537,38 +592,11 @@ async fn signature_is_validated_over_canonical_payload_at_enqueue() {
     let _lock = common::acquire_test_lock(&database_url).await;
     let pool = test_pool().await.expect("test pool after lock");
 
-    // Mock server that captures and validates the signature.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock server");
-    let addr = listener.local_addr().expect("mock address");
-    let target_url = format!("http://{addr}/deliver");
-
-    // Capture the request headers and body.
-    let captured_data: Arc<Mutex<Option<(HeaderMap, Bytes)>>> = Arc::new(Mutex::new(None));
-    let data = captured_data.clone();
-
-    let server = tokio::spawn(async move {
-        let app = Router::new().route(
-            "/deliver",
-            post(move |headers: HeaderMap, body: Bytes| async move {
-                let mut guard = data.lock().await;
-                *guard = Some((headers, body));
-                (StatusCode::OK, "ok")
-            }),
-        );
-        axum::serve(listener, app).await.expect("mock server");
-    });
+    let target_url = "https://hooks.example.test/signature".to_owned();
 
     let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
     let delivery_id = format!("sig-test-{}", Uuid::now_v7());
     insert_queued_delivery(&pool, webhook_id, &delivery_id, &target_url, &secret).await;
-
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .no_proxy()
-        .build()
-        .expect("reqwest client");
 
     let owner = format!("test-{}", Uuid::now_v7());
     let claimed_all = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
@@ -579,30 +607,18 @@ async fn signature_is_validated_over_canonical_payload_at_enqueue() {
         .find(|c| c.delivery_id == delivery_id)
         .expect("must claim own delivery");
 
-    let outcome = webhook_scheduler::deliver_one(&http, claimed).await;
+    let (deps, requests) = fake_deps(200);
+    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
     assert!(outcome.success);
 
     // Verify the canonical payload and signature.
-    let guard = captured_data.lock().await;
-    let (headers, body) = guard.as_ref().expect("mock server received request");
-
-    let sig_header = headers
-        .get("x-gobrowse-signature")
-        .and_then(|v| v.to_str().ok())
-        .expect("X-Gobrowse-Signature header present");
-
-    let delivery_header = headers
-        .get("x-gobrowse-delivery")
-        .and_then(|v| v.to_str().ok())
-        .expect("X-Gobrowse-Delivery header present");
-    assert_eq!(delivery_header, delivery_id);
-
+    let requests = requests.lock().await;
+    assert_eq!(requests.len(), 1);
+    let request = &requests[0];
+    assert_eq!(request.delivery_id, delivery_id);
+    let sig_header = request.signature.as_deref().expect("signature");
     let canonical_body = format!("{target_url}\n{delivery_id}");
-    assert_eq!(
-        String::from_utf8_lossy(body),
-        canonical_body,
-        "body must be canonical payload: target\\ndelivery_id"
-    );
+    assert_eq!(request.payload, canonical_body);
 
     let expected_mac = hmac_sha256(&secret, canonical_body.as_bytes());
     let expected_sig = format!("sha256={}", hex_encode(&expected_mac));
@@ -611,7 +627,6 @@ async fn signature_is_validated_over_canonical_payload_at_enqueue() {
         "outbound signature must match HMAC-SHA256 of canonical payload"
     );
 
-    server.abort();
     cleanup(&pool, webhook_id, profile_id).await;
 }
 

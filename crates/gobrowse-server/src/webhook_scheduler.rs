@@ -17,7 +17,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::AppState;
-use crate::outbound_http::{pinned_client, resolve_target};
+use crate::outbound_http::{TransportError, WebhookDeliveryDeps, resolve_target_with};
 use crate::webhooks::{hex_encode, hmac_sha256};
 
 /// How often the scheduler scans for pending deliveries.
@@ -25,9 +25,6 @@ const SCAN_INTERVAL_MS: u64 = 750;
 
 /// Maximum concurrent outbound deliveries.
 const MAX_CONCURRENT: usize = 4;
-
-/// HTTP request timeout for each outbound delivery POST.
-const DELIVERY_TIMEOUT_SECS: u64 = 5;
 
 /// Maximum backoff interval in seconds (cap).
 const MAX_BACKOFF_SECS: f64 = 60.0;
@@ -64,14 +61,7 @@ pub struct DeliveryOutcome {
 pub async fn run_worker(state: AppState, shutdown: CancellationToken) {
     let owner = format!("gobrowse-server:{}:{}", std::process::id(), Uuid::now_v7());
     let max_attempts = state.settings.features.webhook_scheduler_max_attempts;
-    let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(DELIVERY_TIMEOUT_SECS))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .user_agent(concat!("gobrowse-os/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .expect("reqwest client for webhook scheduler");
+    let deps = WebhookDeliveryDeps::production();
 
     let mut tasks = JoinSet::new();
     let mut scan = tokio::time::interval(Duration::from_millis(SCAN_INTERVAL_MS));
@@ -95,9 +85,9 @@ pub async fn run_worker(state: AppState, shutdown: CancellationToken) {
                     Ok(claimed) => {
                         for delivery in claimed {
                             let delivery_pool = state.pool.clone();
-                            let delivery_http = http.clone();
+                            let delivery_deps = deps.clone();
                             tasks.spawn(async move {
-                                let outcome = deliver_one(&delivery_http, &delivery).await;
+                                let outcome = deliver_one_with(&delivery_deps, &delivery).await;
                                 persist_outcome(
                                     &delivery_pool,
                                     &delivery,
@@ -205,8 +195,11 @@ pub async fn recover_stuck_deliveries(
 }
 
 /// POST the canonical outbound payload to the target URL with HMAC signature.
-pub async fn deliver_one(_http: &reqwest::Client, delivery: &ClaimedDelivery) -> DeliveryOutcome {
-    let target = match resolve_target(&delivery.target_url).await {
+pub async fn deliver_one_with(
+    deps: &WebhookDeliveryDeps,
+    delivery: &ClaimedDelivery,
+) -> DeliveryOutcome {
+    let target = match resolve_target_with(deps.resolver.as_ref(), &delivery.target_url).await {
         Ok(target) => target,
         Err(error) => {
             return DeliveryOutcome {
@@ -217,69 +210,56 @@ pub async fn deliver_one(_http: &reqwest::Client, delivery: &ClaimedDelivery) ->
             };
         }
     };
-    let http = match pinned_client(&target) {
-        Ok(http) => http,
-        Err(_) => {
-            return DeliveryOutcome {
-                response_code: None,
-                success: false,
-                retryable: false,
-                error: Some("target_policy_denied".to_owned()),
-            };
-        }
-    };
 
-    // Canonical outbound signing payload: {target}\n{delivery_id}
     let payload = format!("{}\n{}", delivery.target_url, delivery.delivery_id);
-
-    let mut request = http.post(target.url).body(payload.clone());
-
-    // Attach delivery identifier header.
-    request = request.header("X-Gobrowse-Delivery", &delivery.delivery_id);
-
-    // HMAC sign if secret is configured.
-    if let Some(ref secret) = delivery.secret_key {
+    let signature = delivery.secret_key.as_ref().map(|secret| {
         let mac = hmac_sha256(secret, payload.as_bytes());
-        let sig = format!("sha256={}", hex_encode(&mac));
-        request = request.header("X-Gobrowse-Signature", &sig);
-    }
-
-    match request.send().await {
+        format!("sha256={}", hex_encode(&mac))
+    });
+    match deps
+        .transport
+        .send(
+            &target,
+            &delivery.delivery_id,
+            &payload,
+            signature.as_deref(),
+        )
+        .await
+    {
         Ok(response) => {
-            let status = response.status().as_u16();
-            let success = (200..300).contains(&status);
-            let retryable = match status {
+            let success = (200..300).contains(&response.status);
+            let retryable = match response.status {
                 408 | 429 => true,
-                s if s >= 500 => true,
+                status if status >= 500 => true,
                 _ => false,
             };
-            let error = if success || retryable {
-                None
-            } else {
-                Some(format!("target returned non-retryable HTTP {status}"))
-            };
             DeliveryOutcome {
-                response_code: Some(status),
+                response_code: Some(response.status),
                 success,
                 retryable,
-                error,
+                error: if success || retryable {
+                    None
+                } else {
+                    Some(format!(
+                        "target returned non-retryable HTTP {}",
+                        response.status
+                    ))
+                },
             }
         }
-        Err(err) => {
-            let error = if err.is_timeout() {
-                "target_timeout"
-            } else if err.is_connect() {
-                "target_connection_failed"
-            } else {
-                "target_transport_failed"
-            };
-            DeliveryOutcome {
-                response_code: None,
-                success: false,
-                retryable: true,
-                error: Some(error.to_owned()),
-            }
-        }
+        Err(error) => DeliveryOutcome {
+            response_code: None,
+            success: false,
+            retryable: true,
+            error: Some(
+                match error {
+                    TransportError::Timeout => "target_timeout",
+                    TransportError::Connection => "target_connection_failed",
+                    TransportError::Other => "target_transport_failed",
+                }
+                .to_owned(),
+            ),
+        },
     }
 }
 
