@@ -421,7 +421,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     }
     let post_workspace_skill = Uuid::now_v7();
     sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'post-scoped','')").bind(post_workspace_skill).bind(profile_id).bind(workspace).execute(&mut connection).await.expect("post scoped skill");
-    let result=sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'bad','tester','bad',$3)").bind(Uuid::now_v7()).bind(post_workspace_skill).bind(vec![post_wrong]).execute(&mut connection).await;
+    let result=sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,15,'bad','tester','bad',$3)").bind(Uuid::now_v7()).bind(post_workspace_skill).bind(vec![post_wrong]).execute(&mut connection).await;
     let constraint = result.as_ref().err().and_then(|error| match error {
         sqlx::Error::Database(database) => database.constraint(),
         _ => None,

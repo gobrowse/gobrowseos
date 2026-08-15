@@ -790,16 +790,28 @@ async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
         .await;
         assert_eq!(status, StatusCode::CREATED);
         assert_eq!(created["revision"], revision);
+        let submitted_evaluation = valid_evaluation(1);
         let (status, evaluated) = request_json(
             &app,
             Method::POST,
             &format!("/api/v1/skills/{skill_id}/revisions/{revision}/evaluate"),
             cookie,
-            Some(json!({"evaluation":valid_evaluation(1)})),
+            Some(json!({"evaluation":submitted_evaluation})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{evaluated}");
-        let evaluated_id = evaluated["id"].as_str().expect("evaluated ID");
+        let evaluated_id: Uuid = evaluated["id"]
+            .as_str()
+            .expect("evaluated ID")
+            .parse()
+            .expect("evaluation UUID");
+        let persisted_evaluation: serde_json::Value =
+            sqlx::query_scalar("SELECT evaluation FROM skill_revisions WHERE id=$1")
+                .bind(evaluated_id)
+                .fetch_one(&pool)
+                .await
+                .expect("persisted evaluation");
+        assert_eq!(persisted_evaluation, submitted_evaluation);
         let actor = if revision == 3 {
             workspace_owner
         } else {
@@ -812,7 +824,7 @@ async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
                 profile_id,
                 "skill.evaluated",
                 "skill_revision",
-                Some(evaluated_id)
+                Some(&evaluated_id.to_string())
             )
             .await,
             1
@@ -827,6 +839,18 @@ async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&format!("{skill_id}:2")),
+        )
+        .await,
+        1
+    );
     let (status, _) = request_json(
         &app,
         Method::POST,
@@ -836,6 +860,26 @@ async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        audit_count(
+            &pool,
+            _admin,
+            profile_id,
+            "skill.rolled_back",
+            "skill",
+            Some(&skill_id.to_string()),
+        )
+        .await,
+        1
+    );
+    let state: (i64, i64) = sqlx::query_as(
+        "SELECT active_revision,(SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted)",
+    )
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .expect("rollback state");
+    assert_eq!(state, (1, 1));
 }
 
 #[tokio::test]
@@ -1632,7 +1676,7 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
         });
         assert_eq!(constraint, Some("skill_revisions_sources_valid"));
     }
-    let result=sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,100,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_conversation]).execute(&pool).await;
+    let result=sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,105,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_conversation]).execute(&pool).await;
     let constraint = result.as_ref().err().and_then(|error| match error {
         sqlx::Error::Database(database) => database.constraint(),
         _ => None,
