@@ -490,9 +490,9 @@ async fn profile_global_skill_mutations_require_owner_or_admin() {
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "global-role-test").await;
     let (_owner, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
-    let (_member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
-    let (_viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
-    let (skill_id, _revision_id) =
+    let (member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let (viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
+    let (skill_id, revision_id) =
         insert_skill_fixture(&pool, profile_id, None, "global-role", "manual").await;
     let app = router(
         AppState::new(pool.clone(), test_settings(&url))
@@ -500,7 +500,48 @@ async fn profile_global_skill_mutations_require_owner_or_admin() {
             .expect("state"),
     );
     let before = skill_side_effect_counts(&pool, skill_id).await;
-    for cookie in [&member_cookie, &viewer_cookie] {
+    for (actor, cookie) in [(member, &member_cookie), (viewer, &viewer_cookie)] {
+        let create_audit =
+            audit_count(&pool, actor, profile_id, "skill.created", "skill", None).await;
+        let revision_audit = audit_count(
+            &pool,
+            actor,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            None,
+        )
+        .await;
+        let revision_id_text = revision_id.to_string();
+        let evaluate_audit = audit_count(
+            &pool,
+            actor,
+            profile_id,
+            "skill.evaluated",
+            "skill_revision",
+            Some(&revision_id_text),
+        )
+        .await;
+        let promote_id = format!("{skill_id}:1");
+        let promote_audit = audit_count(
+            &pool,
+            actor,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&promote_id),
+        )
+        .await;
+        let skill_id_text = skill_id.to_string();
+        let rollback_audit = audit_count(
+            &pool,
+            actor,
+            profile_id,
+            "skill.rolled_back",
+            "skill",
+            Some(&skill_id_text),
+        )
+        .await;
         for (method, path, body) in [
             (
                 Method::POST,
@@ -532,6 +573,58 @@ async fn profile_global_skill_mutations_require_owner_or_admin() {
             assert_eq!(status, StatusCode::FORBIDDEN);
         }
         assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+        assert_eq!(
+            audit_count(&pool, actor, profile_id, "skill.created", "skill", None).await,
+            create_audit
+        );
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.revision_created",
+                "skill_revision",
+                None
+            )
+            .await,
+            revision_audit
+        );
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.evaluated",
+                "skill_revision",
+                Some(&revision_id_text)
+            )
+            .await,
+            evaluate_audit
+        );
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.promoted",
+                "skill_revision",
+                Some(&promote_id)
+            )
+            .await,
+            promote_audit
+        );
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.rolled_back",
+                "skill",
+                Some(&skill_id_text)
+            )
+            .await,
+            rollback_audit
+        );
     }
 }
 
@@ -683,6 +776,48 @@ async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
             0
         );
     }
+    for (cookie, content, revision) in [
+        (&workspace_owner_cookie, "owner-member", 3_i64),
+        (&editor_cookie, "editor-member", 4_i64),
+    ] {
+        let (status, created) = request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions"),
+            cookie,
+            Some(json!({"content":content,"reason":"evaluate","source_conversation_ids":[]})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["revision"], revision);
+        let (status, evaluated) = request_json(
+            &app,
+            Method::POST,
+            &format!("/api/v1/skills/{skill_id}/revisions/{revision}/evaluate"),
+            cookie,
+            Some(json!({"evaluation":valid_evaluation(1)})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{evaluated}");
+        let evaluated_id = evaluated["id"].as_str().expect("evaluated ID");
+        let actor = if revision == 3 {
+            workspace_owner
+        } else {
+            editor
+        };
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.evaluated",
+                "skill_revision",
+                Some(evaluated_id)
+            )
+            .await,
+            1
+        );
+    }
     let (status, _) = request_json(
         &app,
         Method::POST,
@@ -746,6 +881,52 @@ async fn workspace_member_with_viewer_access_receives_forbidden_on_mutation() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let before = skill_side_effect_counts(&pool, skill_id).await;
+    let revision_audit = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
+    let revision_id_text = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM skill_revisions WHERE skill_id=$1 AND revision=1",
+    )
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .expect("revision")
+    .to_string();
+    let evaluate_audit = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.evaluated",
+        "skill_revision",
+        Some(&revision_id_text),
+    )
+    .await;
+    let promote_id = format!("{skill_id}:1");
+    let promote_audit = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.promoted",
+        "skill_revision",
+        Some(&promote_id),
+    )
+    .await;
+    let skill_id_text = skill_id.to_string();
+    let rollback_audit = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.rolled_back",
+        "skill",
+        Some(&skill_id_text),
+    )
+    .await;
     for (path, body) in [
         (
             format!("/api/v1/skills/{skill_id}/revisions"),
@@ -768,6 +949,54 @@ async fn workspace_member_with_viewer_access_receives_forbidden_on_mutation() {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
     assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            None
+        )
+        .await,
+        revision_audit
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.evaluated",
+            "skill_revision",
+            Some(&revision_id_text)
+        )
+        .await,
+        evaluate_audit
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&promote_id)
+        )
+        .await,
+        promote_audit
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.rolled_back",
+            "skill",
+            Some(&skill_id_text)
+        )
+        .await,
+        rollback_audit
+    );
 }
 
 #[tokio::test]
@@ -818,6 +1047,70 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
         "skill.revision_created",
         "skill_revision",
         None,
+    )
+    .await;
+    let revision_id_text = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM skill_revisions WHERE skill_id=$1 AND revision=1",
+    )
+    .bind(skill_id)
+    .fetch_one(&pool)
+    .await
+    .expect("revision")
+    .to_string();
+    let promote_id = format!("{skill_id}:1");
+    let skill_id_text = skill_id.to_string();
+    let before_member_evaluate = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.evaluated",
+        "skill_revision",
+        Some(&revision_id_text),
+    )
+    .await;
+    let before_member_promote = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.promoted",
+        "skill_revision",
+        Some(&promote_id),
+    )
+    .await;
+    let before_member_rollback = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.rolled_back",
+        "skill",
+        Some(&skill_id_text),
+    )
+    .await;
+    let before_viewer_evaluate = audit_count(
+        &pool,
+        viewer,
+        profile_id,
+        "skill.evaluated",
+        "skill_revision",
+        Some(&revision_id_text),
+    )
+    .await;
+    let before_viewer_promote = audit_count(
+        &pool,
+        viewer,
+        profile_id,
+        "skill.promoted",
+        "skill_revision",
+        Some(&promote_id),
+    )
+    .await;
+    let before_viewer_rollback = audit_count(
+        &pool,
+        viewer,
+        profile_id,
+        "skill.rolled_back",
+        "skill",
+        Some(&skill_id_text),
     )
     .await;
     for cookie in [&member_cookie, &viewer_cookie] {
@@ -878,6 +1171,78 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
         )
         .await,
         before_member_audits
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.evaluated",
+            "skill_revision",
+            Some(&revision_id_text)
+        )
+        .await,
+        before_member_evaluate
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&promote_id)
+        )
+        .await,
+        before_member_promote
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.rolled_back",
+            "skill",
+            Some(&skill_id_text)
+        )
+        .await,
+        before_member_rollback
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            viewer,
+            profile_id,
+            "skill.evaluated",
+            "skill_revision",
+            Some(&revision_id_text)
+        )
+        .await,
+        before_viewer_evaluate
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            viewer,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&promote_id)
+        )
+        .await,
+        before_viewer_promote
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            viewer,
+            profile_id,
+            "skill.rolled_back",
+            "skill",
+            Some(&skill_id_text)
+        )
+        .await,
+        before_viewer_rollback
     );
     assert_eq!(
         audit_count(
@@ -1044,7 +1409,15 @@ async fn duplicate_and_inaccessible_skill_sources_return_validation() {
             .await
             .expect("state"),
     );
-    let before_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.revision_created' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("audit baseline");
+    let before_audits: i64 = audit_count(
+        &pool,
+        owner,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
     for ids in [
         vec![valid_source, valid_source],
         vec![Uuid::nil()],
@@ -1064,7 +1437,15 @@ async fn duplicate_and_inaccessible_skill_sources_return_validation() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
     assert_eq!(skill_side_effect_counts(&pool, skill_id).await.0.len(), 1);
-    let after_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.revision_created' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("audit final");
+    let after_audits: i64 = audit_count(
+        &pool,
+        owner,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
     assert_eq!(after_audits, before_audits);
 }
 
@@ -1206,6 +1587,7 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
             .await
             .is_err()
     );
+    let valid = Uuid::now_v7();
     let deleted = Uuid::now_v7();
     let cross = Uuid::now_v7();
     let source_profile = profile(&pool, "raw-source-profile").await;
@@ -1234,18 +1616,28 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
         insert_skill_fixture(&pool, profile_id, Some(workspace), "raw-scoped", "manual")
             .await
             .0;
-    sqlx::query("INSERT INTO conversations (id,profile_id,title,status) VALUES ($1,$2,'deleted','deleted'),($3,$4,'cross','active'),($5,$2,'wrong workspace','active')").bind(deleted).bind(profile_id).bind(cross).bind(source_profile).bind(wrong_conversation).bind(wrong_workspace).execute(&pool).await.expect("raw source rows");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title,status) VALUES ($1,$2,$3,'valid','active'),($4,$2,NULL,'deleted','deleted'),($5,$6,NULL,'cross','active'),($7,$2,$8,'wrong workspace','active')").bind(valid).bind(profile_id).bind(workspace).bind(deleted).bind(cross).bind(source_profile).bind(wrong_conversation).bind(wrong_workspace).execute(&pool).await.expect("raw source rows");
     let missing = Uuid::now_v7();
-    for ids in [
-        vec![Uuid::nil()],
-        vec![Uuid::nil(), Uuid::nil()],
-        vec![missing],
-        vec![deleted],
-        vec![cross],
+    for (revision, ids) in [
+        (100, vec![Uuid::nil()]),
+        (101, vec![valid, valid]),
+        (102, vec![missing]),
+        (103, vec![deleted]),
+        (104, vec![cross]),
     ] {
-        assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(ids).execute(&pool).await.is_err());
+        let result=sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,$3,'bad','x','x',$4)").bind(Uuid::now_v7()).bind(skill_id).bind(revision).bind(ids).execute(&pool).await;
+        let constraint = result.as_ref().err().and_then(|error| match error {
+            sqlx::Error::Database(database) => database.constraint(),
+            _ => None,
+        });
+        assert_eq!(constraint, Some("skill_revisions_sources_valid"));
     }
-    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_conversation]).execute(&pool).await.is_err());
+    let result=sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,100,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_conversation]).execute(&pool).await;
+    let constraint = result.as_ref().err().and_then(|error| match error {
+        sqlx::Error::Database(database) => database.constraint(),
+        _ => None,
+    });
+    assert_eq!(constraint, Some("skill_revisions_sources_valid"));
     assert!(
         sqlx::query("UPDATE skill_revisions SET source_conversation_ids=$1 WHERE id=$2")
             .bind(vec![Uuid::nil()])
@@ -1630,6 +2022,15 @@ async fn concurrent_source_delete_fixture() {
         .fetch_one(&mut *deletion)
         .await
         .expect("lock conversation");
+    let audit_before = audit_count(
+        &pool,
+        owner,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
     let request_app = app.clone();
     let request_cookie = cookie.clone();
     let request_path = format!("/api/v1/skills/{skill_id}/revisions");
@@ -1673,7 +2074,7 @@ async fn concurrent_source_delete_fixture() {
             None
         )
         .await,
-        0
+        audit_before
     );
 }
 async fn concurrent_revocation_fixture() {
@@ -1709,6 +2110,15 @@ async fn concurrent_revocation_fixture() {
     );
     let mut revocation = pool.begin().await.expect("revocation tx");
     sqlx::query("SELECT workspace_id,user_id FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2 FOR UPDATE").bind(workspace).bind(editor).fetch_one(&mut *revocation).await.expect("lock membership");
+    let audit_before = audit_count(
+        &pool,
+        editor,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
     let request_app = app.clone();
     let request_cookie = editor_cookie.clone();
     let request_path = format!("/api/v1/skills/{skill_id}/revisions");
@@ -1753,6 +2163,6 @@ async fn concurrent_revocation_fixture() {
             None
         )
         .await,
-        0
+        audit_before
     );
 }
