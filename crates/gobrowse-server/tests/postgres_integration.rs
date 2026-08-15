@@ -85,6 +85,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
             .expect("install schema 14 migration");
     }
     let profile_id = Uuid::now_v7();
+    let primary_user_id = Uuid::now_v7();
     let skill_id = Uuid::now_v7();
     let revision_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'skills-v14-repair')")
@@ -92,6 +93,16 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .execute(&mut connection)
         .await
         .expect("create profile");
+    sqlx::query(
+        "INSERT INTO users (id,email,display_name,password_hash,role,primary_profile_id) \
+         VALUES ($1,$2,'Primary Owner','unused','OWNER',$3)",
+    )
+    .bind(primary_user_id)
+    .bind(format!("{primary_user_id}@example.test"))
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("create primary owner");
     sqlx::query("INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'repair','')")
         .bind(skill_id)
         .bind(profile_id)
@@ -113,6 +124,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,evaluation) VALUES ($1,$2,$3,'invalid-eval','tester','legacy',$4)").bind(id).bind(skill_id).bind((index+2) as i64).bind(value).execute(&mut connection).await.expect("insert malformed evaluation");
     }
     let other_profile = Uuid::now_v7();
+    let other_user_id = Uuid::now_v7();
     let workspace = Uuid::now_v7();
     let same_profile_workspace = Uuid::now_v7();
     let other_workspace = Uuid::now_v7();
@@ -121,13 +133,23 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .execute(&mut connection)
         .await
         .expect("other profile");
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'same workspace'),($3,$2,'same profile other workspace'),($4,$5,'other workspace')").bind(workspace).bind(profile_id).bind(same_profile_workspace).bind(other_workspace).bind(other_profile).execute(&mut connection).await.expect("workspaces");
+    sqlx::query(
+        "INSERT INTO users (id,email,display_name,password_hash,role,primary_profile_id) \
+         VALUES ($1,$2,'Other Owner','unused','OWNER',$3)",
+    )
+    .bind(other_user_id)
+    .bind(format!("{other_user_id}@example.test"))
+    .bind(other_profile)
+    .execute(&mut connection)
+    .await
+    .expect("create other owner");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title,created_by_user_id) VALUES ($1,$2,'same workspace',$3),($4,$2,'same profile other workspace',$3),($5,$6,'other workspace',$7)").bind(workspace).bind(profile_id).bind(primary_user_id).bind(same_profile_workspace).bind(other_workspace).bind(other_profile).bind(other_user_id).execute(&mut connection).await.expect("workspaces");
     let source = Uuid::now_v7();
     let wrong_source = Uuid::now_v7();
     let deleted_source = Uuid::now_v7();
     let cross_source = Uuid::now_v7();
     let missing_source = Uuid::now_v7();
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'source'),($4,$2,$5,'wrong'),($6,$2,NULL,'deleted'),($7,$8,NULL,'cross')").bind(source).bind(profile_id).bind(workspace).bind(wrong_source).bind(same_profile_workspace).bind(deleted_source).bind(cross_source).bind(other_profile).execute(&mut connection).await.expect("source fixtures");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,created_by_user_id,title) VALUES ($1,$2,$3,$4,'source'),($5,$2,$6,$4,'wrong'),($7,$2,NULL,$4,'deleted'),($8,$9,NULL,$10,'cross')").bind(source).bind(profile_id).bind(workspace).bind(primary_user_id).bind(wrong_source).bind(same_profile_workspace).bind(deleted_source).bind(cross_source).bind(other_profile).bind(other_user_id).execute(&mut connection).await.expect("source fixtures");
     sqlx::query("UPDATE conversations SET status='deleted' WHERE id=$1")
         .bind(deleted_source)
         .execute(&mut connection)
@@ -182,9 +204,10 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     let mut oversized = Vec::new();
     for _ in 0..101 {
         let id = Uuid::now_v7();
-        sqlx::query("INSERT INTO conversations (id,profile_id,title) VALUES ($1,$2,'oversized')")
+        sqlx::query("INSERT INTO conversations (id,profile_id,created_by_user_id,title) VALUES ($1,$2,$3,'oversized')")
             .bind(id)
             .bind(profile_id)
+            .bind(primary_user_id)
             .execute(&mut connection)
             .await
             .expect("oversized conversation");
@@ -394,14 +417,26 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     let post_cross = Uuid::now_v7();
     let post_wrong = Uuid::now_v7();
     let post_profile = Uuid::now_v7();
+    let post_user_id = Uuid::now_v7();
     let post_workspace = Uuid::now_v7();
+    let post_other_workspace = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'post-v14-profile')")
         .bind(post_profile)
         .execute(&mut connection)
         .await
         .expect("post profile");
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'post same workspace'),($3,$4,'post other workspace')").bind(post_workspace).bind(profile_id).bind(Uuid::now_v7()).bind(post_profile).execute(&mut connection).await.expect("post workspaces");
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title,status) VALUES ($1,$2,$3,'valid','active'),($4,$2,NULL,'deleted','deleted'),($5,$6,NULL,'cross','active'),($7,$2,$8,'wrong','active')").bind(post_valid).bind(profile_id).bind(workspace).bind(post_deleted).bind(post_cross).bind(post_profile).bind(post_wrong).bind(post_workspace).execute(&mut connection).await.expect("post source rows");
+    sqlx::query(
+        "INSERT INTO users (id,email,display_name,password_hash,role,primary_profile_id) \
+         VALUES ($1,$2,'Post Owner','unused','OWNER',$3)",
+    )
+    .bind(post_user_id)
+    .bind(format!("{post_user_id}@example.test"))
+    .bind(post_profile)
+    .execute(&mut connection)
+    .await
+    .expect("post profile owner");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title,created_by_user_id) VALUES ($1,$2,'post same workspace',$3),($4,$5,'post other workspace',$6)").bind(post_workspace).bind(profile_id).bind(primary_user_id).bind(post_other_workspace).bind(post_profile).bind(post_user_id).execute(&mut connection).await.expect("post workspaces");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,created_by_user_id,title,status) VALUES ($1,$2,$3,$4,'valid','active'),($5,$2,NULL,$4,'deleted','deleted'),($6,$7,NULL,$8,'cross','active'),($9,$2,$10,$4,'wrong','active')").bind(post_valid).bind(profile_id).bind(workspace).bind(primary_user_id).bind(post_deleted).bind(post_cross).bind(post_profile).bind(post_user_id).bind(post_wrong).bind(post_workspace).execute(&mut connection).await.expect("post source rows");
     let post_missing = Uuid::now_v7();
     let mut post_revision = 10_i64;
     for ids in [
