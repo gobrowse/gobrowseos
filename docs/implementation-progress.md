@@ -131,3 +131,332 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - **`BLOCKED_EXTERNAL`:** M4 has no real runtime-proof success claim. The required approved ephemeral local runner is absent: it must run real rootless Podman as a non-root user, already have that user's `/etc/subuid` and `/etc/subgid` entries configured, hold the approved immutable digest image locally, and back a trusted required non-ignored CI job.
 - No Docker shim, remote or rootful Podman fallback, image pull, installation, `sudo`, or host mutation is permitted. The smallest eventual scope is one deterministic test-only real-local-Podman `--userns=keep-id` UID-identity proof against the preloaded digest image and its trusted required CI invocation.
 - The sandbox remains release-gated and off. Existing fake and Docker-backed tests do not prove the rootless Podman `keep-id` user-namespace mapping.
+
+## M20 Readiness Ledger
+
+<!-- m20-readiness-ledger:v1; update this block in place; never append a second ledger -->
+
+```json
+{
+  "SCHEMA_VERSION": 1,
+  "AS_OF": "2026-08-15",
+  "STATUS_ENUM": [
+    "ACCEPTED",
+    "IN_PROGRESS",
+    "BLOCKED_EXTERNAL",
+    "NOT_STARTED",
+    "UNASSESSED",
+    "DEFERRED"
+  ],
+  "COUNTING_RULE": "Count one release blocker for each milestone whose acceptance gate is not ACCEPTED. This is a milestone-gate count, not a count of implementation subtasks or transitive dependency failures. EXTERNAL_BLOCKERS counts only records explicitly established as BLOCKED_EXTERNAL; every other unsatisfied gate is INTERNAL_BLOCKERS until an accepted review reclassifies it.",
+  "TOTAL_RELEASE_BLOCKERS": 16,
+  "EXTERNAL_BLOCKERS": 2,
+  "INTERNAL_BLOCKERS": 14,
+  "MILESTONES": [
+    {
+      "ID": "M1",
+      "NAME": "foundation",
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
+      "DEPENDENCIES": [],
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Verification Log: 2026-08-09 Milestone 1 baseline passed formatting, Clippy with warnings denied, and 26/26 Nextest tests with PostgreSQL and pgvector.",
+        "docs/implementation-progress.md § Release State: Milestone 1 remains tagged and its backup is retained."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Preserve the accepted evidence; reopen only for a demonstrated regression."
+    },
+    {
+      "ID": "M2",
+      "NAME": "library",
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Verification Log: 2026-08-10 Milestone 2 passed native/WASM Clippy and 33/33 Nextest tests, including live fake-provider semantic retrieval.",
+        "docs/implementation-progress.md § Release State records the retained Milestone 2 image digest and released schema version 2."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Preserve the accepted evidence; reopen only for a demonstrated regression."
+    },
+    {
+      "ID": "M3",
+      "NAME": "runtime",
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Verification Log: Milestone 3 passed 40/40 fresh-PostgreSQL tests, native/WASM Clippy, release Trunk build, browser flow, supply-chain checks, and later closure review.",
+        "docs/implementation-progress.md § Release State and § Verification Log: reviewed implementation commit `7ee7ff6` was deployed privately; live schema version is 3."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Preserve the accepted implementation/deployment evidence; later schema releases are tracked by their own milestones and M20."
+    },
+    {
+      "ID": "M4",
+      "NAME": "sandbox runtime",
+      "STATUS": "BLOCKED_EXTERNAL",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "PLAN.md § Status, Decision, and Preserved M7 External Record: M4 is `BLOCKED_EXTERNAL`; no successful runtime proof is claimed.",
+        "docs/implementation-progress.md § M4 rootless Podman `keep-id` external gate: fake and Docker-backed tests do not prove the required real rootless Podman UID mapping."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Provision the approved non-root local runner with real rootless Podman, preconfigured subuid/subgid ranges, the approved digest-pinned image preloaded, and a trusted required non-ignored CI job; then run the single `--pull=never --userns=keep-id` UID-identity proof."
+    },
+    {
+      "ID": "M5",
+      "NAME": "worktree task-subagent workflows",
+      "STATUS": "NOT_STARTED",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": [
+        "M1",
+        "M3",
+        "M6"
+      ],
+      "EVIDENCE": [
+        "docs/worktrees.md records the intended isolation/replay contract only.",
+        "Current read-only M5 architecture review found existing task/agent/worktree primitives but no M5 workspace-scoped worktree metadata implementation, migration 0016, API acceptance suite, CI, or deployment evidence."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Accept a bounded M5 plan, then implement the workspace-scoped worktree metadata/task-subagent metadata slice from schema 15 with same-workspace database integrity, authenticated API authorization, and real-PostgreSQL concurrency tests. Do not make it depend on M4 or M7."
+    },
+    {
+      "ID": "M6",
+      "NAME": "skill self-improvement",
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Skills/schema-15 acceptance closure: commit `4d0b0b30ace33e9f3bd807883575742f6ae094da` was accepted by exact-SHA CI; Nextest ran 307 tests and passed all 307, with six configured skips.",
+        "docs/skills.md records the accepted revision, evidence, promotion, rollback, authorization, concurrency, provenance, and schema-15 integrity contract.",
+        "The live deployment remains schema 3; this is implementation-candidate acceptance, not a deployment claim and not acceptance of the old combined Skills/worktrees/tasks roadmap row."
+      ],
+      "CI_RUN": [
+        {
+          "RUN_ID": "31858799443",
+          "COMMIT": "4d0b0b30ace33e9f3bd807883575742f6ae094da",
+          "SCOPE": "Skills/schema-15 candidate only"
+        }
+      ],
+      "NEXT_ACTION": "Preserve acceptance evidence. Deploy only through the later release runbook after dependent release gates pass; track deployment under M20."
+    },
+    {
+      "ID": "M7",
+      "NAME": "real MCP transport",
+      "STATUS": "BLOCKED_EXTERNAL",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § M7 bounded stdio framing acceptance: commit `4c2bff3796ec7ac15b86a167d49828a1eb556b98` accepts bounded JSON-RPC line framing over caller-provided Tokio pipes only.",
+        "The same section states the sole remaining M7 gate is `BLOCKED_EXTERNAL`: an approved, immutable, independently implemented MCP stdio peer and a non-ignored real-peer CI test for `server/discover` and capability-authorized `tools/list`."
+      ],
+      "CI_RUN": [
+        {
+          "RUN_ID": "31908353273",
+          "COMMIT": "4c2bff3796ec7ac15b86a167d49828a1eb556b98",
+          "SCOPE": "Bounded stdio framing only"
+        }
+      ],
+      "NEXT_ACTION": "Approve and pin an independently implemented MCP stdio peer with provenance, version, and content hash; add the required non-ignored CI interoperability test. Do not substitute a fixture, mock, loopback, or in-repository peer."
+    },
+    {
+      "ID": "M8",
+      "NAME": "MCP authentication vault doctor",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md records accepted credential-vault encryption/rotation coverage from Milestone 2 and a pure MCP doctor audience/schema validator.",
+        "docs/implementation-progress.md § Remaining gates says the real OAuth matrix, real-server conformance, and JWKS token validation remain unproved; docs/mcp-auth.md records the required OAuth security contract.",
+        "No repository record accepts M8 as a complete milestone."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Define and accept the exact M8 completion matrix without attributing M2 vault or pure-validator evidence to real OAuth/JWKS interoperability; resolve the real-provider prerequisite or formally change scope."
+    },
+    {
+      "ID": "M9",
+      "NAME": "generated MCP integration pipeline",
+      "STATUS": "UNASSESSED",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/mcp.md names a generator workflow as intended architecture, but current implementation-progress contains no milestone-scoped M9 acceptance, exact CI run, or completion claim."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Inventory generator code, generated artifacts, drift checks, security boundaries, and CI; write a bounded milestone plan before assigning implementation status."
+    },
+    {
+      "ID": "M10",
+      "NAME": "scheduler webhook release",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Webhook SSRF proof acceptance closure: commit `dfbbaa5b8e6e884010cbd4f2e57b60a8253c9edc` passed exact-SHA CI with 324/324 tests.",
+        "The same section proves `features.webhook_scheduler_enabled` remains default-off and explicitly says scheduler release remains separately gated; docs/roadmap.md still marks scheduler/webhooks release-gated/off."
+      ],
+      "CI_RUN": [
+        {
+          "RUN_ID": "31864560017",
+          "COMMIT": "dfbbaa5b8e6e884010cbd4f2e57b60a8253c9edc",
+          "SCOPE": "Webhook SSRF/fencing proof only; not scheduler release"
+        }
+      ],
+      "NEXT_ACTION": "Keep the scheduler off until the complete restart/replay/signature/recovery release gate is explicitly accepted and recorded; do not promote the bounded SSRF CI run into M10 completion."
+    },
+    {
+      "ID": "M11",
+      "NAME": "authorization matrix",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md records accepted bounded authorization evidence across Milestones 1–3, task/activity tenancy hardening, and the Skills/schema-15 lifecycle.",
+        "No consolidated M11 authorization-matrix definition, exact acceptance run, or completion statement exists in the inspected repository docs."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Define the cross-surface subject/role/resource/action matrix, map existing tests to every cell and revocation race, add only missing behavioral coverage, and record a milestone-scoped acceptance run."
+    },
+    {
+      "ID": "M12",
+      "NAME": "backup restore diagnostics",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md records checksum-verified backups and post-storage-move health, doctor, and security-audit checks.",
+        "docs/backups.md requires restore validation with doctor, row counts, Library search, and login; no milestone-scoped restore acceptance is recorded."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Run and record a destructive-safe restore rehearsal against an isolated target, including backup checksum, row counts, login, Library search, doctor, and rollback viability; do not treat backup creation as restore proof."
+    },
+    {
+      "ID": "M13",
+      "NAME": "sandboxed browser web LSP",
+      "STATUS": "DEFERRED",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Remaining gates lists browser/connectors/media adapter tests as user-excluded and requiring real adapter runtimes.",
+        "No M13 acceptance or CI record exists."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Obtain an explicit M20 scope decision. If M13 remains required, plan and prove the sandbox/browser/Web/LSP boundary against real runtimes; if removed, record the authoritative scope change rather than marking it accepted."
+    },
+    {
+      "ID": "M14",
+      "NAME": "plugin messaging media boundaries",
+      "STATUS": "DEFERRED",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/roadmap.md marks browser/connectors/media release-gated/off pending isolated adapter-specific security tests.",
+        "docs/implementation-progress.md says browser/connectors/media adapter tests were user-excluded; no M14 acceptance or CI record exists."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Obtain an explicit M20 scope decision. If retained, define and prove plugin, messaging, connector, and media trust boundaries with isolated real-adapter tests; exclusion is not completion."
+    },
+    {
+      "ID": "M15",
+      "NAME": "operator UI surfaces",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md records accepted M3 browser validation for owner login, conversation creation/opening, transcript composer, provider registry, and responsive layouts.",
+        "docs/skills.md has an accepted backend contract while the inspected architecture evidence identifies the Skills operator page as non-functional; no complete M15 surface inventory or acceptance exists."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Inventory every required operator surface against accepted APIs, implement missing surfaces only after their backend gates, and run desktop/mobile authenticated browser acceptance for the complete inventory."
+    },
+    {
+      "ID": "M16",
+      "NAME": "concurrency recovery gates",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md records bounded accepted concurrency/recovery evidence for M3 run leases and takeover, schema-15 Skills lifecycle races, task/activity ordering, and webhook stale-worker fencing.",
+        "No repository record consolidates these slices into a complete M16 gate or proves every enabled subsystem."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Define the enabled-subsystem crash/race/restart matrix, reuse existing accepted cases, add only uncovered observable recovery cases, and accept one milestone-scoped real-PostgreSQL CI run."
+    },
+    {
+      "ID": "M17",
+      "NAME": "security regression gates",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md records repeated Clippy, deny, audit, tenancy, CSRF, SSRF, append-only, and redaction checks, including clean supply-chain outcome in CI `31864560017`.",
+        "docs/security.md retains documented advisory exceptions; no repository record declares a complete M17 adversarial regression gate accepted."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Create a traceable security-requirement-to-test matrix, include accepted CI evidence without relabeling bounded runs, resolve uncovered enabled-surface threats, and record independent milestone acceptance."
+    },
+    {
+      "ID": "M18",
+      "NAME": "performance resource evidence",
+      "STATUS": "UNASSESSED",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/deployment.md documents example CPU/memory caps and states production sizing depends on workload.",
+        "No milestone-scoped load, latency, memory, CPU, queue, database, or resource-exhaustion acceptance evidence is recorded."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Define measurable release budgets and representative workloads first, then run repeatable resource/performance experiments and record raw results and thresholds."
+    },
+    {
+      "ID": "M19",
+      "NAME": "clean-install qualification",
+      "STATUS": "IN_PROGRESS",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": null,
+      "EVIDENCE": [
+        "docs/implementation-progress.md § Compose cold-start smoke records an ephemeral build/start/readiness/401 proof on 2026-08-12 and cleanup afterward.",
+        "No complete M19 clean-host qualification, immutable artifact provenance, setup/upgrade matrix, or milestone acceptance record exists."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Define the clean-host matrix and qualify the release candidate from immutable artifacts, including fresh install, migration, readiness, authentication denial, diagnostics, restart, and cleanup with exact evidence."
+    },
+    {
+      "ID": "M20",
+      "NAME": "private production release",
+      "STATUS": "NOT_STARTED",
+      "REMAINING_RELEASE_BLOCKERS": 1,
+      "DEPENDENCIES": [
+        "M1",
+        "M2",
+        "M3",
+        "M4",
+        "M5",
+        "M6",
+        "M7",
+        "M8",
+        "M9",
+        "M10",
+        "M11",
+        "M12",
+        "M13",
+        "M14",
+        "M15",
+        "M16",
+        "M17",
+        "M18",
+        "M19"
+      ],
+      "EVIDENCE": [
+        "docs/implementation-progress.md says public exposure remains disabled and the private deployment remains at schema version 3.",
+        "docs/implementation-progress.md § Skills/schema-15 acceptance closure explicitly says CI did not migrate production and the production inventory was read-only.",
+        "No M20 release-candidate deployment, post-migration smoke, or release acceptance exists."
+      ],
+      "CI_RUN": [],
+      "NEXT_ACTION": "Do not deploy or claim M20 until every dependency is ACCEPTED or formally removed from scope. Then execute the backup-first maintenance-mode schema upgrade from the Git-backed immutable candidate, verify health/schema/auth/diagnostics/security/functional flows and rollback evidence, and record exact deployment identity and acceptance."
+    }
+  ]
+}
+```
