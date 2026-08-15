@@ -397,7 +397,7 @@ async fn lock_activity_workspace(
     Ok(())
 }
 
-async fn append_activity(
+pub(crate) async fn append_activity(
     tx: &mut Transaction<'_, Postgres>,
     workspace_id: Uuid,
     task_id: Option<Uuid>,
@@ -489,7 +489,7 @@ async fn validate_task_references_in_transaction(
     Ok(())
 }
 
-async fn authorize_workspace(
+pub(crate) async fn authorize_workspace(
     state: &AppState,
     user: &crate::auth::AuthenticatedUser,
     workspace_id: Uuid,
@@ -517,7 +517,7 @@ async fn authorize_workspace(
 /// workspace row and then the membership row are locked in that order.  A
 /// concurrent membership revocation therefore either wins before this check,
 /// or waits until this transaction commits.
-async fn authorize_workspace_in_transaction(
+pub(crate) async fn authorize_workspace_in_transaction(
     tx: &mut Transaction<'_, Postgres>,
     user: &crate::auth::AuthenticatedUser,
     workspace_id: Uuid,
@@ -712,7 +712,7 @@ fn task_state_name(state: TaskState) -> &'static str {
     }
 }
 
-fn require_writer(user: &crate::auth::AuthenticatedUser) -> Result<(), AppError> {
+pub(crate) fn require_writer(user: &crate::auth::AuthenticatedUser) -> Result<(), AppError> {
     if user.role == "VIEWER" {
         Err(AppError::Forbidden)
     } else {

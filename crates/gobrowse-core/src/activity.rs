@@ -22,6 +22,7 @@ pub enum ActivityKind {
     SkillUpdated,
     BookCreated,
     BookUpdated,
+    WorktreeDeleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

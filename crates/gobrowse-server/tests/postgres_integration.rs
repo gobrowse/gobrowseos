@@ -4,7 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gobrowse_server::{config::VaultSettings, vault};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Connection, PgConnection, PgPool, Row};
-use time::Duration;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 async fn test_pool() -> Option<PgPool> {
@@ -33,12 +33,12 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 15);
+    assert_eq!(row.get::<i64, _>("schema_version"), 16);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
 #[tokio::test]
-async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
+async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -109,19 +109,72 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .execute(&mut connection)
         .await
         .expect("create skill");
-    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids,evaluation,promoted) VALUES ($1,$2,1,'content','tester','legacy',$3,$4,true)")
-        .bind(revision_id).bind(skill_id).bind(vec![Uuid::nil()]).bind(serde_json::json!({"malformed": true})).execute(&mut connection).await.expect("insert legacy malformed revision");
+    sqlx::query(
+        "INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids,evaluation,promoted) VALUES ($1,$2,1,'content','tester','legacy',$3,$4,true)",
+    )
+    .bind(revision_id)
+    .bind(skill_id)
+    .bind(vec![Uuid::nil()])
+    .bind(serde_json::json!({ "malformed": true }))
+    .execute(&mut connection)
+    .await
+    .expect("insert legacy malformed revision");
     let evaluation_cases = [
-        serde_json::json!({"deterministic_checks_passed":true,"attempts":0,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0}),
-        serde_json::json!({"deterministic_checks_passed":true,"attempts":0,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0,"user_corrections":0,"extra":true}),
-        serde_json::json!({"deterministic_checks_passed":"yes","attempts":0,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0,"user_corrections":0}),
-        serde_json::json!({"deterministic_checks_passed":true,"attempts":1000001,"successful_attempts":0,"steps":0,"retries":0,"errors":0,"duration_ms":0,"user_corrections":0}),
+        serde_json::json!({
+            "deterministic_checks_passed": true,
+            "attempts": 0,
+            "successful_attempts": 0,
+            "steps": 0,
+            "retries": 0,
+            "errors": 0,
+            "duration_ms": 0
+        }),
+        serde_json::json!({
+            "deterministic_checks_passed": true,
+            "attempts": 0,
+            "successful_attempts": 0,
+            "steps": 0,
+            "retries": 0,
+            "errors": 0,
+            "duration_ms": 0,
+            "user_corrections": 0,
+            "extra": true
+        }),
+        serde_json::json!({
+            "deterministic_checks_passed": "yes",
+            "attempts": 0,
+            "successful_attempts": 0,
+            "steps": 0,
+            "retries": 0,
+            "errors": 0,
+            "duration_ms": 0,
+            "user_corrections": 0
+        }),
+        serde_json::json!({
+            "deterministic_checks_passed": true,
+            "attempts": 1000001,
+            "successful_attempts": 0,
+            "steps": 0,
+            "retries": 0,
+            "errors": 0,
+            "duration_ms": 0,
+            "user_corrections": 0
+        }),
     ];
     let mut evaluation_ids = Vec::new();
     for (index, value) in evaluation_cases.iter().enumerate() {
         let id = Uuid::now_v7();
         evaluation_ids.push((id, value.clone()));
-        sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,evaluation) VALUES ($1,$2,$3,'invalid-eval','tester','legacy',$4)").bind(id).bind(skill_id).bind((index+2) as i64).bind(value).execute(&mut connection).await.expect("insert malformed evaluation");
+        sqlx::query(
+            "INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,evaluation) VALUES ($1,$2,$3,'invalid-eval','tester','legacy',$4)",
+        )
+        .bind(id)
+        .bind(skill_id)
+        .bind((index + 2) as i64)
+        .bind(value)
+        .execute(&mut connection)
+        .await
+        .expect("insert malformed evaluation");
     }
     let other_profile = Uuid::now_v7();
     let other_user_id = Uuid::now_v7();
@@ -270,11 +323,249 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     .execute(&mut connection)
     .await
     .expect("upgrade schema 14 to 15");
+    let safe_worktree_id = Uuid::now_v7();
+    let unsafe_branch_worktree_id = Uuid::now_v7();
+    let cross_workspace_task_worktree_id = Uuid::now_v7();
+    let cross_workspace_owner_worktree_id = Uuid::now_v7();
+    let unsafe_base_commit_worktree_id = Uuid::now_v7();
+    let unsafe_path_worktree_id = Uuid::now_v7();
+    let unsafe_changed_files_worktree_id = Uuid::now_v7();
+    let safe_worktree_task_id = Uuid::now_v7();
+    let unsafe_worktree_task_id = Uuid::now_v7();
+    let foreign_worktree_task_id = Uuid::now_v7();
+    let worktree_agent_id = Uuid::now_v7();
+    let foreign_worktree_agent_id = Uuid::now_v7();
+    let legacy_activity_at = OffsetDateTime::now_utc() - Duration::hours(1);
+    for task_id in [safe_worktree_task_id, unsafe_worktree_task_id] {
+        sqlx::query(
+            "INSERT INTO tasks (id,workspace_id,title,state) VALUES ($1,$2,'Legacy worktree task','BACKLOG')",
+        )
+        .bind(task_id)
+        .bind(workspace)
+        .execute(&mut connection)
+        .await
+        .expect("seed schema-15 local worktree task");
+    }
+    sqlx::query(
+        "INSERT INTO tasks (id,workspace_id,title,state) VALUES ($1,$2,'Foreign worktree task','BACKLOG')",
+    )
+    .bind(foreign_worktree_task_id)
+    .bind(other_workspace)
+    .execute(&mut connection)
+    .await
+    .expect("seed schema-15 foreign worktree task");
+    for (agent_id, agent_workspace, name) in [
+        (worktree_agent_id, workspace, "Legacy worktree agent"),
+        (
+            foreign_worktree_agent_id,
+            other_workspace,
+            "Foreign worktree agent",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO agents (id,workspace_id,name,kind,permissions,status) \
+             VALUES ($1,$2,$3,'coding','{}','paused')",
+        )
+        .bind(agent_id)
+        .bind(agent_workspace)
+        .bind(name)
+        .execute(&mut connection)
+        .await
+        .expect("seed schema-15 worktree agent");
+    }
+    let worktree_path = |task_id: Uuid| {
+        format!(
+            "/srv/legacy/worktrees/task-{}",
+            &task_id.simple().to_string()[..12]
+        )
+    };
+    let seeded_worktrees = vec![
+        (
+            safe_worktree_id,
+            safe_worktree_task_id,
+            worktree_agent_id,
+            "agent/schema-15-safe".to_string(),
+            "a".repeat(40),
+            worktree_path(safe_worktree_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            unsafe_branch_worktree_id,
+            unsafe_worktree_task_id,
+            worktree_agent_id,
+            "agent/schema-15[unsafe".to_string(),
+            "a".repeat(40),
+            worktree_path(unsafe_worktree_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            cross_workspace_task_worktree_id,
+            foreign_worktree_task_id,
+            worktree_agent_id,
+            "agent/schema-15-cross-task".to_string(),
+            "a".repeat(40),
+            worktree_path(foreign_worktree_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            cross_workspace_owner_worktree_id,
+            unsafe_worktree_task_id,
+            foreign_worktree_agent_id,
+            "agent/schema-15-cross-owner".to_string(),
+            "a".repeat(40),
+            worktree_path(unsafe_worktree_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            unsafe_base_commit_worktree_id,
+            unsafe_worktree_task_id,
+            worktree_agent_id,
+            "agent/schema-15-unsafe-base".to_string(),
+            "not-a-full-object-id".to_string(),
+            worktree_path(unsafe_worktree_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            unsafe_path_worktree_id,
+            unsafe_worktree_task_id,
+            worktree_agent_id,
+            "agent/schema-15-unsafe-path".to_string(),
+            "a".repeat(40),
+            "/srv/legacy/derived-path".to_string(),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            unsafe_changed_files_worktree_id,
+            unsafe_worktree_task_id,
+            worktree_agent_id,
+            "agent/schema-15-unsafe-files".to_string(),
+            "a".repeat(40),
+            worktree_path(unsafe_worktree_task_id),
+            vec!["a/../legacy.rs".to_string()],
+        ),
+    ];
+    for (id, task_id, owner_agent_id, branch, base_commit, path, changed_files) in seeded_worktrees
+    {
+        sqlx::query(
+            "INSERT INTO worktrees \
+             (id,workspace_id,task_id,owner_agent_id,branch,base_commit,path,status,changed_files,last_activity_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',$8,$9)",
+        )
+        .bind(id)
+        .bind(workspace)
+        .bind(task_id)
+        .bind(owner_agent_id)
+        .bind(branch)
+        .bind(base_commit)
+        .bind(path)
+        .bind(changed_files)
+        .bind(legacy_activity_at)
+        .execute(&mut connection)
+        .await
+        .expect("seed schema-15 worktree");
+    }
+    sqlx::raw_sql(include_str!("../migrations/0016_worktree_integrity.sql"))
+        .execute(&mut connection)
+        .await
+        .expect("upgrade schema 15 to 16");
     let version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
         .fetch_one(&mut connection)
         .await
         .expect("read schema version");
-    assert_eq!(version, 15);
+    assert_eq!(version, 16);
+    let safe_survives: i64 = sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
+        .bind(safe_worktree_id)
+        .fetch_one(&mut connection)
+        .await
+        .expect("safe schema-15 worktree survives");
+    assert_eq!(safe_survives, 1);
+    for (id, reason) in [
+        (unsafe_branch_worktree_id, "unsafe_branch"),
+        (cross_workspace_task_worktree_id, "cross_workspace_task"),
+        (
+            cross_workspace_owner_worktree_id,
+            "cross_workspace_owner_agent",
+        ),
+        (unsafe_base_commit_worktree_id, "unsafe_base_commit"),
+        (unsafe_path_worktree_id, "unsafe_path"),
+        (unsafe_changed_files_worktree_id, "unsafe_changed_files"),
+    ] {
+        let removed: i64 = sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("unsafe schema-15 worktree removed");
+        assert_eq!(removed, 0, "{reason} worktree must be removed");
+        let quarantined_reason: String =
+            sqlx::query_scalar("SELECT reason FROM worktree_integrity_quarantine WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut connection)
+                .await
+                .expect("unsafe schema-15 worktree quarantined");
+        assert!(
+            quarantined_reason.contains(reason),
+            "quarantine reason must preserve {reason}: {quarantined_reason}"
+        );
+    }
+    let quarantined: (
+        Uuid,
+        Uuid,
+        Uuid,
+        Uuid,
+        String,
+        String,
+        String,
+        String,
+        Vec<String>,
+        OffsetDateTime,
+        String,
+        OffsetDateTime,
+    ) = sqlx::query_as(
+        "SELECT id,workspace_id,task_id,owner_agent_id,branch,base_commit,path,status,changed_files,last_activity_at,reason,quarantined_at \
+         FROM worktree_integrity_quarantine WHERE id=$1",
+    )
+    .bind(unsafe_branch_worktree_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("unsafe worktree is fully quarantined");
+    assert_eq!(quarantined.0, unsafe_branch_worktree_id);
+    assert_eq!(quarantined.1, workspace);
+    assert_eq!(quarantined.2, unsafe_worktree_task_id);
+    assert_eq!(quarantined.3, worktree_agent_id);
+    assert_eq!(quarantined.4, "agent/schema-15[unsafe");
+    assert_eq!(quarantined.5, "a".repeat(40));
+    assert_eq!(
+        quarantined.6,
+        format!(
+            "/srv/legacy/worktrees/task-{}",
+            &unsafe_worktree_task_id.simple().to_string()[..12]
+        )
+    );
+    assert_eq!(quarantined.7, "ACTIVE");
+    assert_eq!(quarantined.8, vec!["legacy.rs".to_string()]);
+    assert_eq!(quarantined.9, legacy_activity_at);
+    assert!(quarantined.10.contains("unsafe_branch"));
+    assert!(quarantined.11 >= legacy_activity_at);
+    assert!(
+        sqlx::query(
+            "INSERT INTO worktrees \
+             (id,workspace_id,task_id,owner_agent_id,branch,base_commit,path,status,changed_files) \
+             VALUES ($1,$2,$3,$4,'agent[recurrence',$5,$6,'ACTIVE',ARRAY[]::text[])",
+        )
+        .bind(Uuid::now_v7())
+        .bind(workspace)
+        .bind(safe_worktree_task_id)
+        .bind(worktree_agent_id)
+        .bind("a".repeat(40))
+        .bind(format!(
+            "/srv/legacy/worktrees/task-{}",
+            &safe_worktree_task_id.simple().to_string()[..12]
+        ))
+        .execute(&mut connection)
+        .await
+        .is_err(),
+        "schema 16 must block unsafe worktree recurrence"
+    );
     for (id, original) in &evaluation_ids {
         let live: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT evaluation FROM skill_revisions WHERE id=$1")
@@ -670,7 +961,7 @@ async fn vault_round_trip_never_persists_plaintext() {
         .expect("encrypt provider credential");
     sqlx::query(
         "INSERT INTO secret_references \
-         (id, profile_id, backend, locator, encrypted_value, nonce, key_version, purpose, algorithm, wrapped_data_key, wrap_nonce) \
+         (id,profile_id,backend,locator,encrypted_value,nonce,key_version,purpose,algorithm,wrapped_data_key,wrap_nonce) \
          VALUES ($1,$2,'encrypted_database','database',$3,$4,$5,'provider_credential',$6,$7,$8)",
     )
     .bind(&id)
@@ -742,7 +1033,7 @@ async fn vault_round_trip_never_persists_plaintext() {
 }
 
 #[tokio::test]
-async fn deployed_schema_v3_upgrades_to_v15() {
+async fn deployed_schema_v3_upgrades_to_v16() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -777,7 +1068,9 @@ async fn deployed_schema_v3_upgrades_to_v15() {
     let autobiography = Uuid::now_v7();
     let conversation_id = Uuid::now_v7();
     let workspace_id = Uuid::now_v7();
+    let foreign_workspace_id = Uuid::now_v7();
     let agent_id = Uuid::now_v7();
+    let foreign_agent_id = Uuid::now_v7();
     let run_id = Uuid::now_v7();
     let chunk_id = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'upgrade-test')")
@@ -795,12 +1088,16 @@ async fn deployed_schema_v3_upgrades_to_v15() {
     .execute(&mut connection)
     .await
     .expect("create v1 user");
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'Legacy workspace')")
-        .bind(workspace_id)
-        .bind(profile_id)
-        .execute(&mut connection)
-        .await
-        .expect("create v1 workspace");
+    sqlx::query(
+        "INSERT INTO workspaces (id,profile_id,title) \
+         VALUES ($1,$2,'Legacy workspace'),($3,$2,'Foreign legacy workspace')",
+    )
+    .bind(workspace_id)
+    .bind(profile_id)
+    .bind(foreign_workspace_id)
+    .execute(&mut connection)
+    .await
+    .expect("create v1 workspaces");
     sqlx::query("INSERT INTO audit_events (actor_user_id,profile_id,action,resource_type,resource_id,outcome) VALUES ($1,$2,'workspace.created','workspace',$3,'success')")
         .bind(user_id).bind(profile_id).bind(workspace_id.to_string()).execute(&mut connection).await.expect("audit workspace creator");
     sqlx::query("INSERT INTO agents (id,workspace_id,name,kind,permissions,status) VALUES ($1,$2,'Legacy agent','coding','{}','paused')")
@@ -1036,6 +1333,137 @@ async fn deployed_schema_v3_upgrades_to_v15() {
         .execute(&mut connection)
         .await;
     assert!(immutable.is_err(), "revision trigger must reject updates");
+    let legacy_safe_task_id = Uuid::now_v7();
+    let legacy_unsafe_task_id = Uuid::now_v7();
+    let legacy_foreign_task_id = Uuid::now_v7();
+    let legacy_safe_worktree_id = Uuid::now_v7();
+    let legacy_unsafe_branch_worktree_id = Uuid::now_v7();
+    let legacy_cross_task_worktree_id = Uuid::now_v7();
+    let legacy_cross_owner_worktree_id = Uuid::now_v7();
+    let legacy_unsafe_base_worktree_id = Uuid::now_v7();
+    let legacy_unsafe_path_worktree_id = Uuid::now_v7();
+    let legacy_unsafe_files_worktree_id = Uuid::now_v7();
+    let legacy_worktree_activity_at = OffsetDateTime::now_utc() - Duration::hours(1);
+    for task_id in [legacy_safe_task_id, legacy_unsafe_task_id] {
+        sqlx::query(
+            "INSERT INTO tasks (id,workspace_id,title,state) \
+             VALUES ($1,$2,'Schema three worktree task','BACKLOG')",
+        )
+        .bind(task_id)
+        .bind(workspace_id)
+        .execute(&mut connection)
+        .await
+        .expect("seed schema-3 local worktree task");
+    }
+    sqlx::query(
+        "INSERT INTO tasks (id,workspace_id,title,state) \
+         VALUES ($1,$2,'Schema three foreign worktree task','BACKLOG')",
+    )
+    .bind(legacy_foreign_task_id)
+    .bind(foreign_workspace_id)
+    .execute(&mut connection)
+    .await
+    .expect("seed schema-3 foreign worktree task");
+    sqlx::query(
+        "INSERT INTO agents (id,workspace_id,name,kind,permissions,status) \
+         VALUES ($1,$2,'Foreign legacy agent','coding','{}','paused')",
+    )
+    .bind(foreign_agent_id)
+    .bind(foreign_workspace_id)
+    .execute(&mut connection)
+    .await
+    .expect("seed schema-3 foreign worktree agent");
+    let legacy_worktree_path = |task_id: Uuid| {
+        format!(
+            "/srv/schema-3/worktrees/task-{}",
+            &task_id.simple().to_string()[..12]
+        )
+    };
+    let seeded_worktrees = vec![
+        (
+            legacy_safe_worktree_id,
+            legacy_safe_task_id,
+            agent_id,
+            "agent/schema-3-safe".to_string(),
+            "a".repeat(40),
+            legacy_worktree_path(legacy_safe_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            legacy_unsafe_branch_worktree_id,
+            legacy_unsafe_task_id,
+            agent_id,
+            "agent/schema-3[unsafe".to_string(),
+            "a".repeat(40),
+            legacy_worktree_path(legacy_unsafe_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            legacy_cross_task_worktree_id,
+            legacy_foreign_task_id,
+            agent_id,
+            "agent/schema-3-cross-task".to_string(),
+            "a".repeat(40),
+            legacy_worktree_path(legacy_foreign_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            legacy_cross_owner_worktree_id,
+            legacy_unsafe_task_id,
+            foreign_agent_id,
+            "agent/schema-3-cross-owner".to_string(),
+            "a".repeat(40),
+            legacy_worktree_path(legacy_unsafe_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            legacy_unsafe_base_worktree_id,
+            legacy_unsafe_task_id,
+            agent_id,
+            "agent/schema-3-unsafe-base".to_string(),
+            "not-a-full-object-id".to_string(),
+            legacy_worktree_path(legacy_unsafe_task_id),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            legacy_unsafe_path_worktree_id,
+            legacy_unsafe_task_id,
+            agent_id,
+            "agent/schema-3-unsafe-path".to_string(),
+            "a".repeat(40),
+            "/srv/schema-3/derived-path".to_string(),
+            vec!["legacy.rs".to_string()],
+        ),
+        (
+            legacy_unsafe_files_worktree_id,
+            legacy_unsafe_task_id,
+            agent_id,
+            "agent/schema-3-unsafe-files".to_string(),
+            "a".repeat(40),
+            legacy_worktree_path(legacy_unsafe_task_id),
+            vec!["a/../legacy.rs".to_string()],
+        ),
+    ];
+    for (id, task_id, owner_agent_id, branch, base_commit, path, changed_files) in seeded_worktrees
+    {
+        sqlx::query(
+            "INSERT INTO worktrees \
+             (id,workspace_id,task_id,owner_agent_id,branch,base_commit,path,status,changed_files,last_activity_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',$8,$9)",
+        )
+        .bind(id)
+        .bind(workspace_id)
+        .bind(task_id)
+        .bind(owner_agent_id)
+        .bind(branch)
+        .bind(base_commit)
+        .bind(path)
+        .bind(changed_files)
+        .bind(legacy_worktree_activity_at)
+        .execute(&mut connection)
+        .await
+        .expect("seed schema-3 worktree");
+    }
     let migrations = [
         (
             "0004_login_attempts.sql",
@@ -1085,6 +1513,10 @@ async fn deployed_schema_v3_upgrades_to_v15() {
             "0015_skill_lifecycle_hardening.sql",
             include_str!("../migrations/0015_skill_lifecycle_hardening.sql"),
         ),
+        (
+            "0016_worktree_integrity.sql",
+            include_str!("../migrations/0016_worktree_integrity.sql"),
+        ),
     ];
     for (migration, sql) in migrations {
         sqlx::raw_sql(sql)
@@ -1096,7 +1528,91 @@ async fn deployed_schema_v3_upgrades_to_v15() {
         .fetch_one(&mut connection)
         .await
         .expect("read final schema version");
-    assert_eq!(final_schema, 15);
+    assert_eq!(final_schema, 16);
+    let safe_worktree_survives: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
+            .bind(legacy_safe_worktree_id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("safe schema-3 worktree survives upgrade");
+    assert_eq!(safe_worktree_survives, 1);
+    for (id, reason) in [
+        (legacy_unsafe_branch_worktree_id, "unsafe_branch"),
+        (legacy_cross_task_worktree_id, "cross_workspace_task"),
+        (
+            legacy_cross_owner_worktree_id,
+            "cross_workspace_owner_agent",
+        ),
+        (legacy_unsafe_base_worktree_id, "unsafe_base_commit"),
+        (legacy_unsafe_path_worktree_id, "unsafe_path"),
+        (legacy_unsafe_files_worktree_id, "unsafe_changed_files"),
+    ] {
+        let removed: i64 = sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
+            .bind(id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("unsafe schema-3 worktree is removed");
+        assert_eq!(removed, 0, "{reason} worktree must be removed");
+        let quarantined_reason: String =
+            sqlx::query_scalar("SELECT reason FROM worktree_integrity_quarantine WHERE id=$1")
+                .bind(id)
+                .fetch_one(&mut connection)
+                .await
+                .expect("unsafe schema-3 worktree is quarantined");
+        assert!(
+            quarantined_reason.contains(reason),
+            "quarantine reason must preserve {reason}: {quarantined_reason}"
+        );
+    }
+    let quarantined_schema_three: (
+        String,
+        String,
+        String,
+        Vec<String>,
+        OffsetDateTime,
+        String,
+        OffsetDateTime,
+    ) = sqlx::query_as(
+        "SELECT branch,base_commit,path,changed_files,last_activity_at,reason,quarantined_at \
+         FROM worktree_integrity_quarantine WHERE id=$1",
+    )
+    .bind(legacy_unsafe_branch_worktree_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("unsafe schema-3 worktree is fully quarantined");
+    assert_eq!(quarantined_schema_three.0, "agent/schema-3[unsafe");
+    assert_eq!(quarantined_schema_three.1, "a".repeat(40));
+    assert_eq!(
+        quarantined_schema_three.2,
+        format!(
+            "/srv/schema-3/worktrees/task-{}",
+            &legacy_unsafe_task_id.simple().to_string()[..12]
+        )
+    );
+    assert_eq!(quarantined_schema_three.3, vec!["legacy.rs".to_string()]);
+    assert_eq!(quarantined_schema_three.4, legacy_worktree_activity_at);
+    assert!(quarantined_schema_three.5.contains("unsafe_branch"));
+    assert!(quarantined_schema_three.6 >= legacy_worktree_activity_at);
+    assert!(
+        sqlx::query(
+            "INSERT INTO worktrees \
+             (id,workspace_id,task_id,owner_agent_id,branch,base_commit,path,status,changed_files) \
+             VALUES ($1,$2,$3,$4,'agent[recurrence',$5,$6,'ACTIVE',ARRAY[]::text[])",
+        )
+        .bind(Uuid::now_v7())
+        .bind(workspace_id)
+        .bind(legacy_safe_task_id)
+        .bind(agent_id)
+        .bind("a".repeat(40))
+        .bind(format!(
+            "/srv/schema-3/worktrees/task-{}",
+            &legacy_safe_task_id.simple().to_string()[..12]
+        ))
+        .execute(&mut connection)
+        .await
+        .is_err(),
+        "upgraded schema must block unsafe worktree recurrence"
+    );
     let source_trigger: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM pg_trigger WHERE tgname='skill_revisions_sources_valid')",
     )

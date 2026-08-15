@@ -20,6 +20,7 @@ pub mod vault;
 pub mod vault_api;
 pub mod webhook_scheduler;
 pub mod webhooks;
+pub mod worktree_api;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -90,18 +91,14 @@ pub fn router(state: AppState) -> Router {
             get(conversation_api::list_conversations).post(conversation_api::create_conversation),
         )
         .route(
-            "/workspaces/{workspace_id}/tasks",
-            get(task_api::list_tasks).post(task_api::create_task),
+            "/workspaces/{workspace_id}/worktrees",
+            get(worktree_api::list_worktrees).post(worktree_api::create_worktree),
         )
         .route(
-            "/workspaces/{workspace_id}/activity",
-            get(task_api::list_activity).post(task_api::create_activity),
-        )
-        .route(
-            "/tasks/{id}",
-            get(task_api::get_task)
-                .patch(task_api::update_task)
-                .put(task_api::update_task),
+            "/worktrees/{id}",
+            get(worktree_api::get_worktree)
+                .patch(worktree_api::update_worktree)
+                .delete(worktree_api::delete_worktree),
         )
         .route(
             "/conversations/search",
