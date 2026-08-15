@@ -1580,7 +1580,7 @@ async fn automatic_promotion_requires_recorded_non_regression() {
     assert_eq!(state, (7, 7));
     let eval_audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.evaluated' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("evaluation audits");
     assert_eq!(eval_audits, 7);
-    let auto_resources:Vec<String>=sqlx::query_scalar("SELECT resource_id FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.automatically_promoted' AND resource_type='skill_revision' AND outcome='success' ORDER BY id").bind(owner).bind(profile_id).fetch_all(&pool).await.expect("automatic resources");
+    let auto_resources:Vec<String>=sqlx::query_scalar("SELECT resource_id FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.automatically_promoted' AND resource_type='skill_revision' AND outcome='success' ORDER BY sequence").bind(owner).bind(profile_id).fetch_all(&pool).await.expect("automatic resources");
     assert_eq!(auto_resources.len(), 2);
     assert!(auto_resources.contains(&baseline_id));
     let qualifying_id: String =
