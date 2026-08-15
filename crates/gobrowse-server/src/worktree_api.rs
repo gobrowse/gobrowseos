@@ -334,13 +334,13 @@ fn validation(error: impl ToString) -> AppError {
 }
 
 fn conflict_from_database(error: sqlx::Error) -> AppError {
-    if let sqlx::Error::Database(database) = &error {
-        if database.constraint().is_some_and(|constraint| {
+    if let sqlx::Error::Database(database) = &error
+        && database.constraint().is_some_and(|constraint| {
             constraint == "worktrees_workspace_id_branch_key"
                 || constraint == "worktrees_workspace_id_path_key"
-        }) {
-            return AppError::Conflict("worktree branch or path is already owned");
-        }
+        })
+    {
+        return AppError::Conflict("worktree branch or path is already owned");
     }
     AppError::Database(error)
 }

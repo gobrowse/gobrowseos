@@ -507,20 +507,7 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
             "quarantine reason must preserve {reason}: {quarantined_reason}"
         );
     }
-    let quarantined: (
-        Uuid,
-        Uuid,
-        Uuid,
-        Uuid,
-        String,
-        String,
-        String,
-        String,
-        Vec<String>,
-        OffsetDateTime,
-        String,
-        OffsetDateTime,
-    ) = sqlx::query_as(
+    let quarantined = sqlx::query(
         "SELECT id,workspace_id,task_id,owner_agent_id,branch,base_commit,path,status,changed_files,last_activity_at,reason,quarantined_at \
          FROM worktree_integrity_quarantine WHERE id=$1",
     )
@@ -528,24 +515,43 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
     .fetch_one(&mut connection)
     .await
     .expect("unsafe worktree is fully quarantined");
-    assert_eq!(quarantined.0, unsafe_branch_worktree_id);
-    assert_eq!(quarantined.1, workspace);
-    assert_eq!(quarantined.2, unsafe_worktree_task_id);
-    assert_eq!(quarantined.3, worktree_agent_id);
-    assert_eq!(quarantined.4, "agent/schema-15[unsafe");
-    assert_eq!(quarantined.5, "a".repeat(40));
+    assert_eq!(quarantined.get::<Uuid, _>("id"), unsafe_branch_worktree_id);
+    assert_eq!(quarantined.get::<Uuid, _>("workspace_id"), workspace);
     assert_eq!(
-        quarantined.6,
+        quarantined.get::<Uuid, _>("task_id"),
+        unsafe_worktree_task_id
+    );
+    assert_eq!(
+        quarantined.get::<Uuid, _>("owner_agent_id"),
+        worktree_agent_id
+    );
+    assert_eq!(
+        quarantined.get::<String, _>("branch"),
+        "agent/schema-15[unsafe"
+    );
+    assert_eq!(quarantined.get::<String, _>("base_commit"), "a".repeat(40));
+    assert_eq!(
+        quarantined.get::<String, _>("path"),
         format!(
             "/srv/legacy/worktrees/task-{}",
             &unsafe_worktree_task_id.simple().to_string()[..12]
         )
     );
-    assert_eq!(quarantined.7, "ACTIVE");
-    assert_eq!(quarantined.8, vec!["legacy.rs".to_string()]);
-    assert_eq!(quarantined.9, legacy_activity_at);
-    assert!(quarantined.10.contains("unsafe_branch"));
-    assert!(quarantined.11 >= legacy_activity_at);
+    assert_eq!(quarantined.get::<String, _>("status"), "ACTIVE");
+    assert_eq!(
+        quarantined.get::<Vec<String>, _>("changed_files"),
+        vec!["legacy.rs".to_string()]
+    );
+    assert_eq!(
+        quarantined.get::<OffsetDateTime, _>("last_activity_at"),
+        legacy_activity_at
+    );
+    assert!(
+        quarantined
+            .get::<String, _>("reason")
+            .contains("unsafe_branch")
+    );
+    assert!(quarantined.get::<OffsetDateTime, _>("quarantined_at") >= legacy_activity_at);
     assert!(
         sqlx::query(
             "INSERT INTO worktrees \
