@@ -796,7 +796,7 @@ mod tests {
 
         for (index, (method, result)) in supported.iter().enumerate() {
             let id = RequestId::Number(index as i64 + 1);
-            let response = validated_response_for_method(*method, id.clone(), Ok(result.clone()))
+            let response = validated_response_for_method(method, id.clone(), Ok(result.clone()))
                 .expect("valid bounded success result");
             let encoded = encode(&ValidatedMessage::Response(response)).expect("encode response");
             let response = match decode(&encoded).expect("decode response") {
