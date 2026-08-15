@@ -1339,12 +1339,14 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         .execute(&mut connection)
         .await;
     assert!(immutable.is_err(), "revision trigger must reject updates");
-    let legacy_safe_task_id = Uuid::now_v7();
-    let legacy_unsafe_task_id = Uuid::now_v7();
-    let legacy_foreign_task_id = Uuid::now_v7();
-    let legacy_cross_owner_task_id = Uuid::now_v7();
-    let legacy_unsafe_base_task_id = Uuid::now_v7();
-    let legacy_unsafe_files_task_id = Uuid::now_v7();
+    let legacy_safe_task_id = Uuid::from_u128(0x00000000000170008000000000000001);
+    let legacy_unsafe_task_id = Uuid::from_u128(0x00000000000270008000000000000002);
+    let legacy_foreign_task_id = Uuid::from_u128(0x00000000000370008000000000000003);
+    let legacy_cross_owner_task_id = Uuid::from_u128(0x00000000000470008000000000000004);
+    let legacy_unsafe_base_task_id = Uuid::from_u128(0x00000000000570008000000000000005);
+    let legacy_unsafe_path_task_id = Uuid::from_u128(0x00000000000670008000000000000006);
+    let legacy_unsafe_files_task_id = Uuid::from_u128(0x00000000000770008000000000000007);
+    let legacy_unsafe_recurrence_task_id = Uuid::from_u128(0x00000000000870008000000000000008);
     let legacy_safe_worktree_id = Uuid::now_v7();
     let legacy_unsafe_branch_worktree_id = Uuid::now_v7();
     let legacy_cross_task_worktree_id = Uuid::now_v7();
@@ -1358,7 +1360,9 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         legacy_unsafe_task_id,
         legacy_cross_owner_task_id,
         legacy_unsafe_base_task_id,
+        legacy_unsafe_path_task_id,
         legacy_unsafe_files_task_id,
+        legacy_unsafe_recurrence_task_id,
     ] {
         sqlx::query(
             "INSERT INTO tasks (id,workspace_id,title,state) \
@@ -1442,7 +1446,7 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         ),
         (
             legacy_unsafe_path_worktree_id,
-            legacy_unsafe_task_id,
+            legacy_unsafe_path_task_id,
             agent_id,
             "agent/schema-3-unsafe-path".to_string(),
             "a".repeat(40),
@@ -1616,13 +1620,10 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         )
         .bind(Uuid::now_v7())
         .bind(workspace_id)
-        .bind(legacy_safe_task_id)
+        .bind(legacy_unsafe_recurrence_task_id)
         .bind(agent_id)
         .bind("a".repeat(40))
-        .bind(format!(
-            "/srv/schema-3/worktrees/task-{}",
-            &legacy_safe_task_id.simple().to_string()[..12]
-        ))
+        .bind(legacy_worktree_path(legacy_unsafe_recurrence_task_id))
         .execute(&mut connection)
         .await
         .is_err(),
