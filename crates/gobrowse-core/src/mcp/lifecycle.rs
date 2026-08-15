@@ -121,6 +121,9 @@ impl SessionLifecycle {
         {
             return Err(LifecycleError::IllegalTransition);
         }
+        self.generation
+            .checked_add(1)
+            .ok_or(LifecycleError::IdExhausted)?;
         self.reconnect_attempts = 0;
         self.begin_connect_inner()
     }
@@ -198,7 +201,6 @@ impl SessionLifecycle {
             return Err(LifecycleError::IllegalTransition);
         }
         self.state = SessionState::Ready;
-        self.reconnect_attempts = 0;
         Ok(())
     }
     pub fn allocate_and_reserve(&mut self) -> Result<PendingToken, LifecycleError> {
@@ -417,6 +419,40 @@ mod tests {
         assert_eq!(life.begin_close().unwrap(), Vec::new());
         life.finish_close().unwrap();
         assert_eq!(life.finish_close(), Ok(()));
+    }
+    #[test]
+    fn fresh_connect_failure_is_mutation_free_and_ready_preserves_budget() {
+        let mut life = SessionLifecycle::new();
+        life.generation = u64::MAX;
+        life.reconnect_attempts = 2;
+        let snapshot = (
+            life.state,
+            life.generation,
+            life.reconnect_attempts,
+            life.pending_len(),
+        );
+        assert_eq!(life.begin_connect(), Err(LifecycleError::IdExhausted));
+        assert_eq!(
+            (
+                life.state,
+                life.generation,
+                life.reconnect_attempts,
+                life.pending_len()
+            ),
+            snapshot
+        );
+        let mut ready = SessionLifecycle::new();
+        ready.begin_connect().unwrap();
+        ready.begin_discovery().unwrap();
+        ready
+            .bind_negotiation(
+                McpProtocolEra::Modern20260728,
+                ServerCapabilities::default(),
+            )
+            .unwrap();
+        ready.reconnect_attempts = 2;
+        ready.mark_ready().unwrap();
+        assert_eq!(ready.reconnect_attempts(), 2);
     }
     #[test]
     fn legacy_path_and_id_exhaustion_are_boundaries() {

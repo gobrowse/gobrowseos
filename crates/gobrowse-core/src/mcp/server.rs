@@ -84,41 +84,60 @@ fn not_found<T>() -> Result<T, RpcError> {
     })
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum NegotiationState {
+    Pristine,
+    LegacyStaged {
+        era: McpProtocolEra,
+        capabilities: ServerCapabilities,
+    },
+    Ready {
+        era: McpProtocolEra,
+        capabilities: ServerCapabilities,
+    },
+    Rejected,
+}
 pub struct McpServerDispatcher<H> {
     handler: H,
-    era: Option<McpProtocolEra>,
-    capabilities: Option<ServerCapabilities>,
-    pending_legacy: Option<(McpProtocolEra, ServerCapabilities)>,
-    initialize_seen: bool,
-    initialized_seen: bool,
+    negotiation: NegotiationState,
 }
 impl<H: McpServerHandler> McpServerDispatcher<H> {
     pub fn new(handler: H) -> Self {
         Self {
             handler,
-            era: None,
-            capabilities: None,
-            pending_legacy: None,
-            initialize_seen: false,
-            initialized_seen: false,
+            negotiation: NegotiationState::Pristine,
         }
     }
-    pub const fn capabilities(&self) -> Option<&ServerCapabilities> {
-        self.capabilities.as_ref()
+    pub fn capabilities(&self) -> Option<&ServerCapabilities> {
+        match &self.negotiation {
+            NegotiationState::Ready { capabilities, .. } => Some(capabilities),
+            _ => None,
+        }
     }
-    pub const fn era(&self) -> Option<McpProtocolEra> {
-        self.era
+    pub fn era(&self) -> Option<McpProtocolEra> {
+        match self.negotiation {
+            NegotiationState::Ready { era, .. } => Some(era),
+            _ => None,
+        }
     }
-    pub const fn initialized(&self) -> bool {
-        self.initialized_seen
+    pub fn initialized(&self) -> bool {
+        matches!(self.negotiation, NegotiationState::Ready { .. })
     }
 
     pub async fn dispatch(&mut self, request: ValidatedRequest) -> ValidatedResponse {
         let id = request.id().clone();
         let method = request.method().to_owned();
+        let before = self.negotiation.clone();
         let result = self.dispatch_request(request).await;
-        validated_response_for_method(&method, id.clone(), result)
-            .unwrap_or_else(|_| safe_internal_error_response(id))
+        match validated_response_for_method(&method, id.clone(), result) {
+            Ok(response) => response,
+            Err(_) => {
+                if !matches!(self.negotiation, NegotiationState::Rejected) {
+                    self.negotiation = before;
+                }
+                safe_internal_error_response(id)
+            }
+        }
     }
     pub async fn notify(
         &mut self,
@@ -126,16 +145,13 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
     ) -> Result<(), DispatchError> {
         match notification.method() {
             METHOD_INITIALIZED => {
-                if self.pending_legacy.is_none() || !self.initialize_seen || self.initialized_seen {
+                let NegotiationState::LegacyStaged { era, capabilities } = &self.negotiation else {
                     return Err(DispatchError::Negotiation);
-                }
-                let (era, capabilities) = self
-                    .pending_legacy
-                    .take()
-                    .ok_or(DispatchError::Negotiation)?;
-                self.era = Some(era);
-                self.capabilities = Some(capabilities);
-                self.initialized_seen = true;
+                };
+                self.negotiation = NegotiationState::Ready {
+                    era: *era,
+                    capabilities: capabilities.clone(),
+                };
                 Ok(())
             }
             METHOD_CANCELLED => {
@@ -157,7 +173,8 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
             METHOD_RESOURCE_UPDATED => {
                 self.notification_capability(CapabilityNotification::ResourceUpdated)
             }
-            METHOD_PROGRESS | METHOD_LOGGING_MESSAGE => Err(DispatchError::NotSupported),
+            METHOD_PROGRESS => Err(DispatchError::NotSupported),
+            METHOD_LOGGING_MESSAGE => self.notification_capability(CapabilityNotification::Logging),
             _ => Ok(()),
         }
     }
@@ -169,7 +186,10 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
             .unwrap_or_else(|| Value::Object(Default::default()));
         match method.as_str() {
             METHOD_DISCOVER => {
-                if self.era.is_some() || self.pending_legacy.is_some() || self.initialize_seen {
+                if !matches!(self.negotiation, NegotiationState::Pristine) {
+                    if matches!(self.negotiation, NegotiationState::LegacyStaged { .. }) {
+                        self.negotiation = NegotiationState::Rejected;
+                    }
                     return Err(negotiation_error());
                 }
                 let discovered = self.handler.discover().await?;
@@ -186,13 +206,18 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                 if !era.is_modern() {
                     return Err(negotiation_error());
                 }
-                self.era = Some(era);
-                self.capabilities = Some(discovered.capabilities.clone());
-                self.initialized_seen = true;
-                serde_json::to_value(discovered).map_err(internal_error)
+                let value = serde_json::to_value(&discovered).map_err(internal_error)?;
+                self.negotiation = NegotiationState::Ready {
+                    era,
+                    capabilities: discovered.capabilities.clone(),
+                };
+                Ok(value)
             }
             METHOD_INITIALIZE => {
-                if self.initialize_seen || self.era.is_some() {
+                if !matches!(self.negotiation, NegotiationState::Pristine) {
+                    if matches!(self.negotiation, NegotiationState::LegacyStaged { .. }) {
+                        self.negotiation = NegotiationState::Rejected;
+                    }
                     return Err(negotiation_error());
                 }
                 let params: InitializeParams = self.params(Some(&params))?;
@@ -208,10 +233,12 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                 {
                     return Err(negotiation_error());
                 }
-                self.pending_legacy =
-                    Some((McpProtocolEra::Legacy20251125, result.capabilities.clone()));
-                self.initialize_seen = true;
-                serde_json::to_value(result).map_err(internal_error)
+                let value = serde_json::to_value(&result).map_err(internal_error)?;
+                self.negotiation = NegotiationState::LegacyStaged {
+                    era: McpProtocolEra::Legacy20251125,
+                    capabilities: result.capabilities.clone(),
+                };
+                Ok(value)
             }
             METHOD_PING => validated_result(self.handler.ping().await),
             METHOD_TOOLS_LIST => {
@@ -273,7 +300,7 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
         &self,
         notification: CapabilityNotification,
     ) -> Result<(), DispatchError> {
-        let Some(capabilities) = &self.capabilities else {
+        let NegotiationState::Ready { capabilities, .. } = &self.negotiation else {
             return Err(DispatchError::NotInitialized);
         };
         notification_allowed(notification, capabilities)
@@ -285,14 +312,16 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
             .map_err(|_| invalid_params())
     }
     fn require(&self, method: &str) -> Result<(), RpcError> {
-        if !self.initialized_seen {
-            return Err(RpcError {
-                code: ERROR_NOT_INITIALIZED,
-                message: "server is not initialized".into(),
-                data: None,
-            });
-        }
-        let caps = self.capabilities.as_ref().ok_or_else(negotiation_error)?;
+        let caps = match &self.negotiation {
+            NegotiationState::Ready { capabilities, .. } => capabilities,
+            _ => {
+                return Err(RpcError {
+                    code: ERROR_NOT_INITIALIZED,
+                    message: "server is not initialized".into(),
+                    data: None,
+                });
+            }
+        };
         let allowed = match method {
             METHOD_TOOLS_LIST | METHOD_TOOLS_CALL => caps.tools.is_some(),
             METHOD_RESOURCES_LIST | METHOD_RESOURCES_READ => caps.resources.is_some(),
@@ -345,7 +374,7 @@ mod tests {
     use super::*;
     use crate::mcp::{
         capabilities::ToolsCapability,
-        wire::{decode, try_request},
+        wire::{decode, try_notification, try_request},
     };
     struct Fixture;
     #[async_trait]
@@ -371,6 +400,20 @@ mod tests {
             })
         }
     }
+    struct LoggingHandler;
+    #[async_trait]
+    impl McpServerHandler for LoggingHandler {
+        async fn discover(&self) -> Result<DiscoverResult, RpcError> {
+            Ok(DiscoverResult {
+                supported_versions: vec!["2026-07-28".into()],
+                capabilities: ServerCapabilities {
+                    logging: Some(crate::mcp::capabilities::LoggingCapability {}),
+                    ..Default::default()
+                },
+                server_info: None,
+            })
+        }
+    }
     struct BadHandler;
     #[async_trait]
     impl McpServerHandler for BadHandler {
@@ -381,6 +424,19 @@ mod tests {
                 data: Some(serde_json::json!({"wide": []})),
             })
         }
+    }
+    #[tokio::test]
+    async fn logging_notification_requires_negotiated_logging_capability() {
+        let mut dispatcher = McpServerDispatcher::new(LoggingHandler);
+        dispatcher
+            .dispatch(try_request(RequestId::Number(1), METHOD_DISCOVER, None).unwrap())
+            .await;
+        let notification = try_notification(
+            METHOD_LOGGING_MESSAGE,
+            Some(serde_json::json!({"level":"info","data":{}})),
+        )
+        .unwrap();
+        assert_eq!(dispatcher.notify(notification).await, Ok(()));
     }
     #[tokio::test]
     async fn invalid_handler_errors_use_a_safe_non_panicking_fallback() {
@@ -433,12 +489,12 @@ mod tests {
                         .unwrap()
                 )
                 .await
-                .is_ok()
+                .is_err()
         );
         let result = dispatcher
             .dispatch(try_request(RequestId::Number(3), METHOD_TOOLS_LIST, None).unwrap())
             .await;
-        assert!(matches!(result.body(), ResponseBody::Result { .. }));
+        assert!(matches!(result.body(), ResponseBody::Error { .. }));
         assert!(
             dispatcher
                 .notify(

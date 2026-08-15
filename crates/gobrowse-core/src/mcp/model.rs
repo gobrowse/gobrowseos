@@ -180,10 +180,16 @@ pub struct PromptGetResult {
     pub messages: Vec<PromptMessage>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PromptRole {
+    User,
+    Assistant,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptMessage {
-    pub role: String,
+    pub role: PromptRole,
     pub content: Content,
 }
 
@@ -397,7 +403,6 @@ impl ValidateMcp for PromptGetParams {
 }
 impl ValidateMcp for PromptMessage {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
-        valid_name(&self.role)?;
         self.content.validate_mcp()
     }
 }
@@ -485,7 +490,11 @@ impl ValidateMcp for CancelledParams {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         self.request_id
             .validate()
-            .map_err(|_| ValidationError::InvalidValue)
+            .map_err(|_| ValidationError::InvalidValue)?;
+        if let Some(reason) = &self.reason {
+            valid_text(reason)?;
+        }
+        Ok(())
     }
 }
 impl ValidateMcp for ResourceSubscriptionParams {
@@ -507,10 +516,22 @@ pub struct ProgressParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total: Option<u64>,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LoggingLevel {
+    Debug,
+    Info,
+    Notice,
+    Warning,
+    Error,
+    Critical,
+    Alert,
+    Emergency,
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LoggingMessageParams {
-    pub level: String,
+    pub level: LoggingLevel,
     pub data: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logger: Option<String>,
@@ -529,7 +550,6 @@ impl ValidateMcp for ProgressParams {
 }
 impl ValidateMcp for LoggingMessageParams {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
-        valid_name(&self.level)?;
         if let Some(logger) = &self.logger {
             valid_name(logger)?;
         }
@@ -583,6 +603,32 @@ mod tests {
             .validate_mcp()
             .is_err()
         );
+        let cancelled = |reason: Option<String>| CancelledParams {
+            request_id: RequestId::Number(1),
+            reason,
+        };
+        assert!(cancelled(None).validate_mcp().is_ok());
+        assert!(
+            cancelled(Some("x".repeat(validation::MAX_METADATA_TEXT_BYTES)))
+                .validate_mcp()
+                .is_ok()
+        );
+        assert!(
+            cancelled(Some("x".repeat(validation::MAX_METADATA_TEXT_BYTES + 1)))
+                .validate_mcp()
+                .is_err()
+        );
+        assert!(cancelled(Some(String::new())).validate_mcp().is_err());
+        assert_eq!(
+            serde_json::from_str::<PromptRole>("\"user\"").unwrap(),
+            PromptRole::User
+        );
+        assert!(serde_json::from_str::<PromptRole>("\"system\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<LoggingLevel>("\"emergency\"").unwrap(),
+            LoggingLevel::Emergency
+        );
+        assert!(serde_json::from_str::<LoggingLevel>("\"trace\"").is_err());
         let duplicate_resources = ResourceReadResult {
             contents: vec![
                 ResourceContent {

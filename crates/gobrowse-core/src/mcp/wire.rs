@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use std::io::{self, Write};
 
 use super::{
     model::*,
@@ -137,8 +138,26 @@ impl ValidatedResponse {
     pub fn id(&self) -> &RequestId {
         &self.0.id
     }
-    pub fn body(&self) -> &ResponseBody {
+    pub(crate) fn body(&self) -> &ResponseBody {
         &self.0.result
+    }
+    pub fn correlate(self, method: &str) -> Result<CorrelatedResponse, WireError> {
+        if let ResponseBody::Result { result } = &self.0.result {
+            validate_success(method, result)?;
+        }
+        Ok(CorrelatedResponse { response: self })
+    }
+}
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrelatedResponse {
+    response: ValidatedResponse,
+}
+impl CorrelatedResponse {
+    pub fn id(&self) -> &RequestId {
+        self.response.id()
+    }
+    pub fn body(&self) -> &ResponseBody {
+        self.response.body()
     }
 }
 impl ValidatedMessage {
@@ -262,15 +281,43 @@ fn validate_response(response: Response) -> Result<ValidatedResponse, WireError>
         return Err(WireError::InvalidVersion);
     }
     response.id.validate()?;
-    if let ResponseBody::Error { error } = &response.result {
-        if error.message.is_empty() || error.message.len() > MAX_METHOD_BYTES {
-            return Err(WireError::InvalidValue);
+    match &response.result {
+        ResponseBody::Result { result } => {
+            validation::validate_json(result).map_err(|_| WireError::InvalidValue)?
         }
-        if let Some(data) = &error.data {
-            validation::validate_json(data).map_err(|_| WireError::InvalidValue)?;
+        ResponseBody::Error { error } => {
+            if error.message.is_empty() || error.message.len() > MAX_METHOD_BYTES {
+                return Err(WireError::InvalidValue);
+            }
+            if let Some(data) = &error.data {
+                validation::validate_json(data).map_err(|_| WireError::InvalidValue)?;
+            }
         }
     }
+    preflight_size(&response)?;
     Ok(ValidatedResponse(response))
+}
+fn preflight_size(response: &Response) -> Result<(), WireError> {
+    struct Capped(usize);
+    impl Write for Capped {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() > self.0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "frame limit"));
+            }
+            self.0 -= bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Capped(MAX_FRAME_BYTES), response).map_err(|error| {
+        if error.io_error_kind().is_some() {
+            WireError::FrameTooLarge
+        } else {
+            WireError::Malformed
+        }
+    })
 }
 
 pub(crate) fn safe_internal_error_response(id: RequestId) -> ValidatedResponse {
@@ -383,30 +430,42 @@ pub fn try_notification(
         params,
     })
 }
+fn validate_success(method: &str, value: &Value) -> Result<(), WireError> {
+    macro_rules! typed_result {
+        ($ty:ty) => {{
+            let parsed: $ty =
+                serde_json::from_value(value.clone()).map_err(|_| WireError::InvalidValue)?;
+            parsed.validate_mcp().map_err(|_| WireError::InvalidValue)?;
+        }};
+    }
+    match method {
+        METHOD_INITIALIZE => typed_result!(InitializeResult),
+        METHOD_DISCOVER => typed_result!(DiscoverResult),
+        METHOD_PING => {
+            if !value.is_object() {
+                return Err(WireError::InvalidValue);
+            }
+        }
+        METHOD_TOOLS_LIST => typed_result!(Paginated<Tool>),
+        METHOD_TOOLS_CALL => typed_result!(ToolCallResult),
+        METHOD_RESOURCES_LIST => typed_result!(Paginated<Resource>),
+        METHOD_RESOURCES_READ => typed_result!(ResourceReadResult),
+        METHOD_RESOURCES_SUBSCRIBE | METHOD_RESOURCES_UNSUBSCRIBE => {
+            value.validate_mcp().map_err(|_| WireError::InvalidValue)?
+        }
+        METHOD_PROMPTS_LIST => typed_result!(Paginated<Prompt>),
+        METHOD_PROMPTS_GET => typed_result!(PromptGetResult),
+        _ => return Err(WireError::InvalidValue),
+    }
+    Ok(())
+}
 pub fn validated_response_for_method(
     method: &str,
     id: RequestId,
     result: Result<Value, RpcError>,
 ) -> Result<ValidatedResponse, WireError> {
     if let Ok(value) = &result {
-        macro_rules! typed_result {
-            ($ty:ty) => {{
-                let parsed: $ty =
-                    serde_json::from_value(value.clone()).map_err(|_| WireError::InvalidValue)?;
-                parsed.validate_mcp().map_err(|_| WireError::InvalidValue)?;
-            }};
-        }
-        match method {
-            METHOD_INITIALIZE => typed_result!(InitializeResult),
-            METHOD_DISCOVER => typed_result!(DiscoverResult),
-            METHOD_TOOLS_LIST => typed_result!(Paginated<Tool>),
-            METHOD_TOOLS_CALL => typed_result!(ToolCallResult),
-            METHOD_RESOURCES_LIST => typed_result!(Paginated<Resource>),
-            METHOD_RESOURCES_READ => typed_result!(ResourceReadResult),
-            METHOD_PROMPTS_LIST => typed_result!(Paginated<Prompt>),
-            METHOD_PROMPTS_GET => typed_result!(PromptGetResult),
-            _ => value.validate_mcp().map_err(|_| WireError::InvalidValue)?,
-        }
+        validate_success(method, value)?;
     }
     response(id, result)
 }
@@ -449,6 +508,39 @@ mod tests {
         ] {
             assert!(decode(raw.as_bytes()).is_err(), "accepted {raw}");
         }
+    }
+    #[test]
+    fn response_size_and_correlation_are_bounded() {
+        let huge = serde_json::json!({"value": "x".repeat(MAX_FRAME_BYTES)});
+        assert_eq!(
+            validated_response_for_method(METHOD_PING, RequestId::Number(1), Ok(huge)),
+            Err(WireError::FrameTooLarge)
+        );
+        let response = validated_response_for_method(
+            METHOD_PING,
+            RequestId::Number(2),
+            Ok(serde_json::json!({})),
+        )
+        .unwrap();
+        assert!(response.clone().correlate(METHOD_PING).is_ok());
+        assert_eq!(
+            response.clone().correlate(METHOD_TOOLS_LIST),
+            Err(WireError::InvalidValue)
+        );
+        assert_eq!(
+            response.correlate("unknown/method"),
+            Err(WireError::InvalidValue)
+        );
+        let error = validated_response_for_method(
+            METHOD_PING,
+            RequestId::Number(3),
+            Err(RpcError {
+                code: -1,
+                message: "x".repeat(MAX_METHOD_BYTES + 1),
+                data: None,
+            }),
+        );
+        assert_eq!(error, Err(WireError::InvalidValue));
     }
     #[test]
     fn rejects_deep_and_large_containers_before_dispatch() {
