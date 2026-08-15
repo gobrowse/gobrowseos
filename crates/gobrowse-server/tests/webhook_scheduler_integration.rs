@@ -829,15 +829,21 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
 
     // The current worker's outcome is still accepted by the same fence.
     webhook_scheduler::persist_outcome(&pool, &current, &success, 5).await;
-    let status: String = sqlx::query_scalar(
-        "SELECT status FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    let completed = sqlx::query(
+        "SELECT status, lease_token, lease_expires_at FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
     )
     .bind(webhook_id)
     .bind(&delivery_id)
     .fetch_one(&pool)
     .await
     .expect("read completed delivery");
-    assert_eq!(status, "succeeded");
+    assert_eq!(completed.get::<String, _>("status"), "succeeded");
+    assert!(completed.get::<Option<Uuid>, _>("lease_token").is_none());
+    assert!(
+        completed
+            .get::<Option<OffsetDateTime>, _>("lease_expires_at")
+            .is_none()
+    );
 
     cleanup(&pool, webhook_id, profile_id).await;
 }

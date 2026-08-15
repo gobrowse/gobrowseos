@@ -495,8 +495,23 @@ mod tests {
     #[tokio::test]
     async fn trust_material_verifies_now_and_five_years_forward() {
         let now = UnixTime::now();
+        let now_datetime = time::OffsetDateTime::from_unix_timestamp(now.as_secs() as i64)
+            .expect("current certificate time");
+        let future_year = now_datetime.year() + 5;
+        let future_date =
+            time::Date::from_calendar_date(future_year, now_datetime.month(), now_datetime.day())
+                .or_else(|_| {
+                    time::Date::from_calendar_date(
+                        future_year,
+                        now_datetime.month(),
+                        now_datetime.day() - 1,
+                    )
+                })
+                .expect("five-year calendar date");
+        let future_datetime = future_date.with_time(now_datetime.time()).assume_utc();
+        assert_eq!(future_datetime.year(), future_year);
         let future = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
-            now.as_secs() + 5 * 365 * 24 * 60 * 60,
+            future_datetime.unix_timestamp() as u64,
         ));
         for verification_time in [now, future] {
             let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
@@ -570,10 +585,8 @@ mod tests {
             .send(&target, "delivery", "body", None)
             .await
             .expect_err("hostname mismatch");
-        assert!(matches!(
-            error,
-            TransportError::Connection | TransportError::Other
-        ));
+        assert_eq!(error, TransportError::Connection);
+        assert_eq!(error.code(), "target_connection_failed");
         assert!(!error.code().contains("wrong.example.test"));
         task.await.expect("TLS server");
     }
