@@ -1354,7 +1354,12 @@ async fn deployed_schema_v3_upgrades_to_v16() {
     let legacy_unsafe_base_worktree_id = Uuid::now_v7();
     let legacy_unsafe_path_worktree_id = Uuid::now_v7();
     let legacy_unsafe_files_worktree_id = Uuid::now_v7();
+    // PostgreSQL `TIMESTAMPTZ` persists microseconds, so seed the legacy value at that precision
+    // and retain exact equality as the migration-preservation check.
     let legacy_worktree_activity_at = OffsetDateTime::now_utc() - Duration::hours(1);
+    let legacy_worktree_activity_at = legacy_worktree_activity_at
+        .replace_nanosecond(legacy_worktree_activity_at.nanosecond() / 1_000 * 1_000)
+        .expect("truncate legacy activity timestamp to PostgreSQL microseconds");
     for task_id in [
         legacy_safe_task_id,
         legacy_unsafe_task_id,
