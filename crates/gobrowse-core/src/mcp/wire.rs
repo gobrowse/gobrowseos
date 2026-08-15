@@ -606,4 +606,162 @@ mod tests {
             Err(WireError::InvalidValue)
         );
     }
+
+    #[test]
+    fn envelope_and_id_matrix_is_exclusive_and_fail_closed() {
+        for raw in [
+            r#"{"jsonrpc":"1.0","id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":2,"id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":null,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":"","method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"unknown":true}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"other"}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"} {"jsonrpc":"2.0"}"#,
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+        ] {
+            assert!(decode(raw.as_bytes()).is_err(), "accepted {raw}");
+        }
+    }
+
+    #[test]
+    fn known_method_parameter_matrix_distinguishes_missing_empty_and_aliases() {
+        let initialize = serde_json::json!({
+            "protocolVersion":"2025-11-25", "capabilities":{},
+            "clientInfo":{"name":"client","version":"1"}
+        });
+        let calls = [
+            (METHOD_DISCOVER, None),
+            (METHOD_INITIALIZE, Some(initialize)),
+            (METHOD_PING, None),
+            (METHOD_TOOLS_LIST, None),
+            (METHOD_RESOURCES_LIST, Some(serde_json::json!({}))),
+            (
+                METHOD_PROMPTS_LIST,
+                Some(serde_json::json!({"cursor":"next"})),
+            ),
+            (
+                METHOD_TOOLS_CALL,
+                Some(serde_json::json!({"name":"tool","arguments":{}})),
+            ),
+            (
+                METHOD_RESOURCES_READ,
+                Some(serde_json::json!({"uri":"urn:test"})),
+            ),
+            (
+                METHOD_RESOURCES_SUBSCRIBE,
+                Some(serde_json::json!({"uri":"urn:test"})),
+            ),
+            (
+                METHOD_RESOURCES_UNSUBSCRIBE,
+                Some(serde_json::json!({"uri":"urn:test"})),
+            ),
+            (
+                METHOD_PROMPTS_GET,
+                Some(serde_json::json!({"name":"prompt","arguments":{}})),
+            ),
+        ];
+        for (method, params) in calls {
+            assert!(
+                try_request(RequestId::Number(1), method, params).is_ok(),
+                "{method}"
+            );
+        }
+        for (method, params) in [
+            (METHOD_INITIALIZE, None),
+            (METHOD_TOOLS_CALL, None),
+            (METHOD_RESOURCES_READ, None),
+            (METHOD_RESOURCES_SUBSCRIBE, None),
+            (METHOD_RESOURCES_UNSUBSCRIBE, None),
+            (METHOD_PROMPTS_GET, None),
+        ] {
+            assert_eq!(
+                try_request(RequestId::Number(1), method, params),
+                Err(WireError::InvalidValue)
+            );
+        }
+        assert!(
+            try_request(
+                RequestId::Number(1),
+                METHOD_TOOLS_LIST,
+                Some(serde_json::json!({"cursor":""}))
+            )
+            .is_err()
+        );
+        assert!(
+            try_request(
+                RequestId::Number(1),
+                METHOD_RESOURCES_READ,
+                Some(serde_json::json!({"uri":"urn:test","uri_text":"alias"}))
+            )
+            .is_err()
+        );
+        assert!(try_notification(METHOD_INITIALIZED, Some(serde_json::json!({}))).is_err());
+        assert!(try_notification(METHOD_TOOLS_LIST_CHANGED, Some(serde_json::json!({}))).is_err());
+        assert!(
+            try_notification(METHOD_CANCELLED, Some(serde_json::json!({"requestId":1}))).is_ok()
+        );
+    }
+
+    #[test]
+    fn exact_frame_limit_and_response_fallback_size_are_deterministic() {
+        fn error_with_padding(padding: String) -> Result<ValidatedResponse, WireError> {
+            response(
+                RequestId::Number(7),
+                Err(RpcError {
+                    code: -1,
+                    message: "e".into(),
+                    data: Some(serde_json::json!({"padding": padding})),
+                }),
+            )
+        }
+        let base = error_with_padding(String::new()).expect("base");
+        let base_len = serde_json::to_vec(&base.0).expect("base bytes").len();
+        let exact =
+            error_with_padding("x".repeat(MAX_FRAME_BYTES - base_len)).expect("exact frame");
+        assert_eq!(
+            serde_json::to_vec(&exact.0).expect("exact bytes").len(),
+            MAX_FRAME_BYTES
+        );
+        assert_eq!(
+            error_with_padding("x".repeat(MAX_FRAME_BYTES - base_len + 1)),
+            Err(WireError::FrameTooLarge)
+        );
+        assert_eq!(
+            decode(&vec![b' '; MAX_FRAME_BYTES + 1]),
+            Err(WireError::FrameTooLarge)
+        );
+        let fallback = safe_internal_error_response(RequestId::String("request".into()));
+        assert!(
+            encode(&ValidatedMessage::Response(fallback))
+                .expect("fallback")
+                .len()
+                < MAX_FRAME_BYTES
+        );
+    }
+
+    #[test]
+    fn all_valid_success_results_reject_cross_method_correlation() {
+        let results = [
+            (
+                METHOD_DISCOVER,
+                serde_json::json!({"supportedVersions":["2026-07-28"],"capabilities":{}}),
+            ),
+            (METHOD_PING, serde_json::json!({})),
+            (METHOD_RESOURCES_SUBSCRIBE, serde_json::json!({})),
+            (METHOD_RESOURCES_UNSUBSCRIBE, serde_json::json!({})),
+        ];
+        for (method, value) in results {
+            let response = validated_response_for_method(method, RequestId::Number(1), Ok(value))
+                .expect("valid result");
+            assert!(response.clone().correlate(method).is_ok());
+            assert_eq!(
+                response.clone().correlate(METHOD_TOOLS_LIST),
+                Err(WireError::InvalidValue)
+            );
+            assert!(response.correlate(method).is_ok());
+        }
+    }
 }

@@ -425,6 +425,38 @@ mod tests {
             })
         }
     }
+    struct InvalidOutputHandler;
+    #[async_trait]
+    impl McpServerHandler for InvalidOutputHandler {
+        async fn discover(&self) -> Result<DiscoverResult, RpcError> {
+            Ok(DiscoverResult {
+                supported_versions: vec!["2026-07-28".into()],
+                capabilities: ServerCapabilities {
+                    resources: Some(crate::mcp::capabilities::ResourcesCapability {
+                        subscribe: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                server_info: None,
+            })
+        }
+        async fn ping(&self) -> Result<Value, RpcError> {
+            Ok(serde_json::json!({"unexpected": true}))
+        }
+        async fn resources_subscribe(
+            &self,
+            _: ResourceSubscriptionParams,
+        ) -> Result<Value, RpcError> {
+            Ok(Value::Null)
+        }
+        async fn resources_unsubscribe(
+            &self,
+            _: ResourceSubscriptionParams,
+        ) -> Result<Value, RpcError> {
+            Ok(serde_json::json!(["unexpected"]))
+        }
+    }
     #[tokio::test]
     async fn logging_notification_requires_negotiated_logging_capability() {
         let mut dispatcher = McpServerDispatcher::new(LoggingHandler);
@@ -448,6 +480,38 @@ mod tests {
             matches!(response.body(), ResponseBody::Error { error: RpcError { code: -32603, message, data: None } } if message == "internal MCP handler error")
         );
     }
+    #[tokio::test]
+    async fn invalid_ping_and_subscription_outputs_use_the_same_safe_fallback() {
+        let mut dispatcher = McpServerDispatcher::new(InvalidOutputHandler);
+        let discover = dispatcher
+            .dispatch(try_request(RequestId::Number(1), METHOD_DISCOVER, None).unwrap())
+            .await;
+        assert!(matches!(discover.body(), ResponseBody::Result { .. }));
+        assert_eq!(
+            dispatcher.era(),
+            Some(crate::mcp::McpProtocolEra::Modern20260728)
+        );
+
+        for (id, method) in [
+            (2, METHOD_PING),
+            (3, METHOD_RESOURCES_SUBSCRIBE),
+            (4, METHOD_RESOURCES_UNSUBSCRIBE),
+        ] {
+            let params = (method != METHOD_PING).then(|| serde_json::json!({"uri":"urn:test"}));
+            let response = dispatcher
+                .dispatch(try_request(RequestId::Number(id), method, params).unwrap())
+                .await;
+            assert!(matches!(
+                response.body(),
+                ResponseBody::Error { error: RpcError { code: -32603, message, data: None } }
+                    if message == "internal MCP handler error"
+            ));
+            assert_eq!(response.id(), &RequestId::Number(id));
+            let encoded = encode(&ValidatedMessage::Response(response)).expect("fallback frame");
+            assert!(encoded.len() < MAX_FRAME_BYTES);
+        }
+    }
+
     #[tokio::test]
     async fn binds_capabilities_only_after_valid_legacy_handshake() {
         let mut dispatcher = McpServerDispatcher::new(Fixture);

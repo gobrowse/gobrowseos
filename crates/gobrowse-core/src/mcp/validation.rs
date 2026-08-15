@@ -247,4 +247,85 @@ mod tests {
         }
         assert_eq!(validate_json(&value), Err(ValidationError::TooDeep));
     }
+
+    #[test]
+    fn bounded_parser_matrix_accepts_exact_limits_and_rejects_overflow() {
+        for raw in ["null", "true", "42", "\"text\"", "[]", "{}"] {
+            assert!(parse_bounded_json(raw.as_bytes()).is_ok(), "{raw}");
+        }
+        let mut exact_depth = "null".to_owned();
+        for _ in 0..MAX_JSON_DEPTH {
+            exact_depth = format!("[{exact_depth}]");
+        }
+        assert!(parse_bounded_json(exact_depth.as_bytes()).is_ok());
+        assert_eq!(
+            parse_bounded_json(format!("[{exact_depth}]").as_bytes()),
+            Err(ValidationError::InvalidValue)
+        );
+
+        let exact_array = serde_json::to_vec(&vec![Value::Null; MAX_ITEMS]).expect("array");
+        assert!(parse_bounded_json(&exact_array).is_ok());
+        let over_array = serde_json::to_vec(&vec![Value::Null; MAX_ITEMS + 1]).expect("array");
+        assert_eq!(
+            parse_bounded_json(&over_array),
+            Err(ValidationError::InvalidValue)
+        );
+
+        let exact_object = (0..MAX_ITEMS)
+            .map(|index| (format!("k{index}"), Value::Null))
+            .collect::<Map<_, _>>();
+        assert!(parse_bounded_json(&serde_json::to_vec(&exact_object).expect("object")).is_ok());
+        let over_object = (0..=MAX_ITEMS)
+            .map(|index| (format!("k{index}"), Value::Null))
+            .collect::<Map<_, _>>();
+        assert_eq!(
+            parse_bounded_json(&serde_json::to_vec(&over_object).expect("object")),
+            Err(ValidationError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn parser_rejects_duplicate_keys_before_duplicate_value_and_trailing_data() {
+        assert_eq!(
+            parse_bounded_json(br#"{"a":1,"a":{"unterminated":}"#),
+            Err(ValidationError::InvalidValue)
+        );
+        assert_eq!(parse_bounded_json(b""), Err(ValidationError::Malformed));
+        assert_eq!(
+            parse_bounded_json(b" \n\t"),
+            Err(ValidationError::Malformed)
+        );
+        assert_eq!(
+            parse_bounded_json(br#"{"a":1}{"b":2}"#),
+            Err(ValidationError::Malformed)
+        );
+        assert_eq!(
+            parse_bounded_json(b"{\"a\":\x80}"),
+            Err(ValidationError::Malformed)
+        );
+    }
+
+    #[test]
+    fn parser_classifies_overflow_before_descending_and_checks_early_values() {
+        let mut elements = vec![Value::Null; MAX_ITEMS];
+        elements.push(Value::String("not-json".into()));
+        let mut raw = serde_json::to_vec(&elements).expect("array");
+        raw.extend_from_slice(b" trailing-malformed");
+        assert_eq!(parse_bounded_json(&raw), Err(ValidationError::InvalidValue));
+
+        let mut first_bad = vec![Value::Null; MAX_ITEMS];
+        first_bad[MAX_ITEMS - 1] = Value::String("unterminated".into());
+        let mut raw = serde_json::to_vec(&first_bad).expect("array");
+        raw.pop();
+        assert_eq!(parse_bounded_json(&raw), Err(ValidationError::Malformed));
+
+        let mut members = (0..MAX_ITEMS)
+            .map(|index| (format!("k{index}"), Value::Null))
+            .collect::<Map<_, _>>();
+        members.insert("overflow".into(), Value::String("value".into()));
+        assert_eq!(
+            parse_bounded_json(&serde_json::to_vec(&members).expect("object")),
+            Err(ValidationError::InvalidValue)
+        );
+    }
 }

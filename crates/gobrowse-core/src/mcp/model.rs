@@ -653,4 +653,258 @@ mod tests {
         };
         assert!(duplicate_versions.validate_mcp().is_err());
     }
+
+    #[test]
+    fn modern_discover_and_legacy_initialize_fixtures_have_exact_wire_keys() {
+        let discover = DiscoverResult {
+            supported_versions: vec!["2026-07-28".into(), "2025-11-25".into()],
+            capabilities: ServerCapabilities::default(),
+            server_info: Some(ClientInfo {
+                name: "server".into(),
+                version: "1".into(),
+            }),
+        };
+        let discover_json = serde_json::to_value(&discover).expect("discover");
+        assert_eq!(
+            discover_json["supportedVersions"],
+            serde_json::json!(["2026-07-28", "2025-11-25"])
+        );
+        assert!(discover_json.get("supported_versions").is_none());
+        assert!(
+            serde_json::from_value::<DiscoverResult>(serde_json::json!({
+                "supported_versions":["2026-07-28"], "capabilities":{}
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<DiscoverResult>(serde_json::json!({
+                "supportedVersions":["2026-07-28"], "capabilities":{}, "unknown":true
+            }))
+            .is_err()
+        );
+        assert!(discover.validate_mcp().is_ok());
+
+        let initialize = InitializeResult {
+            protocol_version: "2025-11-25".into(),
+            capabilities: ServerCapabilities::default(),
+            server_info: ClientInfo {
+                name: "server".into(),
+                version: "1".into(),
+            },
+            instructions: Some("read this".into()),
+        };
+        let initialize_json = serde_json::to_value(&initialize).expect("initialize");
+        for key in ["protocolVersion", "serverInfo"] {
+            assert!(initialize_json.get(key).is_some(), "{key}");
+        }
+        assert!(initialize_json.get("protocol_version").is_none());
+        assert!(
+            serde_json::from_value::<InitializeResult>(serde_json::json!({
+                "protocolVersion":"2025-11-25", "capabilities":{},
+                "serverInfo":{"name":"server","version":"1"}, "server_info":{}
+            }))
+            .is_err()
+        );
+        assert!(initialize.validate_mcp().is_ok());
+    }
+
+    #[test]
+    fn model_limits_vocabularies_and_page_identity_matrix_is_bounded() {
+        assert!(valid_name(&"x".repeat(validation::MAX_IDENTIFIER_BYTES)).is_ok());
+        assert!(valid_name(&"x".repeat(validation::MAX_IDENTIFIER_BYTES + 1)).is_err());
+        assert!(valid_text(&"x".repeat(validation::MAX_METADATA_TEXT_BYTES)).is_ok());
+        assert!(valid_text(&"x".repeat(validation::MAX_METADATA_TEXT_BYTES + 1)).is_err());
+        assert!(valid_mime(&"x".repeat(validation::MAX_MIME_BYTES)).is_ok());
+        assert!(valid_mime(&"x".repeat(validation::MAX_MIME_BYTES + 1)).is_err());
+        assert!(
+            validation::validate_cursor(Some(&"x".repeat(validation::MAX_CURSOR_BYTES))).is_ok()
+        );
+        assert!(
+            validation::validate_cursor(Some(&"x".repeat(validation::MAX_CURSOR_BYTES + 1)))
+                .is_err()
+        );
+        assert!(validation::validate_uri(&"x".repeat(validation::MAX_URI_BYTES)).is_ok());
+        assert!(validation::validate_uri(&"x".repeat(validation::MAX_URI_BYTES + 1)).is_err());
+
+        let valid_schema = serde_json::json!({"type":"object"});
+        let tool = |name: &str| Tool {
+            name: name.into(),
+            title: None,
+            description: None,
+            input_schema: valid_schema.clone(),
+            output_schema: None,
+        };
+        let exact_tools = (0..validation::MAX_ITEMS)
+            .map(|index| tool(&format!("tool{index}")))
+            .collect();
+        assert!(
+            Paginated {
+                items: exact_tools,
+                next_cursor: None
+            }
+            .validate_mcp()
+            .is_ok()
+        );
+        let over_tools = (0..=validation::MAX_ITEMS)
+            .map(|index| tool(&format!("tool{index}")))
+            .collect();
+        assert!(
+            Paginated {
+                items: over_tools,
+                next_cursor: None
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert!(
+            Paginated {
+                items: vec![tool("a"), tool("a")],
+                next_cursor: None
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert!(
+            Paginated {
+                items: vec![tool("a")],
+                next_cursor: Some("".into())
+            }
+            .validate_mcp()
+            .is_err()
+        );
+
+        let exact_blob = STANDARD.encode(vec![b'x'; validation::MAX_CONTENT_BYTES]);
+        assert!(
+            Content::Image {
+                data: exact_blob,
+                mime_type: "image/png".into()
+            }
+            .validate_mcp()
+            .is_ok()
+        );
+        let oversized_blob = STANDARD.encode(vec![b'x'; validation::MAX_CONTENT_BYTES + 1]);
+        assert!(
+            Content::Image {
+                data: oversized_blob,
+                mime_type: "image/png".into()
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert!(
+            Content::Text {
+                text: "x".repeat(validation::MAX_CONTENT_BYTES)
+            }
+            .validate_mcp()
+            .is_ok()
+        );
+        assert!(
+            Content::Text {
+                text: "x".repeat(validation::MAX_CONTENT_BYTES + 1)
+            }
+            .validate_mcp()
+            .is_err()
+        );
+
+        for role in ["user", "assistant"] {
+            assert!(serde_json::from_str::<PromptRole>(&format!("\"{role}\"")).is_ok());
+            assert!(
+                serde_json::from_str::<PromptRole>(&format!("\"{}\"", role.to_uppercase()))
+                    .is_err()
+            );
+        }
+        for level in [
+            "debug",
+            "info",
+            "notice",
+            "warning",
+            "error",
+            "critical",
+            "alert",
+            "emergency",
+        ] {
+            assert!(serde_json::from_str::<LoggingLevel>(&format!("\"{level}\"")).is_ok());
+            assert!(
+                serde_json::from_str::<LoggingLevel>(&format!("\"{}\"", level.to_uppercase()))
+                    .is_err()
+            );
+        }
+        for invalid in [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!("unknown"),
+        ] {
+            assert!(serde_json::from_value::<PromptRole>(invalid.clone()).is_err());
+            assert!(serde_json::from_value::<LoggingLevel>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn content_progress_and_schema_matrix_rejects_invalid_shapes() {
+        assert!(
+            serde_json::from_value::<Content>(serde_json::json!({
+                "type":"text", "text":"ok", "extra":true
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<Content>(serde_json::json!({
+                "type":"image", "data":"aA==", "mimeType":"image/png", "mime_type":"x"
+            }))
+            .is_err()
+        );
+        assert!(
+            Content::Image {
+                data: "not base64".into(),
+                mime_type: "image/png".into()
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert!(
+            ResourceReadResult {
+                contents: vec![
+                    ResourceContent {
+                        uri: "urn:a".into(),
+                        mime_type: None,
+                        text: Some("a".into()),
+                        blob: None
+                    },
+                    ResourceContent {
+                        uri: "urn:a".into(),
+                        mime_type: None,
+                        text: Some("b".into()),
+                        blob: None
+                    },
+                ]
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert!(
+            ProgressParams {
+                progress_token: RequestId::String("".into()),
+                progress: 1,
+                total: None
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert!(
+            LoggingMessageParams {
+                level: LoggingLevel::Info,
+                data: serde_json::Value::Null,
+                logger: Some("".into())
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        assert_eq!(
+            super::validate_schema(
+                "tool",
+                &serde_json::json!({"$ref":"https://example.invalid/schema"})
+            ),
+            Err(ValidationError::InvalidValue)
+        );
+    }
 }

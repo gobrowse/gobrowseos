@@ -527,4 +527,132 @@ mod tests {
         life.mark_ready().unwrap();
         assert_eq!(retry_class("tools/call"), RetryClass::Never);
     }
+
+    #[test]
+    fn pending_and_identifier_matrix_is_bounded_and_generation_fenced() {
+        let mut life = modern_ready();
+        let mut tokens = Vec::new();
+        for _ in 0..MAX_PENDING_REQUESTS {
+            tokens.push(life.allocate_and_reserve().expect("pending capacity"));
+        }
+        assert_eq!(life.pending_len(), MAX_PENDING_REQUESTS);
+        assert_eq!(
+            life.allocate_and_reserve(),
+            Err(LifecycleError::PendingLimit)
+        );
+        assert!(tokens.windows(2).all(|pair| pair[0].id() < pair[1].id()));
+
+        assert_eq!(
+            life.reserve(tokens[0].clone()),
+            Err(LifecycleError::DuplicateRequest)
+        );
+        assert_eq!(
+            life.reserve(PendingToken {
+                generation: life.generation() + 1,
+                id: RequestId::Number(999)
+            }),
+            Err(LifecycleError::UnknownResponse)
+        );
+        assert_eq!(
+            life.reserve(PendingToken {
+                generation: life.generation(),
+                id: RequestId::String(String::new())
+            }),
+            Err(LifecycleError::UnknownResponse)
+        );
+        let first = tokens.remove(0);
+        assert_eq!(life.complete(&first), Ok(()));
+        assert_eq!(life.complete(&first), Err(LifecycleError::UnknownResponse));
+        assert_eq!(life.cancel(&tokens[0]), Ok(()));
+        assert_eq!(
+            life.cancel(&tokens[0]),
+            Err(LifecycleError::UnknownResponse)
+        );
+    }
+
+    #[test]
+    fn terminal_operations_drain_sorted_tokens_once_and_block_late_responses() {
+        let mut life = modern_ready();
+        let first = life.allocate_and_reserve().unwrap();
+        let second = life.allocate_and_reserve().unwrap();
+        let third = life.allocate_and_reserve().unwrap();
+        let expected = vec![first.clone(), second.clone(), third.clone()];
+        assert_eq!(life.fail(), expected);
+        assert_eq!(life.fail(), Vec::new());
+        assert_eq!(life.disconnect(), Vec::new());
+        assert_eq!(life.complete(&first), Err(LifecycleError::UnknownResponse));
+        assert_eq!(life.cancel(&second), Err(LifecycleError::UnknownResponse));
+
+        let mut closing = modern_ready();
+        let pending = closing.allocate_and_reserve().unwrap();
+        assert_eq!(closing.begin_close().unwrap(), vec![pending.clone()]);
+        assert_eq!(
+            closing.complete(&pending),
+            Err(LifecycleError::UnknownResponse)
+        );
+        assert_eq!(closing.begin_close().unwrap(), Vec::new());
+        closing.finish_close().unwrap();
+        assert_eq!(closing.finish_close(), Ok(()));
+    }
+
+    #[test]
+    fn lifecycle_operation_matrix_rejects_cross_state_mutation() {
+        let mut fresh = SessionLifecycle::new();
+        let snapshot = (
+            fresh.state,
+            fresh.generation,
+            fresh.pending_len(),
+            fresh.reconnect_attempts,
+        );
+        assert_eq!(
+            fresh.begin_discovery(),
+            Err(LifecycleError::IllegalTransition)
+        );
+        assert_eq!(
+            fresh.begin_initialize(),
+            Err(LifecycleError::IllegalTransition)
+        );
+        assert_eq!(fresh.mark_ready(), Err(LifecycleError::NegotiationRequired));
+        assert_eq!(
+            (
+                fresh.state,
+                fresh.generation,
+                fresh.pending_len(),
+                fresh.reconnect_attempts
+            ),
+            snapshot
+        );
+
+        let mut connecting = SessionLifecycle::new();
+        connecting.begin_connect().unwrap();
+        assert_eq!(
+            connecting.allocate_and_reserve(),
+            Err(LifecycleError::NotReady)
+        );
+        assert_eq!(
+            connecting.mark_legacy_initialized(),
+            Err(LifecycleError::IllegalTransition)
+        );
+        assert_eq!(
+            connecting.bind_negotiation(
+                McpProtocolEra::Modern20260728,
+                ServerCapabilities::default()
+            ),
+            Err(LifecycleError::NegotiationRequired)
+        );
+
+        for (method, expected) in [
+            ("server/discover", RetryClass::SafeDiscovery),
+            ("ping", RetryClass::SafePing),
+            ("tools/list", RetryClass::SafeList),
+            ("resources/list", RetryClass::SafeList),
+            ("prompts/list", RetryClass::SafeList),
+            ("resources/read", RetryClass::SafeRead),
+            ("initialize", RetryClass::Never),
+            ("tools/call", RetryClass::Never),
+            ("unknown", RetryClass::Never),
+        ] {
+            assert_eq!(retry_class(method), expected, "{method}");
+        }
+    }
 }
