@@ -1342,6 +1342,9 @@ async fn deployed_schema_v3_upgrades_to_v16() {
     let legacy_safe_task_id = Uuid::now_v7();
     let legacy_unsafe_task_id = Uuid::now_v7();
     let legacy_foreign_task_id = Uuid::now_v7();
+    let legacy_cross_owner_task_id = Uuid::now_v7();
+    let legacy_unsafe_base_task_id = Uuid::now_v7();
+    let legacy_unsafe_files_task_id = Uuid::now_v7();
     let legacy_safe_worktree_id = Uuid::now_v7();
     let legacy_unsafe_branch_worktree_id = Uuid::now_v7();
     let legacy_cross_task_worktree_id = Uuid::now_v7();
@@ -1350,7 +1353,13 @@ async fn deployed_schema_v3_upgrades_to_v16() {
     let legacy_unsafe_path_worktree_id = Uuid::now_v7();
     let legacy_unsafe_files_worktree_id = Uuid::now_v7();
     let legacy_worktree_activity_at = OffsetDateTime::now_utc() - Duration::hours(1);
-    for task_id in [legacy_safe_task_id, legacy_unsafe_task_id] {
+    for task_id in [
+        legacy_safe_task_id,
+        legacy_unsafe_task_id,
+        legacy_cross_owner_task_id,
+        legacy_unsafe_base_task_id,
+        legacy_unsafe_files_task_id,
+    ] {
         sqlx::query(
             "INSERT INTO tasks (id,workspace_id,title,state) \
              VALUES ($1,$2,'Schema three worktree task','BACKLOG')",
@@ -1415,20 +1424,20 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         ),
         (
             legacy_cross_owner_worktree_id,
-            legacy_unsafe_task_id,
+            legacy_cross_owner_task_id,
             foreign_agent_id,
             "agent/schema-3-cross-owner".to_string(),
             "a".repeat(40),
-            legacy_worktree_path(legacy_unsafe_task_id),
+            legacy_worktree_path(legacy_cross_owner_task_id),
             vec!["legacy.rs".to_string()],
         ),
         (
             legacy_unsafe_base_worktree_id,
-            legacy_unsafe_task_id,
+            legacy_unsafe_base_task_id,
             agent_id,
             "agent/schema-3-unsafe-base".to_string(),
             "not-a-full-object-id".to_string(),
-            legacy_worktree_path(legacy_unsafe_task_id),
+            legacy_worktree_path(legacy_unsafe_base_task_id),
             vec!["legacy.rs".to_string()],
         ),
         (
@@ -1442,11 +1451,11 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         ),
         (
             legacy_unsafe_files_worktree_id,
-            legacy_unsafe_task_id,
+            legacy_unsafe_files_task_id,
             agent_id,
             "agent/schema-3-unsafe-files".to_string(),
             "a".repeat(40),
-            legacy_worktree_path(legacy_unsafe_task_id),
+            legacy_worktree_path(legacy_unsafe_files_task_id),
             vec!["a/../legacy.rs".to_string()],
         ),
     ];
