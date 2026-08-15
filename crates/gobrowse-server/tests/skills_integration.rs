@@ -1436,13 +1436,9 @@ async fn duplicate_and_inaccessible_skill_sources_return_validation() {
     let wrong_workspace = Uuid::now_v7();
     let cross_profile = Uuid::now_v7();
     let other_profile = profile(&pool, "source-foreign-profile").await;
-    let other_workspace = insert_workspace(
-        &pool,
-        other_profile,
-        create_session(&pool, other_profile, "OWNER").await.0,
-    )
-    .await;
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'valid'),($4,$2,$3,'deleted'),($5,$2,$6,'wrong'),($7,$8,NULL,'foreign')").bind(valid_source).bind(profile_id).bind(workspace).bind(deleted_source).bind(wrong_workspace).bind(other_workspace).bind(cross_profile).bind(other_profile).execute(&pool).await.expect("source cases");
+    let (other_owner, _) = create_session(&pool, other_profile, "OWNER").await;
+    let other_workspace = insert_workspace(&pool, other_profile, other_owner).await;
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title,created_by_user_id) VALUES ($1,$2,$3,'valid',$9),($4,$2,$3,'deleted',$9),($5,$2,$6,'wrong',$9),($7,$8,NULL,'foreign',$10)").bind(valid_source).bind(profile_id).bind(workspace).bind(deleted_source).bind(wrong_workspace).bind(other_workspace).bind(cross_profile).bind(other_profile).bind(owner).bind(other_owner).execute(&pool).await.expect("source cases");
     sqlx::query("UPDATE conversations SET status='deleted' WHERE id=$1")
         .bind(deleted_source)
         .execute(&pool)
@@ -1601,6 +1597,7 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
     let _lock = common::acquire_test_lock(&url).await;
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "raw-sql-invariants").await;
+    let (owner, _) = create_session(&pool, profile_id, "OWNER").await;
     let (skill_id, revision_id) =
         insert_skill_fixture(&pool, profile_id, None, "raw-invariants", "manual").await;
     assert!(
@@ -1635,32 +1632,15 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
     let deleted = Uuid::now_v7();
     let cross = Uuid::now_v7();
     let source_profile = profile(&pool, "raw-source-profile").await;
-    let workspace = insert_workspace(
-        &pool,
-        profile_id,
-        sqlx::query_scalar("SELECT id FROM users WHERE primary_profile_id=$1 LIMIT 1")
-            .bind(profile_id)
-            .fetch_one(&pool)
-            .await
-            .expect("owner"),
-    )
-    .await;
-    let wrong_workspace = insert_workspace(
-        &pool,
-        profile_id,
-        sqlx::query_scalar("SELECT id FROM users WHERE primary_profile_id=$1 LIMIT 1")
-            .bind(profile_id)
-            .fetch_one(&pool)
-            .await
-            .expect("owner"),
-    )
-    .await;
+    let (source_owner, _) = create_session(&pool, source_profile, "OWNER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    let wrong_workspace = insert_workspace(&pool, profile_id, owner).await;
     let wrong_conversation = Uuid::now_v7();
     let scoped_skill =
         insert_skill_fixture(&pool, profile_id, Some(workspace), "raw-scoped", "manual")
             .await
             .0;
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title,status) VALUES ($1,$2,$3,'valid','active'),($4,$2,NULL,'deleted','deleted'),($5,$6,NULL,'cross','active'),($7,$2,$8,'wrong workspace','active')").bind(valid).bind(profile_id).bind(workspace).bind(deleted).bind(cross).bind(source_profile).bind(wrong_conversation).bind(wrong_workspace).execute(&pool).await.expect("raw source rows");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title,status,created_by_user_id) VALUES ($1,$2,$3,'valid','active',$9),($4,$2,NULL,'deleted','deleted',$9),($5,$6,NULL,'cross','active',$10),($7,$2,$8,'wrong workspace','active',$9)").bind(valid).bind(profile_id).bind(workspace).bind(deleted).bind(cross).bind(source_profile).bind(wrong_conversation).bind(wrong_workspace).bind(owner).bind(source_owner).execute(&pool).await.expect("raw source rows");
     let missing = Uuid::now_v7();
     for (revision, ids) in [
         (100, vec![Uuid::nil()]),
