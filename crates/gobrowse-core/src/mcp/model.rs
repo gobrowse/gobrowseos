@@ -217,16 +217,21 @@ pub struct ResourceSubscriptionParams {
 }
 
 fn valid_name(value: &str) -> Result<(), ValidationError> {
-    (!value.is_empty() && value.len() <= validation::MAX_URI_BYTES)
-        .then_some(())
-        .ok_or(ValidationError::InvalidValue)
+    validation::validate_identifier(value)
+}
+fn valid_text(value: &str) -> Result<(), ValidationError> {
+    validation::validate_metadata_text(value)
+}
+fn valid_mime(value: &str) -> Result<(), ValidationError> {
+    validation::validate_mime(value)
 }
 
 impl ValidateMcp for InitializeParams {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         valid_name(&self.protocol_version)?;
         self.capabilities.validate_mcp()?;
-        valid_name(&self.client_info.name)
+        valid_name(&self.client_info.name)?;
+        valid_name(&self.client_info.version)
     }
 }
 impl ValidateMcp for DiscoverResult {
@@ -246,6 +251,7 @@ impl ValidateMcp for DiscoverResult {
         self.capabilities.validate_mcp()?;
         if let Some(info) = &self.server_info {
             valid_name(&info.name)?;
+            valid_name(&info.version)?;
         }
         Ok(())
     }
@@ -255,9 +261,10 @@ impl ValidateMcp for InitializeResult {
         valid_name(&self.protocol_version)?;
         self.capabilities.validate_mcp()?;
         if let Some(instructions) = &self.instructions {
-            validation::validate_content_text(instructions)?;
+            valid_text(instructions)?;
         }
-        valid_name(&self.server_info.name)
+        valid_name(&self.server_info.name)?;
+        valid_name(&self.server_info.version)
     }
 }
 fn validate_schema(name: &str, value: &Value) -> Result<(), ValidationError> {
@@ -282,6 +289,12 @@ fn validate_blob(value: &str) -> Result<(), ValidationError> {
 impl ValidateMcp for Tool {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         valid_name(&self.name)?;
+        if let Some(title) = &self.title {
+            valid_text(title)?;
+        }
+        if let Some(description) = &self.description {
+            valid_text(description)?;
+        }
         validate_schema(&self.name, &self.input_schema)?;
         if let Some(value) = &self.output_schema {
             validate_schema(&self.name, value)?;
@@ -300,7 +313,7 @@ impl ValidateMcp for Content {
         match self {
             Content::Text { text } => validation::validate_content_text(text),
             Content::Image { data, mime_type } | Content::Audio { data, mime_type } => {
-                valid_name(mime_type)?;
+                valid_mime(mime_type)?;
                 validate_blob(data)
             }
             Content::Resource { resource } => resource.validate_mcp(),
@@ -310,6 +323,9 @@ impl ValidateMcp for Content {
 impl ValidateMcp for EmbeddedResource {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         validation::validate_uri(&self.uri)?;
+        if let Some(mime_type) = &self.mime_type {
+            valid_mime(mime_type)?;
+        }
         if let Some(text) = &self.text {
             validation::validate_content_text(text)?;
         }
@@ -322,7 +338,14 @@ impl ValidateMcp for EmbeddedResource {
 impl ValidateMcp for Resource {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         validation::validate_uri(&self.uri)?;
-        valid_name(&self.name)
+        valid_name(&self.name)?;
+        if let Some(description) = &self.description {
+            valid_text(description)?;
+        }
+        if let Some(mime_type) = &self.mime_type {
+            valid_mime(mime_type)?;
+        }
+        Ok(())
     }
 }
 impl ValidateMcp for ResourceReadParams {
@@ -333,6 +356,9 @@ impl ValidateMcp for ResourceReadParams {
 impl ValidateMcp for ResourceContent {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         validation::validate_uri(&self.uri)?;
+        if let Some(mime_type) = &self.mime_type {
+            valid_mime(mime_type)?;
+        }
         if let Some(text) = &self.text {
             validation::validate_content_text(text)?;
         }
@@ -345,17 +371,33 @@ impl ValidateMcp for ResourceContent {
 impl ValidateMcp for Prompt {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         valid_name(&self.name)?;
-        validation::validate_collection_len(self.arguments.len())
+        if let Some(description) = &self.description {
+            valid_text(description)?;
+        }
+        validation::validate_collection_len(self.arguments.len())?;
+        for argument in &self.arguments {
+            valid_name(&argument.name)?;
+            if let Some(description) = &argument.description {
+                valid_text(description)?;
+            }
+        }
+        Ok(())
     }
 }
 impl ValidateMcp for PromptGetParams {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         valid_name(&self.name)?;
-        validation::validate_collection_len(self.arguments.len())
+        validation::validate_collection_len(self.arguments.len())?;
+        for (name, value) in &self.arguments {
+            valid_name(name)?;
+            valid_text(value)?;
+        }
+        Ok(())
     }
 }
 impl ValidateMcp for PromptMessage {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
+        valid_name(&self.role)?;
         self.content.validate_mcp()
     }
 }
@@ -386,6 +428,9 @@ impl ValidateMcp for ResourceReadResult {
 }
 impl ValidateMcp for PromptGetResult {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
+        if let Some(description) = &self.description {
+            valid_text(description)?;
+        }
         validation::validate_collection_len(self.messages.len())?;
         self.messages.iter().try_for_each(ValidateMcp::validate_mcp)
     }
@@ -484,6 +529,10 @@ impl ValidateMcp for ProgressParams {
 }
 impl ValidateMcp for LoggingMessageParams {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
+        valid_name(&self.level)?;
+        if let Some(logger) = &self.logger {
+            valid_name(logger)?;
+        }
         self.data.validate_mcp()
     }
 }

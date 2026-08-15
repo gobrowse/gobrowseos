@@ -8,6 +8,9 @@ pub const MAX_ITEMS: usize = 256;
 pub const MAX_CURSOR_BYTES: usize = 512;
 pub const MAX_URI_BYTES: usize = 4096;
 pub const MAX_CONTENT_BYTES: usize = 512 * 1024;
+pub const MAX_IDENTIFIER_BYTES: usize = 128;
+pub const MAX_METADATA_TEXT_BYTES: usize = 4096;
+pub const MAX_MIME_BYTES: usize = 256;
 pub const MAX_JSON_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -67,6 +70,24 @@ pub fn validate_uri(uri: &str) -> Result<(), ValidationError> {
     }
 }
 
+pub fn validate_metadata_text(text: &str) -> Result<(), ValidationError> {
+    (!text.is_empty() && text.len() <= MAX_METADATA_TEXT_BYTES)
+        .then_some(())
+        .ok_or(ValidationError::InvalidValue)
+}
+
+pub fn validate_identifier(text: &str) -> Result<(), ValidationError> {
+    (!text.is_empty() && text.len() <= MAX_IDENTIFIER_BYTES && !text.chars().any(char::is_control))
+        .then_some(())
+        .ok_or(ValidationError::InvalidValue)
+}
+
+pub fn validate_mime(text: &str) -> Result<(), ValidationError> {
+    (!text.is_empty() && text.len() <= MAX_MIME_BYTES && !text.chars().any(char::is_control))
+        .then_some(())
+        .ok_or(ValidationError::InvalidValue)
+}
+
 pub fn validate_content_text(text: &str) -> Result<(), ValidationError> {
     (text.len() <= MAX_CONTENT_BYTES)
         .then_some(())
@@ -104,6 +125,17 @@ impl<'de> DeserializeSeed<'de> for BoundedValueSeed {
         deserializer.deserialize_any(BoundedValueVisitor { depth: self.depth })
     }
 }
+struct RejectExtraValueSeed;
+impl<'de> DeserializeSeed<'de> for RejectExtraValueSeed {
+    type Value = ();
+    fn deserialize<D>(self, _deserializer: D) -> Result<(), D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Err(de::Error::custom("MCP_LIMIT_ITEMS"))
+    }
+}
+
 struct BoundedValueVisitor {
     depth: usize,
 }
@@ -146,14 +178,16 @@ impl<'de> Visitor<'de> for BoundedValueVisitor {
         A: SeqAccess<'de>,
     {
         let mut values = Vec::new();
-        while let Some(value) = access.next_element_seed(BoundedValueSeed {
-            depth: self.depth + 1,
-        })? {
-            if values.len() >= MAX_ITEMS {
-                return Err(de::Error::custom("MCP_LIMIT_ITEMS"));
-            }
+        while values.len() < MAX_ITEMS {
+            let Some(value) = access.next_element_seed(BoundedValueSeed {
+                depth: self.depth + 1,
+            })?
+            else {
+                return Ok(Value::Array(values));
+            };
             values.push(value);
         }
+        let _: Option<()> = access.next_element_seed(RejectExtraValueSeed)?;
         Ok(Value::Array(values))
     }
     fn visit_map<A>(self, mut access: A) -> Result<Value, A::Error>

@@ -262,12 +262,29 @@ fn validate_response(response: Response) -> Result<ValidatedResponse, WireError>
         return Err(WireError::InvalidVersion);
     }
     response.id.validate()?;
-    if let ResponseBody::Error { error } = &response.result
-        && error.message.len() > MAX_METHOD_BYTES
-    {
-        return Err(WireError::InvalidValue);
+    if let ResponseBody::Error { error } = &response.result {
+        if error.message.is_empty() || error.message.len() > MAX_METHOD_BYTES {
+            return Err(WireError::InvalidValue);
+        }
+        if let Some(data) = &error.data {
+            validation::validate_json(data).map_err(|_| WireError::InvalidValue)?;
+        }
     }
     Ok(ValidatedResponse(response))
+}
+
+pub(crate) fn safe_internal_error_response(id: RequestId) -> ValidatedResponse {
+    ValidatedResponse(Response {
+        jsonrpc: JSONRPC_VERSION.into(),
+        id,
+        result: ResponseBody::Error {
+            error: RpcError {
+                code: -32603,
+                message: "internal MCP handler error".into(),
+                data: None,
+            },
+        },
+    })
 }
 fn validate_method_params(method: &str, params: Option<&Value>) -> Result<(), WireError> {
     let Some(params) = params else {

@@ -114,6 +114,13 @@ impl SessionLifecycle {
         self.reconnect_attempts
     }
     pub fn begin_connect(&mut self) -> Result<u64, LifecycleError> {
+        if !matches!(
+            self.state,
+            SessionState::Disconnected | SessionState::Closed | SessionState::Failed
+        ) || !self.pending.is_empty()
+        {
+            return Err(LifecycleError::IllegalTransition);
+        }
         self.reconnect_attempts = 0;
         self.begin_connect_inner()
     }
@@ -313,6 +320,9 @@ impl SessionLifecycle {
                 | SessionState::Closed
         ) {
             return Err(LifecycleError::IllegalTransition);
+        }
+        if self.generation.checked_add(1).is_none() {
+            return Err(LifecycleError::IdExhausted);
         }
         let drained = self.drain_pending();
         if self.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {

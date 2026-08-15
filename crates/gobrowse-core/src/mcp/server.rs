@@ -4,7 +4,11 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use super::{
-    McpProtocolEra, capabilities::ServerCapabilities, model::*, validation::ValidateMcp, wire::*,
+    McpProtocolEra,
+    capabilities::{CapabilityNotification, ServerCapabilities, notification_allowed},
+    model::*,
+    validation::ValidateMcp,
+    wire::*,
 };
 
 pub const ERROR_METHOD_NOT_FOUND: i64 = -32601;
@@ -113,8 +117,8 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
         let id = request.id().clone();
         let method = request.method().to_owned();
         let result = self.dispatch_request(request).await;
-        validated_response_for_method(&method, id, result)
-            .expect("dispatcher creates valid response")
+        validated_response_for_method(&method, id.clone(), result)
+            .unwrap_or_else(|_| safe_internal_error_response(id))
     }
     pub async fn notify(
         &mut self,
@@ -144,9 +148,14 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                 self.handler.cancelled(params).await;
                 Ok(())
             }
-            METHOD_TOOLS_LIST_CHANGED => self.notification_capability(true, false),
-            METHOD_RESOURCES_LIST_CHANGED | METHOD_RESOURCE_UPDATED => {
-                self.notification_capability(false, true)
+            METHOD_TOOLS_LIST_CHANGED => {
+                self.notification_capability(CapabilityNotification::ToolsListChanged)
+            }
+            METHOD_RESOURCES_LIST_CHANGED => {
+                self.notification_capability(CapabilityNotification::ResourcesListChanged)
+            }
+            METHOD_RESOURCE_UPDATED => {
+                self.notification_capability(CapabilityNotification::ResourceUpdated)
             }
             METHOD_PROGRESS | METHOD_LOGGING_MESSAGE => Err(DispatchError::NotSupported),
             _ => Ok(()),
@@ -160,7 +169,7 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
             .unwrap_or_else(|| Value::Object(Default::default()));
         match method.as_str() {
             METHOD_DISCOVER => {
-                if self.era.is_some() {
+                if self.era.is_some() || self.pending_legacy.is_some() || self.initialize_seen {
                     return Err(negotiation_error());
                 }
                 let discovered = self.handler.discover().await?;
@@ -260,23 +269,16 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
             }),
         }
     }
-    fn notification_capability(&self, tools: bool, resources: bool) -> Result<(), DispatchError> {
+    fn notification_capability(
+        &self,
+        notification: CapabilityNotification,
+    ) -> Result<(), DispatchError> {
         let Some(capabilities) = &self.capabilities else {
             return Err(DispatchError::NotInitialized);
         };
-        let allowed = (tools
-            && capabilities
-                .tools
-                .as_ref()
-                .and_then(|c| c.list_changed)
-                .unwrap_or(false))
-            || (resources
-                && capabilities
-                    .resources
-                    .as_ref()
-                    .and_then(|c| c.list_changed)
-                    .unwrap_or(false));
-        allowed.then_some(()).ok_or(DispatchError::NotSupported)
+        notification_allowed(notification, capabilities)
+            .then_some(())
+            .ok_or(DispatchError::NotSupported)
     }
     fn params<T: serde::de::DeserializeOwned>(&self, value: Option<&Value>) -> Result<T, RpcError> {
         serde_json::from_value(value.cloned().unwrap_or(Value::Object(Default::default())))
@@ -369,6 +371,27 @@ mod tests {
             })
         }
     }
+    struct BadHandler;
+    #[async_trait]
+    impl McpServerHandler for BadHandler {
+        async fn ping(&self) -> Result<Value, RpcError> {
+            Err(RpcError {
+                code: -1,
+                message: "x".repeat(1024),
+                data: Some(serde_json::json!({"wide": []})),
+            })
+        }
+    }
+    #[tokio::test]
+    async fn invalid_handler_errors_use_a_safe_non_panicking_fallback() {
+        let mut dispatcher = McpServerDispatcher::new(BadHandler);
+        let response = dispatcher
+            .dispatch(try_request(RequestId::Number(1), METHOD_PING, None).unwrap())
+            .await;
+        assert!(
+            matches!(response.body(), ResponseBody::Error { error: RpcError { code: -32603, message, data: None } } if message == "internal MCP handler error")
+        );
+    }
     #[tokio::test]
     async fn binds_capabilities_only_after_valid_legacy_handshake() {
         let mut dispatcher = McpServerDispatcher::new(Fixture);
@@ -391,6 +414,16 @@ mod tests {
         assert!(!dispatcher.initialized());
         assert_eq!(dispatcher.era(), None);
         assert_eq!(dispatcher.capabilities(), None);
+        let mixed = dispatcher
+            .dispatch(try_request(RequestId::Number(22), METHOD_DISCOVER, None).unwrap())
+            .await;
+        assert!(matches!(
+            mixed.body(),
+            ResponseBody::Error {
+                error: RpcError { code: -32003, .. }
+            }
+        ));
+        assert_eq!(dispatcher.era(), None);
         assert!(
             dispatcher
                 .notify(
