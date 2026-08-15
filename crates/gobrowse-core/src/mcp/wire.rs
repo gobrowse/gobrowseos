@@ -764,4 +764,67 @@ mod tests {
             assert!(response.correlate(method).is_ok());
         }
     }
+
+    #[test]
+    fn resource_result_rejects_simultaneous_text_and_blob() {
+        assert_eq!(
+            validated_response_for_method(
+                METHOD_RESOURCES_READ,
+                RequestId::Number(1),
+                Ok(serde_json::json!({
+                    "contents":[{
+                        "uri":"urn:test",
+                        "text":"plain text",
+                        "blob":"c2VjcmV0"
+                    }]
+                })),
+            ),
+            Err(WireError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn tool_call_result_rejects_simultaneous_embedded_resource_text_and_blob() {
+        assert_eq!(
+            validated_response_for_method(
+                METHOD_TOOLS_CALL,
+                RequestId::Number(1),
+                Ok(serde_json::json!({
+                    "content":[{
+                        "type":"resource",
+                        "resource":{
+                            "uri":"urn:test",
+                            "text":"plain text",
+                            "blob":"c2VjcmV0"
+                        }
+                    }]
+                })),
+            ),
+            Err(WireError::InvalidValue)
+        );
+    }
+
+    #[test]
+    fn prompt_get_result_rejects_simultaneous_embedded_resource_text_and_blob() {
+        assert_eq!(
+            validated_response_for_method(
+                METHOD_PROMPTS_GET,
+                RequestId::Number(1),
+                Ok(serde_json::json!({
+                    "messages":[{
+                        "role":"user",
+                        "content":{
+                            "type":"resource",
+                            "resource":{
+                                "uri":"urn:test",
+                                "text":"plain text",
+                                "blob":"c2VjcmV0"
+                            }
+                        }
+                    }]
+                })),
+            ),
+            Err(WireError::InvalidValue)
+        );
+    }
 }

@@ -332,6 +332,9 @@ impl ValidateMcp for EmbeddedResource {
         if let Some(mime_type) = &self.mime_type {
             valid_mime(mime_type)?;
         }
+        if self.text.is_some() && self.blob.is_some() {
+            return Err(ValidationError::InvalidValue);
+        }
         if let Some(text) = &self.text {
             validation::validate_content_text(text)?;
         }
@@ -364,6 +367,9 @@ impl ValidateMcp for ResourceContent {
         validation::validate_uri(&self.uri)?;
         if let Some(mime_type) = &self.mime_type {
             valid_mime(mime_type)?;
+        }
+        if self.text.is_some() && self.blob.is_some() {
+            return Err(ValidationError::InvalidValue);
         }
         if let Some(text) = &self.text {
             validation::validate_content_text(text)?;
@@ -652,6 +658,50 @@ mod tests {
             server_info: None,
         };
         assert!(duplicate_versions.validate_mcp().is_err());
+    }
+
+    #[test]
+    fn resource_payload_encodings_are_mutually_exclusive() {
+        assert_eq!(
+            EmbeddedResource {
+                uri: "urn:test".into(),
+                mime_type: None,
+                text: Some("plain text".into()),
+                blob: Some("c2VjcmV0".into()),
+            }
+            .validate_mcp(),
+            Err(ValidationError::InvalidValue)
+        );
+        assert!(
+            EmbeddedResource {
+                uri: "urn:test".into(),
+                mime_type: None,
+                text: Some("plain text".into()),
+                blob: None,
+            }
+            .validate_mcp()
+            .is_ok()
+        );
+        assert_eq!(
+            ResourceContent {
+                uri: "urn:test".into(),
+                mime_type: None,
+                text: Some("plain text".into()),
+                blob: Some("c2VjcmV0".into()),
+            }
+            .validate_mcp(),
+            Err(ValidationError::InvalidValue)
+        );
+        assert!(
+            ResourceContent {
+                uri: "urn:test".into(),
+                mime_type: None,
+                text: None,
+                blob: Some("c2VjcmV0".into()),
+            }
+            .validate_mcp()
+            .is_ok()
+        );
     }
 
     #[test]
