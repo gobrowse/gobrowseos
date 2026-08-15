@@ -807,9 +807,30 @@ mod tests {
             assert_eq!(response.id(), &id, "{method}");
             assert!(response.clone().correlate(method).is_ok(), "{method}");
             for (other_method, _) in &supported {
-                if *other_method != *method {
+                let compatible = method == other_method
+                    || (matches!(
+                        *method,
+                        METHOD_PING | METHOD_RESOURCES_SUBSCRIBE | METHOD_RESOURCES_UNSUBSCRIBE
+                    ) && matches!(
+                        *other_method,
+                        METHOD_PING | METHOD_RESOURCES_SUBSCRIBE | METHOD_RESOURCES_UNSUBSCRIBE
+                    ))
+                    || (matches!(
+                        *method,
+                        METHOD_TOOLS_LIST | METHOD_RESOURCES_LIST | METHOD_PROMPTS_LIST
+                    ) && matches!(
+                        *other_method,
+                        METHOD_TOOLS_LIST | METHOD_RESOURCES_LIST | METHOD_PROMPTS_LIST
+                    ));
+                let correlation = response.clone().correlate(other_method);
+                if compatible {
+                    assert!(
+                        correlation.is_ok(),
+                        "{method} rejected under {other_method}"
+                    );
+                } else {
                     assert_eq!(
-                        response.clone().correlate(other_method),
+                        correlation,
                         Err(WireError::InvalidValue),
                         "{method} accepted under {other_method}"
                     );

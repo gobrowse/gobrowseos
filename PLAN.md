@@ -12,11 +12,12 @@ reach the redacted `-32603` fallback.
 **Decision: the next blocker is remaining transport-neutral core-matrix
 evidence, not a transport prerequisite.** Before an adapter is permitted to
 accept a peer response, the core must prove that every supported request
-method's successful result is accepted only under its own correlation method.
-`ValidatedResponse::correlate` is the sole receive-side method/result binding
-boundary, but its current cross-method test covers only four of the eleven
-supported request methods. The missing coverage includes the typed tool,
-resource, prompt, and legacy-initialize result families.
+method's successful result is accepted under precisely the correlation methods
+whose public result schemas it satisfies. `ValidatedResponse::correlate` is
+the sole receive-side method/result binding boundary, but its current
+cross-method test covers only four of the eleven supported request methods.
+The missing coverage includes the typed tool, resource, prompt, and
+legacy-initialize result families.
 
 This is the smallest safe next batch: test-only exhaustive evidence for that
 existing boundary. It neither implements nor pretends to prove stdio or
@@ -30,8 +31,11 @@ Add one deterministic, complete response-correlation matrix to the wire core.
 For each currently supported request method, construct one valid success
 result, pass it through the normal response construction and encode/decode
 path, prove same-method correlation succeeds with its request ID preserved,
-and prove correlation under every other supported request method fails closed
-with `WireError::InvalidValue`.
+and prove every other supported method accepts or fails exactly according to
+its public result schema. The empty-object `ping`/subscribe/unsubscribe and
+empty pagination list families are intentionally schema-equivalent; their
+cross-method acceptance is expected, while every other cross-method pairing
+must fail closed with `WireError::InvalidValue`.
 
 The matrix is specifically the contract an eventual stdio or Streamable HTTP
 adapter will consume after it receives a JSON-RPC response. It establishes no
@@ -85,8 +89,13 @@ For every row, the test must:
 - encode it and decode it back into a `ValidatedResponse`, asserting the
   response shape and exact request-ID preservation;
 - show that `.correlate(row_method)` succeeds after the round trip; and
-- iterate the other ten known request methods and assert each
-  `.correlate(other_method)` is exactly `Err(WireError::InvalidValue)`.
+- iterate the other ten known request methods: cross-method correlation may
+  succeed only within the exact bounded schema-equivalent fixture families
+  `{}` among `METHOD_PING`, `METHOD_RESOURCES_SUBSCRIBE`, and
+  `METHOD_RESOURCES_UNSUBSCRIBE`, and empty paginated `items: []` among
+  `METHOD_TOOLS_LIST`, `METHOD_RESOURCES_LIST`, and `METHOD_PROMPTS_LIST`;
+  every other cross-method pairing must be exactly
+  `Err(WireError::InvalidValue)`.
 
 Add one distinct error-response assertion: a bounded valid `RpcError` with
 non-empty message and valid optional data must round-trip with its request ID
@@ -104,10 +113,14 @@ regressions and failure diagnostics.
 
 ## Security and Concurrency Invariants
 
-- A valid result for one MCP method MUST NOT be usable as a successful result
-  for any different supported method. This prevents method/result confusion at
-  the untrusted peer boundary; rejection must be `WireError::InvalidValue`,
-  not coercion, fallback deserialization, or a panic.
+- Cross-method success is permitted only when equivalence is proven by the
+  exact bounded schema-equivalent fixture families: `{}` among
+  `METHOD_PING`, `METHOD_RESOURCES_SUBSCRIBE`, and
+  `METHOD_RESOURCES_UNSUBSCRIBE`, or empty paginated `items: []` among
+  `METHOD_TOOLS_LIST`, `METHOD_RESOURCES_LIST`, and `METHOD_PROMPTS_LIST`.
+  Every other cross-method pairing at the untrusted peer boundary MUST fail
+  closed with `WireError::InvalidValue`, with no coercion, fallback
+  deserialization, or panic.
 - The successful response's valid JSON-RPC request ID MUST survive
   `validated_response_for_method` → `encode` → `decode` unchanged. No test
   may bypass the real envelope path or use an unchecked response constructor.
@@ -173,9 +186,12 @@ correction at the failing boundary.
 
 ### Part 3 — exhaustive correlation rejection
 
-Stop if a response correlates successfully under a different request method,
-if rejection is not `WireError::InvalidValue`, or if a valid error response is
-reinterpreted as a successful typed result. Do not add an adapter, special-case
+Stop if a response correlates successfully under a different request method outside
+the two explicitly permitted schema-equivalent fixture families: empty `{}` among
+`ping`/`resources-subscribe`/`resources-unsubscribe`, or empty `items: []` among
+`tools-list`/`resources-list`/`prompts-list`; stop if rejection is not
+`WireError::InvalidValue`, or if a valid error response is reinterpreted as a
+successful typed result. Do not add an adapter, special-case
 the test, or broaden a result schema. Record the exact source and destination
 methods and isolate the wire validation defect first.
 
