@@ -323,19 +323,26 @@ impl SessionLifecycle {
         ) {
             return Err(LifecycleError::IllegalTransition);
         }
-        if self.generation.checked_add(1).is_none() {
-            return Err(LifecycleError::IdExhausted);
-        }
-        let drained = self.drain_pending();
         if self.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+            let drained = self.drain_pending();
             self.state = SessionState::Failed;
             self.clear_session();
             return Err(LifecycleError::ReconnectExhausted { drained });
         }
-        self.reconnect_attempts += 1;
+        let next_generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(LifecycleError::IdExhausted)?;
+        let next_attempt = self
+            .reconnect_attempts
+            .checked_add(1)
+            .ok_or(LifecycleError::IdExhausted)?;
+        let drained = self.drain_pending();
+        self.reconnect_attempts = next_attempt;
         self.state = SessionState::Disconnected;
         self.clear_session();
         let generation = self.begin_connect_inner()?;
+        debug_assert_eq!(generation, next_generation);
         Ok(ReconnectResult {
             generation,
             drained,
@@ -419,6 +426,50 @@ mod tests {
         assert_eq!(life.begin_close().unwrap(), Vec::new());
         life.finish_close().unwrap();
         assert_eq!(life.finish_close(), Ok(()));
+    }
+    #[test]
+    fn reconnect_budget_precedes_generation_exhaustion_and_nonterminal_failure_is_atomic() {
+        let mut terminal = modern_ready();
+        let token = terminal.allocate_and_reserve().unwrap();
+        terminal.generation = u64::MAX;
+        terminal.reconnect_attempts = MAX_RECONNECT_ATTEMPTS;
+        assert_eq!(
+            terminal.begin_reconnect(),
+            Err(LifecycleError::ReconnectExhausted {
+                drained: vec![token]
+            })
+        );
+        assert_eq!(terminal.state(), SessionState::Failed);
+        assert_eq!(
+            terminal.begin_reconnect(),
+            Err(LifecycleError::ReconnectExhausted { drained: vec![] })
+        );
+
+        let mut nonterminal = modern_ready();
+        let pending = nonterminal.allocate_and_reserve().unwrap();
+        nonterminal.generation = u64::MAX;
+        let snapshot = (
+            nonterminal.state,
+            nonterminal.reconnect_attempts,
+            nonterminal.pending_len(),
+            nonterminal.era,
+            nonterminal.capabilities.clone(),
+        );
+        assert_eq!(
+            nonterminal.begin_reconnect(),
+            Err(LifecycleError::IdExhausted)
+        );
+        assert_eq!(
+            (
+                nonterminal.state,
+                nonterminal.reconnect_attempts,
+                nonterminal.pending_len(),
+                nonterminal.era,
+                nonterminal.capabilities.clone()
+            ),
+            snapshot
+        );
+        assert_eq!(nonterminal.complete(&pending), Ok(()));
     }
     #[test]
     fn fresh_connect_failure_is_mutation_free_and_ready_preserves_budget() {

@@ -94,6 +94,9 @@ struct ErrorEnvelope {
     id: RequestId,
     error: RpcError,
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmptyResult {}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcError {
@@ -441,18 +444,20 @@ fn validate_success(method: &str, value: &Value) -> Result<(), WireError> {
     match method {
         METHOD_INITIALIZE => typed_result!(InitializeResult),
         METHOD_DISCOVER => typed_result!(DiscoverResult),
-        METHOD_PING => {
-            if !value.is_object() {
+        METHOD_PING | METHOD_RESOURCES_SUBSCRIBE | METHOD_RESOURCES_UNSUBSCRIBE => {
+            let Some(object) = value.as_object() else {
+                return Err(WireError::InvalidValue);
+            };
+            if !object.is_empty() {
                 return Err(WireError::InvalidValue);
             }
+            serde_json::from_value::<EmptyResult>(value.clone())
+                .map_err(|_| WireError::InvalidValue)?;
         }
         METHOD_TOOLS_LIST => typed_result!(Paginated<Tool>),
         METHOD_TOOLS_CALL => typed_result!(ToolCallResult),
         METHOD_RESOURCES_LIST => typed_result!(Paginated<Resource>),
         METHOD_RESOURCES_READ => typed_result!(ResourceReadResult),
-        METHOD_RESOURCES_SUBSCRIBE | METHOD_RESOURCES_UNSUBSCRIBE => {
-            value.validate_mcp().map_err(|_| WireError::InvalidValue)?
-        }
         METHOD_PROMPTS_LIST => typed_result!(Paginated<Prompt>),
         METHOD_PROMPTS_GET => typed_result!(PromptGetResult),
         _ => return Err(WireError::InvalidValue),
@@ -513,24 +518,66 @@ mod tests {
     fn response_size_and_correlation_are_bounded() {
         let huge = serde_json::json!({"value": "x".repeat(MAX_FRAME_BYTES)});
         assert_eq!(
-            validated_response_for_method(METHOD_PING, RequestId::Number(1), Ok(huge)),
+            validated_response_for_method(
+                METHOD_PING,
+                RequestId::Number(1),
+                Err(RpcError {
+                    code: -1,
+                    message: "x".into(),
+                    data: Some(huge)
+                }),
+            ),
             Err(WireError::FrameTooLarge)
         );
-        let response = validated_response_for_method(
+        let validated = validated_response_for_method(
             METHOD_PING,
             RequestId::Number(2),
             Ok(serde_json::json!({})),
         )
         .unwrap();
-        assert!(response.clone().correlate(METHOD_PING).is_ok());
+        assert!(validated.clone().correlate(METHOD_PING).is_ok());
         assert_eq!(
-            response.clone().correlate(METHOD_TOOLS_LIST),
+            validated.clone().correlate(METHOD_TOOLS_LIST),
             Err(WireError::InvalidValue)
         );
         assert_eq!(
-            response.correlate("unknown/method"),
+            validated.correlate("unknown/method"),
             Err(WireError::InvalidValue)
         );
+        for method in [
+            METHOD_PING,
+            METHOD_RESOURCES_SUBSCRIBE,
+            METHOD_RESOURCES_UNSUBSCRIBE,
+        ] {
+            assert!(
+                validated_response_for_method(
+                    method,
+                    RequestId::Number(4),
+                    Ok(serde_json::json!({}))
+                )
+                .is_ok()
+            );
+            for invalid in [
+                serde_json::Value::Null,
+                serde_json::json!([]),
+                serde_json::json!(""),
+                serde_json::json!(0),
+                serde_json::json!(false),
+                serde_json::json!({"extra": null}),
+                serde_json::json!({"nested": {"x": 1}}),
+            ] {
+                assert_eq!(
+                    validated_response_for_method(
+                        method,
+                        RequestId::Number(5),
+                        Ok(invalid.clone())
+                    ),
+                    Err(WireError::InvalidValue)
+                );
+                let generic = super::response(RequestId::Number(6), Ok(invalid)).unwrap();
+                assert_eq!(generic.correlate(method), Err(WireError::InvalidValue));
+            }
+        }
         let error = validated_response_for_method(
             METHOD_PING,
             RequestId::Number(3),
