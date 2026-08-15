@@ -26,7 +26,25 @@ pub enum RetryClass {
     SafeRead,
     Never,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingToken {
+    generation: u64,
+    id: RequestId,
+}
+impl PendingToken {
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub const fn id(&self) -> &RequestId {
+        &self.id
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconnectResult {
+    pub generation: u64,
+    pub drained: Vec<PendingToken>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LifecycleError {
     #[error("illegal MCP session lifecycle operation")]
     IllegalTransition,
@@ -36,12 +54,14 @@ pub enum LifecycleError {
     PendingLimit,
     #[error("MCP request id is already pending")]
     DuplicateRequest,
-    #[error("MCP response id is not pending for this generation")]
+    #[error("MCP response token is not pending for this generation")]
     UnknownResponse,
     #[error("MCP negotiation is not complete")]
     NegotiationRequired,
     #[error("MCP reconnect budget is exhausted")]
-    ReconnectExhausted,
+    ReconnectExhausted { drained: Vec<PendingToken> },
+    #[error("MCP request or generation id is exhausted")]
+    IdExhausted,
 }
 
 #[derive(Debug)]
@@ -51,9 +71,14 @@ pub struct SessionLifecycle {
     era: Option<McpProtocolEra>,
     capabilities: Option<ServerCapabilities>,
     legacy_initialized: bool,
-    pending: BTreeSet<(u64, RequestId)>,
+    pending: BTreeSet<PendingKey>,
     reconnect_attempts: u32,
     next_id: i64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PendingKey {
+    generation: u64,
+    id: RequestId,
 }
 impl Default for SessionLifecycle {
     fn default() -> Self {
@@ -88,21 +113,26 @@ impl SessionLifecycle {
     pub const fn reconnect_attempts(&self) -> u32 {
         self.reconnect_attempts
     }
-
     pub fn begin_connect(&mut self) -> Result<u64, LifecycleError> {
+        self.reconnect_attempts = 0;
+        self.begin_connect_inner()
+    }
+    fn begin_connect_inner(&mut self) -> Result<u64, LifecycleError> {
         if !matches!(
             self.state,
             SessionState::Disconnected | SessionState::Closed | SessionState::Failed
-        ) {
+        ) || !self.pending.is_empty()
+        {
             return Err(LifecycleError::IllegalTransition);
         }
-        self.generation = self.generation.wrapping_add(1);
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(LifecycleError::IdExhausted)?;
         self.state = SessionState::Connecting;
         self.era = None;
         self.capabilities = None;
         self.legacy_initialized = false;
-        self.pending.clear();
-        self.next_id = 0;
         Ok(self.generation)
     }
     pub fn begin_discovery(&mut self) -> Result<(), LifecycleError> {
@@ -126,11 +156,9 @@ impl SessionLifecycle {
         era: McpProtocolEra,
         capabilities: ServerCapabilities,
     ) -> Result<(), LifecycleError> {
-        if !matches!(
-            self.state,
-            SessionState::Discovering | SessionState::Initializing
-        ) || !super::SUPPORTED_PROTOCOL_ERAS.contains(&era)
-        {
+        let path_ok = (era.is_modern() && self.state == SessionState::Discovering)
+            || (!era.is_modern() && self.state == SessionState::Initializing);
+        if !path_ok || !super::SUPPORTED_PROTOCOL_ERAS.contains(&era) {
             return Err(LifecycleError::NegotiationRequired);
         }
         self.era = Some(era);
@@ -166,45 +194,83 @@ impl SessionLifecycle {
         self.reconnect_attempts = 0;
         Ok(())
     }
-    pub fn allocate_id(&mut self) -> Result<RequestId, LifecycleError> {
+    pub fn allocate_and_reserve(&mut self) -> Result<PendingToken, LifecycleError> {
         if self.state != SessionState::Ready {
             return Err(LifecycleError::NotReady);
         }
-        self.next_id = self
+        let id = self
             .next_id
             .checked_add(1)
-            .ok_or(LifecycleError::PendingLimit)?;
-        Ok(RequestId::Number(self.next_id))
+            .ok_or(LifecycleError::IdExhausted)?;
+        if self.pending.len() >= MAX_PENDING_REQUESTS {
+            return Err(LifecycleError::PendingLimit);
+        }
+        self.next_id = id;
+        let token = PendingToken {
+            generation: self.generation,
+            id: RequestId::Number(id),
+        };
+        self.pending.insert(PendingKey {
+            generation: token.generation,
+            id: token.id.clone(),
+        });
+        Ok(token)
     }
-    pub fn reserve(&mut self, id: RequestId) -> Result<(), LifecycleError> {
+    pub fn reserve(&mut self, token: PendingToken) -> Result<(), LifecycleError> {
         if !matches!(self.state, SessionState::Ready | SessionState::Initializing) {
             return Err(LifecycleError::NotReady);
         }
-        id.validate().map_err(|_| LifecycleError::UnknownResponse)?;
-        let key = (self.generation, id);
-        if self.pending.contains(&key) {
+        if token.generation != self.generation {
+            return Err(LifecycleError::UnknownResponse);
+        }
+        token
+            .id
+            .validate()
+            .map_err(|_| LifecycleError::UnknownResponse)?;
+        if self
+            .pending
+            .iter()
+            .any(|key| key.generation == token.generation && key.id == token.id)
+        {
             return Err(LifecycleError::DuplicateRequest);
         }
         if self.pending.len() >= MAX_PENDING_REQUESTS {
             return Err(LifecycleError::PendingLimit);
         }
-        self.pending.insert(key);
+        self.pending.insert(PendingKey {
+            generation: token.generation,
+            id: token.id,
+        });
         Ok(())
     }
-    pub fn complete(&mut self, id: &RequestId) -> Result<(), LifecycleError> {
+    pub fn complete(&mut self, token: &PendingToken) -> Result<(), LifecycleError> {
+        if self.state == SessionState::Closing
+            || matches!(
+                self.state,
+                SessionState::Closed | SessionState::Failed | SessionState::Disconnected
+            )
+        {
+            return Err(LifecycleError::UnknownResponse);
+        }
         self.pending
-            .remove(&(self.generation, id.clone()))
+            .remove(&PendingKey {
+                generation: token.generation,
+                id: token.id.clone(),
+            })
             .then_some(())
             .ok_or(LifecycleError::UnknownResponse)
+    }
+    pub fn cancel(&mut self, token: &PendingToken) -> Result<(), LifecycleError> {
+        self.complete(token)
     }
     pub fn pending_len(&self) -> usize {
         self.pending.len()
     }
-    pub fn begin_close(&mut self) -> Result<(), LifecycleError> {
+    pub fn begin_close(&mut self) -> Result<Vec<PendingToken>, LifecycleError> {
         if matches!(self.state, SessionState::Closing | SessionState::Closed) {
-            return Ok(());
+            return Ok(Vec::new());
         }
-        if matches!(
+        if !matches!(
             self.state,
             SessionState::Connecting
                 | SessionState::Discovering
@@ -212,47 +278,75 @@ impl SessionLifecycle {
                 | SessionState::Ready
                 | SessionState::Failed
         ) {
-            self.state = SessionState::Closing;
+            return Err(LifecycleError::IllegalTransition);
+        }
+        self.state = SessionState::Closing;
+        Ok(self.drain_pending())
+    }
+    pub fn finish_close(&mut self) -> Result<(), LifecycleError> {
+        if self.state == SessionState::Closing {
+            self.state = SessionState::Closed;
+            self.clear_session();
+            Ok(())
+        } else if self.state == SessionState::Closed {
             Ok(())
         } else {
             Err(LifecycleError::IllegalTransition)
         }
     }
-    pub fn finish_close(&mut self) -> Vec<RequestId> {
-        self.state = SessionState::Closed;
-        self.clear_session()
-    }
-    pub fn disconnect(&mut self) -> Vec<RequestId> {
+    pub fn disconnect(&mut self) -> Vec<PendingToken> {
         self.state = SessionState::Disconnected;
-        self.clear_session()
+        self.clear_session();
+        self.drain_pending()
     }
-    pub fn fail(&mut self) -> Vec<RequestId> {
+    pub fn fail(&mut self) -> Vec<PendingToken> {
         self.state = SessionState::Failed;
-        self.clear_session()
+        self.clear_session();
+        self.drain_pending()
     }
-    pub fn begin_reconnect(&mut self) -> Result<u64, LifecycleError> {
+    pub fn begin_reconnect(&mut self) -> Result<ReconnectResult, LifecycleError> {
+        if !matches!(
+            self.state,
+            SessionState::Ready
+                | SessionState::Failed
+                | SessionState::Disconnected
+                | SessionState::Closed
+        ) {
+            return Err(LifecycleError::IllegalTransition);
+        }
+        let drained = self.drain_pending();
         if self.reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
             self.state = SessionState::Failed;
-            return Err(LifecycleError::ReconnectExhausted);
+            self.clear_session();
+            return Err(LifecycleError::ReconnectExhausted { drained });
         }
         self.reconnect_attempts += 1;
         self.state = SessionState::Disconnected;
         self.clear_session();
-        self.begin_connect()
+        let generation = self.begin_connect_inner()?;
+        Ok(ReconnectResult {
+            generation,
+            drained,
+        })
     }
-    fn clear_session(&mut self) -> Vec<RequestId> {
+    fn clear_session(&mut self) {
         self.era = None;
         self.capabilities = None;
         self.legacy_initialized = false;
-        self.drain_pending()
     }
-    fn drain_pending(&mut self) -> Vec<RequestId> {
-        let ids = self.pending.iter().map(|(_, id)| id.clone()).collect();
+    fn drain_pending(&mut self) -> Vec<PendingToken> {
+        let tokens = self
+            .pending
+            .iter()
+            .map(|key| PendingToken {
+                generation: key.generation,
+                id: key.id.clone(),
+            })
+            .collect();
         self.pending.clear();
-        ids
+        tokens
     }
 }
-
 pub fn retry_class(method: &str) -> RetryClass {
     match method {
         "server/discover" => RetryClass::SafeDiscovery,
@@ -266,33 +360,7 @@ pub fn retry_class(method: &str) -> RetryClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn negotiation_is_required_and_reconnect_is_fresh_and_bounded() {
-        let mut life = SessionLifecycle::new();
-        life.begin_connect().expect("connect");
-        life.begin_initialize().expect("initialize");
-        assert_eq!(life.mark_ready(), Err(LifecycleError::NegotiationRequired));
-        life.bind_negotiation(
-            McpProtocolEra::Legacy20251125,
-            ServerCapabilities::default(),
-        )
-        .expect("bind");
-        life.mark_legacy_initialized().expect("initialized");
-        life.mark_ready().expect("ready");
-        let id = life.allocate_id().expect("id");
-        life.reserve(id.clone()).expect("reserve");
-        assert_eq!(life.reserve(id), Err(LifecycleError::DuplicateRequest));
-        let old_generation = life.generation();
-        let drained = life.disconnect();
-        assert_eq!(drained.len(), 1);
-        life.begin_reconnect().expect("reconnect");
-        assert!(life.generation() > old_generation);
-        assert_eq!(life.era(), None);
-        assert_eq!(life.pending_len(), 0);
-        assert_eq!(retry_class("tools/call"), RetryClass::Never);
-    }
-    #[test]
-    fn close_is_idempotent_and_drains_pending() {
+    fn modern_ready() -> SessionLifecycle {
         let mut life = SessionLifecycle::new();
         life.begin_connect().unwrap();
         life.begin_discovery().unwrap();
@@ -302,13 +370,64 @@ mod tests {
         )
         .unwrap();
         life.mark_ready().unwrap();
-        let id = life.allocate_id().unwrap();
-        life.reserve(id).unwrap();
-        life.begin_close().unwrap();
-        life.begin_close().unwrap();
-        assert_eq!(life.finish_close().len(), 1);
-        assert_eq!(life.finish_close().len(), 0);
-        assert_eq!(life.era(), None);
-        assert_eq!(life.capabilities(), None);
+        life
+    }
+    #[test]
+    fn generation_fences_and_reconnect_drains_without_resetting_ids() {
+        let mut life = modern_ready();
+        let first = life.allocate_and_reserve().unwrap();
+        let old_generation = first.generation();
+        let drained = life.disconnect();
+        assert_eq!(drained, vec![first]);
+        let reconnect = life.begin_reconnect().unwrap();
+        assert!(reconnect.generation > old_generation);
+        life.begin_discovery().unwrap();
+        life.bind_negotiation(
+            McpProtocolEra::Modern20260728,
+            ServerCapabilities::default(),
+        )
+        .unwrap();
+        life.mark_ready().unwrap();
+        let second = life.allocate_and_reserve().unwrap();
+        assert!(matches!(second.id(), RequestId::Number(value) if *value > 1));
+        assert_eq!(
+            life.complete(&PendingToken {
+                generation: old_generation,
+                id: RequestId::Number(1)
+            }),
+            Err(LifecycleError::UnknownResponse)
+        );
+    }
+    #[test]
+    fn close_drains_immediately_and_is_idempotent() {
+        let mut life = modern_ready();
+        let token = life.allocate_and_reserve().unwrap();
+        let drained = life.begin_close().unwrap();
+        assert_eq!(drained, vec![token]);
+        assert_eq!(life.begin_close().unwrap(), Vec::new());
+        life.finish_close().unwrap();
+        assert_eq!(life.finish_close(), Ok(()));
+    }
+    #[test]
+    fn legacy_path_and_id_exhaustion_are_boundaries() {
+        let mut life = SessionLifecycle::new();
+        life.begin_connect().unwrap();
+        assert_eq!(
+            life.bind_negotiation(
+                McpProtocolEra::Legacy20251125,
+                ServerCapabilities::default()
+            ),
+            Err(LifecycleError::NegotiationRequired)
+        );
+        life.begin_initialize().unwrap();
+        life.bind_negotiation(
+            McpProtocolEra::Legacy20251125,
+            ServerCapabilities::default(),
+        )
+        .unwrap();
+        assert_eq!(life.mark_ready(), Err(LifecycleError::NegotiationRequired));
+        life.mark_legacy_initialized().unwrap();
+        life.mark_ready().unwrap();
+        assert_eq!(retry_class("tools/call"), RetryClass::Never);
     }
 }

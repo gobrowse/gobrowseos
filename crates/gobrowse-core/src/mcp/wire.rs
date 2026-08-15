@@ -50,7 +50,7 @@ impl RequestId {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Request {
+pub(crate) struct Request {
     pub jsonrpc: String,
     pub id: RequestId,
     pub method: String,
@@ -59,7 +59,7 @@ pub struct Request {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Notification {
+pub(crate) struct Notification {
     pub jsonrpc: String,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -67,7 +67,7 @@ pub struct Notification {
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Response {
+pub(crate) struct Response {
     pub jsonrpc: String,
     pub id: RequestId,
     #[serde(flatten)]
@@ -185,7 +185,10 @@ pub fn decode(bytes: &[u8]) -> Result<ValidatedMessage, WireError> {
     if bytes.len() > MAX_FRAME_BYTES {
         return Err(WireError::FrameTooLarge);
     }
-    let value: Value = serde_json::from_slice(bytes).map_err(|_| WireError::Malformed)?;
+    let value = validation::parse_bounded_json(bytes).map_err(|error| match error {
+        validation::ValidationError::Malformed => WireError::Malformed,
+        _ => WireError::InvalidValue,
+    })?;
     validation::validate_json(&value).map_err(|_| WireError::InvalidValue)?;
     let object = value.as_object().ok_or(WireError::NotObject)?;
     classify(object)
@@ -277,11 +280,20 @@ fn validate_method_params(method: &str, params: Option<&Value>) -> Result<(), Wi
                 | METHOD_RESOURCES_UNSUBSCRIBE
                 | METHOD_PROMPTS_GET
                 | METHOD_CANCELLED
+                | METHOD_RESOURCE_UPDATED
+                | METHOD_PROGRESS
+                | METHOD_LOGGING_MESSAGE
         ) {
             return Err(WireError::InvalidValue);
         }
         return Ok(());
     };
+    if matches!(
+        method,
+        METHOD_INITIALIZED | METHOD_TOOLS_LIST_CHANGED | METHOD_RESOURCES_LIST_CHANGED
+    ) {
+        return Err(WireError::InvalidValue);
+    }
     macro_rules! typed {
         ($ty:ty) => {{
             let value: $ty =
@@ -299,6 +311,9 @@ fn validate_method_params(method: &str, params: Option<&Value>) -> Result<(), Wi
         }
         METHOD_PROMPTS_GET => typed!(PromptGetParams),
         METHOD_CANCELLED => typed!(CancelledParams),
+        METHOD_RESOURCE_UPDATED => typed!(ResourceUpdatedParams),
+        METHOD_PROGRESS => typed!(ProgressParams),
+        METHOD_LOGGING_MESSAGE => typed!(LoggingMessageParams),
         _ => {}
     }
     Ok(())
@@ -329,30 +344,56 @@ pub fn encode(message: &ValidatedMessage) -> Result<Vec<u8>, WireError> {
     }
 }
 
-pub fn request(id: RequestId, method: impl Into<String>, params: Option<Value>) -> Request {
-    Request {
+pub fn try_request(
+    id: RequestId,
+    method: impl Into<String>,
+    params: Option<Value>,
+) -> Result<ValidatedRequest, WireError> {
+    validate_request(Request {
         jsonrpc: JSONRPC_VERSION.into(),
         id,
         method: method.into(),
         params,
-    }
+    })
 }
-pub fn notification(method: impl Into<String>, params: Option<Value>) -> Notification {
-    Notification {
+pub fn try_notification(
+    method: impl Into<String>,
+    params: Option<Value>,
+) -> Result<ValidatedNotification, WireError> {
+    validate_notification(Notification {
         jsonrpc: JSONRPC_VERSION.into(),
         method: method.into(),
         params,
+    })
+}
+pub fn validated_response_for_method(
+    method: &str,
+    id: RequestId,
+    result: Result<Value, RpcError>,
+) -> Result<ValidatedResponse, WireError> {
+    if let Ok(value) = &result {
+        macro_rules! typed_result {
+            ($ty:ty) => {{
+                let parsed: $ty =
+                    serde_json::from_value(value.clone()).map_err(|_| WireError::InvalidValue)?;
+                parsed.validate_mcp().map_err(|_| WireError::InvalidValue)?;
+            }};
+        }
+        match method {
+            METHOD_INITIALIZE => typed_result!(InitializeResult),
+            METHOD_DISCOVER => typed_result!(DiscoverResult),
+            METHOD_TOOLS_LIST => typed_result!(Paginated<Tool>),
+            METHOD_TOOLS_CALL => typed_result!(ToolCallResult),
+            METHOD_RESOURCES_LIST => typed_result!(Paginated<Resource>),
+            METHOD_RESOURCES_READ => typed_result!(ResourceReadResult),
+            METHOD_PROMPTS_LIST => typed_result!(Paginated<Prompt>),
+            METHOD_PROMPTS_GET => typed_result!(PromptGetResult),
+            _ => value.validate_mcp().map_err(|_| WireError::InvalidValue)?,
+        }
     }
+    response(id, result)
 }
-pub fn validate_outbound(request: Request) -> Result<ValidatedRequest, WireError> {
-    validate_request(request)
-}
-pub fn validate_outbound_notification(
-    notification: Notification,
-) -> Result<ValidatedNotification, WireError> {
-    validate_notification(notification)
-}
-pub fn response(
+pub(crate) fn response(
     id: RequestId,
     result: Result<Value, RpcError>,
 ) -> Result<ValidatedResponse, WireError> {
@@ -387,6 +428,7 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":1,"result":{},"extra":true}"#,
             r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
             r#"{"jsonrpc":"2.0","id":1,"method":"ping"}{"x":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","method":"other"}"#,
         ] {
             assert!(decode(raw.as_bytes()).is_err(), "accepted {raw}");
         }

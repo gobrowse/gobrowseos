@@ -1,6 +1,8 @@
 //! Shared bounded validation for every untrusted MCP message and model.
 
-use serde_json::Value;
+use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
+use serde_json::{Map, Value};
+use std::fmt;
 
 pub const MAX_ITEMS: usize = 256;
 pub const MAX_CURSOR_BYTES: usize = 512;
@@ -24,6 +26,8 @@ pub enum ValidationError {
     InvalidCursor,
     #[error("MCP value is invalid")]
     InvalidValue,
+    #[error("MCP JSON is malformed or has trailing data")]
+    Malformed,
 }
 
 pub trait ValidateMcp {
@@ -67,6 +71,110 @@ pub fn validate_content_text(text: &str) -> Result<(), ValidationError> {
     (text.len() <= MAX_CONTENT_BYTES)
         .then_some(())
         .ok_or(ValidationError::ContentTooLarge)
+}
+
+pub fn parse_bounded_json(bytes: &[u8]) -> Result<Value, ValidationError> {
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let value = BoundedValueSeed { depth: 0 }
+        .deserialize(&mut deserializer)
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("MCP_LIMIT") || message.contains("MCP_DUPLICATE_KEY") {
+                ValidationError::InvalidValue
+            } else {
+                ValidationError::Malformed
+            }
+        })?;
+    deserializer.end().map_err(|_| ValidationError::Malformed)?;
+    Ok(value)
+}
+
+struct BoundedValueSeed {
+    depth: usize,
+}
+impl<'de> DeserializeSeed<'de> for BoundedValueSeed {
+    type Value = Value;
+    fn deserialize<D>(self, deserializer: D) -> Result<Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > MAX_JSON_DEPTH {
+            return Err(de::Error::custom("MCP_LIMIT_DEPTH"));
+        }
+        deserializer.deserialize_any(BoundedValueVisitor { depth: self.depth })
+    }
+}
+struct BoundedValueVisitor {
+    depth: usize,
+}
+impl<'de> Visitor<'de> for BoundedValueVisitor {
+    type Value = Value;
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a bounded JSON value")
+    }
+    fn visit_bool<E>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+    fn visit_i64<E>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_u64<E>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_f64<E>(self, value: f64) -> Result<Value, E>
+    where
+        E: de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .ok_or_else(|| E::custom("invalid number"))
+    }
+    fn visit_str<E>(self, value: &str) -> Result<Value, E> {
+        Ok(Value::String(value.to_owned()))
+    }
+    fn visit_string<E>(self, value: String) -> Result<Value, E> {
+        Ok(Value::String(value))
+    }
+    fn visit_none<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_unit<E>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_seq<A>(self, mut access: A) -> Result<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = access.next_element_seed(BoundedValueSeed {
+            depth: self.depth + 1,
+        })? {
+            if values.len() >= MAX_ITEMS {
+                return Err(de::Error::custom("MCP_LIMIT_ITEMS"));
+            }
+            values.push(value);
+        }
+        Ok(Value::Array(values))
+    }
+    fn visit_map<A>(self, mut access: A) -> Result<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = access.next_key::<String>()? {
+            if values.len() >= MAX_ITEMS {
+                return Err(de::Error::custom("MCP_LIMIT_ITEMS"));
+            }
+            if values.contains_key(&key) {
+                return Err(de::Error::custom("MCP_DUPLICATE_KEY"));
+            }
+            let value = access.next_value_seed(BoundedValueSeed {
+                depth: self.depth + 1,
+            })?;
+            values.insert(key, value);
+        }
+        Ok(Value::Object(values))
+    }
 }
 
 pub fn validate_json(value: &Value) -> Result<(), ValidationError> {

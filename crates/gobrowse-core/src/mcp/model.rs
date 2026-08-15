@@ -1,5 +1,6 @@
 //! Strict MCP tools, resources, prompts, and content models.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -78,10 +79,22 @@ pub struct ToolCallResult {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Content {
-    Text { text: String },
-    Image { data: String, mime_type: String },
-    Audio { data: String, mime_type: String },
-    Resource { resource: EmbeddedResource },
+    Text {
+        text: String,
+    },
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    Resource {
+        resource: EmbeddedResource,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -212,24 +225,66 @@ fn valid_name(value: &str) -> Result<(), ValidationError> {
 impl ValidateMcp for InitializeParams {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         valid_name(&self.protocol_version)?;
+        self.capabilities.validate_mcp()?;
         valid_name(&self.client_info.name)
     }
 }
 impl ValidateMcp for DiscoverResult {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         validation::validate_collection_len(self.supported_versions.len())?;
-        if self.supported_versions.is_empty() {
+        if self.supported_versions.is_empty()
+            || self.supported_versions.iter().any(|v| v.is_empty())
+        {
             return Err(ValidationError::InvalidValue);
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        if self.supported_versions.iter().any(|version| {
+            !seen.insert(version) || super::McpProtocolEra::from_wire_version(version).is_none()
+        }) {
+            return Err(ValidationError::InvalidValue);
+        }
+        self.capabilities.validate_mcp()?;
+        if let Some(info) = &self.server_info {
+            valid_name(&info.name)?;
         }
         Ok(())
     }
 }
+impl ValidateMcp for InitializeResult {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        valid_name(&self.protocol_version)?;
+        self.capabilities.validate_mcp()?;
+        if let Some(instructions) = &self.instructions {
+            validation::validate_content_text(instructions)?;
+        }
+        valid_name(&self.server_info.name)
+    }
+}
+fn validate_schema(name: &str, value: &Value) -> Result<(), ValidationError> {
+    let check = super::validate_tool_schema(name, value);
+    if check.status == super::DiagnosticStatus::Fail {
+        Err(ValidationError::InvalidValue)
+    } else {
+        value.validate_mcp()
+    }
+}
+fn validate_blob(value: &str) -> Result<(), ValidationError> {
+    if value.len() > validation::MAX_CONTENT_BYTES.saturating_mul(4) / 3 + 4 {
+        return Err(ValidationError::ContentTooLarge);
+    }
+    let decoded = STANDARD
+        .decode(value)
+        .map_err(|_| ValidationError::InvalidValue)?;
+    (decoded.len() <= validation::MAX_CONTENT_BYTES)
+        .then_some(())
+        .ok_or(ValidationError::ContentTooLarge)
+}
 impl ValidateMcp for Tool {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
         valid_name(&self.name)?;
-        self.input_schema.validate_mcp()?;
+        validate_schema(&self.name, &self.input_schema)?;
         if let Some(value) = &self.output_schema {
-            value.validate_mcp()?;
+            validate_schema(&self.name, value)?;
         }
         Ok(())
     }
@@ -246,7 +301,7 @@ impl ValidateMcp for Content {
             Content::Text { text } => validation::validate_content_text(text),
             Content::Image { data, mime_type } | Content::Audio { data, mime_type } => {
                 valid_name(mime_type)?;
-                validation::validate_content_text(data)
+                validate_blob(data)
             }
             Content::Resource { resource } => resource.validate_mcp(),
         }
@@ -259,7 +314,7 @@ impl ValidateMcp for EmbeddedResource {
             validation::validate_content_text(text)?;
         }
         if let Some(blob) = &self.blob {
-            validation::validate_content_text(blob)?;
+            validate_blob(blob)?;
         }
         Ok(())
     }
@@ -281,6 +336,9 @@ impl ValidateMcp for ResourceContent {
         if let Some(text) = &self.text {
             validation::validate_content_text(text)?;
         }
+        if let Some(blob) = &self.blob {
+            validate_blob(blob)?;
+        }
         Ok(())
     }
 }
@@ -301,11 +359,76 @@ impl ValidateMcp for PromptMessage {
         self.content.validate_mcp()
     }
 }
-impl<T: ValidateMcp> ValidateMcp for Paginated<T> {
+impl ValidateMcp for ToolCallResult {
     fn validate_mcp(&self) -> Result<(), ValidationError> {
-        validation::validate_collection_len(self.items.len())?;
-        validation::validate_cursor(self.next_cursor.as_deref())?;
-        self.items.iter().try_for_each(ValidateMcp::validate_mcp)
+        validation::validate_collection_len(self.content.len())?;
+        self.content
+            .iter()
+            .try_for_each(ValidateMcp::validate_mcp)?;
+        if let Some(value) = &self.structured_content {
+            value.validate_mcp()?;
+        }
+        Ok(())
+    }
+}
+impl ValidateMcp for ResourceReadResult {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        validation::validate_collection_len(self.contents.len())?;
+        let mut seen = std::collections::BTreeSet::new();
+        for content in &self.contents {
+            if !seen.insert(&content.uri) {
+                return Err(ValidationError::InvalidValue);
+            }
+            content.validate_mcp()?;
+        }
+        Ok(())
+    }
+}
+impl ValidateMcp for PromptGetResult {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        validation::validate_collection_len(self.messages.len())?;
+        self.messages.iter().try_for_each(ValidateMcp::validate_mcp)
+    }
+}
+fn validate_page_bounds<T: ValidateMcp>(page: &Paginated<T>) -> Result<(), ValidationError> {
+    validation::validate_collection_len(page.items.len())?;
+    validation::validate_cursor(page.next_cursor.as_deref())?;
+    page.items.iter().try_for_each(ValidateMcp::validate_mcp)
+}
+impl ValidateMcp for Paginated<Tool> {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        validate_page_bounds(self)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &self.items {
+            if !seen.insert(&item.name) {
+                return Err(ValidationError::InvalidValue);
+            }
+        }
+        Ok(())
+    }
+}
+impl ValidateMcp for Paginated<Resource> {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        validate_page_bounds(self)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &self.items {
+            if !seen.insert(&item.uri) {
+                return Err(ValidationError::InvalidValue);
+            }
+        }
+        Ok(())
+    }
+}
+impl ValidateMcp for Paginated<Prompt> {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        validate_page_bounds(self)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for item in &self.items {
+            if !seen.insert(&item.name) {
+                return Err(ValidationError::InvalidValue);
+            }
+        }
+        Ok(())
     }
 }
 impl ValidateMcp for ListParams {
@@ -332,7 +455,7 @@ pub struct ResourceUpdatedParams {
     pub uri: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProgressParams {
     pub progress_token: RequestId,
     pub progress: u64,
@@ -382,5 +505,57 @@ mod tests {
         assert!(json.get("protocolVersion").is_some());
         assert!(json.get("protocol_version").is_none());
         assert!(serde_json::from_value::<InitializeParams>(serde_json::json!({"protocolVersion":"x","capabilities":{},"clientInfo":{"name":"x","version":"1"},"extra":true})).is_err());
+        let image = serde_json::to_value(Content::Image {
+            data: "aGVsbG8=".into(),
+            mime_type: "image/png".into(),
+        })
+        .expect("image");
+        assert_eq!(image["mimeType"], "image/png");
+        assert!(image.get("mime_type").is_none());
+        let progress = serde_json::to_value(ProgressParams {
+            progress_token: RequestId::String("p".into()),
+            progress: 1,
+            total: Some(2),
+        })
+        .expect("progress");
+        assert_eq!(progress["progressToken"], "p");
+        assert!(progress.get("progress_token").is_none());
+        assert!(
+            serde_json::from_value::<ProgressParams>(
+                serde_json::json!({"progress_token":"p","progress":1})
+            )
+            .is_err()
+        );
+        assert!(
+            Content::Image {
+                data: "not-base64".into(),
+                mime_type: "image/png".into()
+            }
+            .validate_mcp()
+            .is_err()
+        );
+        let duplicate_resources = ResourceReadResult {
+            contents: vec![
+                ResourceContent {
+                    uri: "urn:test".into(),
+                    mime_type: None,
+                    text: Some("a".into()),
+                    blob: None,
+                },
+                ResourceContent {
+                    uri: "urn:test".into(),
+                    mime_type: None,
+                    text: Some("b".into()),
+                    blob: None,
+                },
+            ],
+        };
+        assert!(duplicate_resources.validate_mcp().is_err());
+        let duplicate_versions = DiscoverResult {
+            supported_versions: vec!["2026-07-28".into(), "2026-07-28".into()],
+            capabilities: Default::default(),
+            server_info: None,
+        };
+        assert!(duplicate_versions.validate_mcp().is_err());
     }
 }

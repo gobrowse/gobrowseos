@@ -1,5 +1,6 @@
 //! Strict capability negotiation and method authorization for the MCP core surface.
 
+use super::validation::{ValidateMcp, ValidationError};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,6 +109,23 @@ pub enum CapabilityNotification {
     Progress,
     Logging,
 }
+impl ValidateMcp for ClientCapabilities {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        if let Some(value) = &self.experimental {
+            value.validate_mcp()?;
+        }
+        Ok(())
+    }
+}
+impl ValidateMcp for ServerCapabilities {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        if let Some(value) = &self.experimental {
+            value.validate_mcp()?;
+        }
+        Ok(())
+    }
+}
+
 pub fn notification_allowed(
     notification: CapabilityNotification,
     capabilities: &ServerCapabilities,

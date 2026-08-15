@@ -84,6 +84,7 @@ pub struct McpServerDispatcher<H> {
     handler: H,
     era: Option<McpProtocolEra>,
     capabilities: Option<ServerCapabilities>,
+    pending_legacy: Option<(McpProtocolEra, ServerCapabilities)>,
     initialize_seen: bool,
     initialized_seen: bool,
 }
@@ -93,6 +94,7 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
             handler,
             era: None,
             capabilities: None,
+            pending_legacy: None,
             initialize_seen: false,
             initialized_seen: false,
         }
@@ -109,8 +111,10 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
 
     pub async fn dispatch(&mut self, request: ValidatedRequest) -> ValidatedResponse {
         let id = request.id().clone();
+        let method = request.method().to_owned();
         let result = self.dispatch_request(request).await;
-        response(id, result).expect("dispatcher creates valid response")
+        validated_response_for_method(&method, id, result)
+            .expect("dispatcher creates valid response")
     }
     pub async fn notify(
         &mut self,
@@ -118,12 +122,15 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
     ) -> Result<(), DispatchError> {
         match notification.method() {
             METHOD_INITIALIZED => {
-                if self.era != Some(McpProtocolEra::Legacy20251125)
-                    || !self.initialize_seen
-                    || self.initialized_seen
-                {
+                if self.pending_legacy.is_none() || !self.initialize_seen || self.initialized_seen {
                     return Err(DispatchError::Negotiation);
                 }
+                let (era, capabilities) = self
+                    .pending_legacy
+                    .take()
+                    .ok_or(DispatchError::Negotiation)?;
+                self.era = Some(era);
+                self.capabilities = Some(capabilities);
                 self.initialized_seen = true;
                 Ok(())
             }
@@ -158,6 +165,13 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                 }
                 let discovered = self.handler.discover().await?;
                 discovered.validate_mcp().map_err(|_| invalid_params())?;
+                let mut versions = std::collections::BTreeSet::new();
+                if discovered.supported_versions.iter().any(|version| {
+                    !versions.insert(version)
+                        || super::McpProtocolEra::from_wire_version(version).is_none()
+                }) {
+                    return Err(negotiation_error());
+                }
                 let era = super::select_protocol_version(&discovered.supported_versions)
                     .map_err(|_| negotiation_error())?;
                 if !era.is_modern() {
@@ -178,68 +192,66 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                     return Err(negotiation_error());
                 }
                 let result = self.handler.initialize(params.clone()).await?;
+                result.validate_mcp().map_err(|_| invalid_params())?;
                 if result.protocol_version != params.protocol_version
                     || super::McpProtocolEra::from_wire_version(&result.protocol_version)
                         != Some(McpProtocolEra::Legacy20251125)
                 {
                     return Err(negotiation_error());
                 }
-                self.era = Some(McpProtocolEra::Legacy20251125);
-                self.capabilities = Some(result.capabilities.clone());
+                self.pending_legacy =
+                    Some((McpProtocolEra::Legacy20251125, result.capabilities.clone()));
                 self.initialize_seen = true;
                 serde_json::to_value(result).map_err(internal_error)
             }
-            METHOD_PING => serde_json::to_value(self.handler.ping().await?).map_err(internal_error),
+            METHOD_PING => validated_result(self.handler.ping().await),
             METHOD_TOOLS_LIST => {
                 self.require(METHOD_TOOLS_LIST)?;
                 let value: ListParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                serde_json::to_value(self.handler.tools_list(value).await?).map_err(internal_error)
+                validated_result(self.handler.tools_list(value).await)
             }
             METHOD_TOOLS_CALL => {
                 self.require(METHOD_TOOLS_CALL)?;
                 let value: ToolCallParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                serde_json::to_value(self.handler.tools_call(value).await?).map_err(internal_error)
+                validated_result(self.handler.tools_call(value).await)
             }
             METHOD_RESOURCES_LIST => {
                 self.require(METHOD_RESOURCES_LIST)?;
                 let value: ListParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                serde_json::to_value(self.handler.resources_list(value).await?)
-                    .map_err(internal_error)
+                validated_result(self.handler.resources_list(value).await)
             }
             METHOD_RESOURCES_READ => {
                 self.require(METHOD_RESOURCES_READ)?;
                 let value: ResourceReadParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                serde_json::to_value(self.handler.resources_read(value).await?)
-                    .map_err(internal_error)
+                validated_result(self.handler.resources_read(value).await)
             }
             METHOD_RESOURCES_SUBSCRIBE => {
                 self.require(METHOD_RESOURCES_SUBSCRIBE)?;
                 let value: ResourceSubscriptionParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                self.handler.resources_subscribe(value).await
+                validated_result(self.handler.resources_subscribe(value).await)
             }
             METHOD_RESOURCES_UNSUBSCRIBE => {
                 self.require(METHOD_RESOURCES_UNSUBSCRIBE)?;
                 let value: ResourceSubscriptionParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                self.handler.resources_unsubscribe(value).await
+                validated_result(self.handler.resources_unsubscribe(value).await)
             }
             METHOD_PROMPTS_LIST => {
                 self.require(METHOD_PROMPTS_LIST)?;
                 let value: ListParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                serde_json::to_value(self.handler.prompts_list(value).await?)
-                    .map_err(internal_error)
+                validated_result(self.handler.prompts_list(value).await)
             }
             METHOD_PROMPTS_GET => {
                 self.require(METHOD_PROMPTS_GET)?;
                 let value: PromptGetParams = self.params(Some(&params))?;
                 value.validate_mcp().map_err(|_| invalid_params())?;
-                serde_json::to_value(self.handler.prompts_get(value).await?).map_err(internal_error)
+                validated_result(self.handler.prompts_get(value).await)
             }
             _ => Err(RpcError {
                 code: ERROR_METHOD_NOT_FOUND,
@@ -297,6 +309,13 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
         })
     }
 }
+fn validated_result<T: serde::Serialize + ValidateMcp>(
+    result: Result<T, RpcError>,
+) -> Result<Value, RpcError> {
+    let value = result?;
+    value.validate_mcp().map_err(|_| invalid_params())?;
+    serde_json::to_value(value).map_err(internal_error)
+}
 fn invalid_params() -> RpcError {
     RpcError {
         code: ERROR_INVALID_PARAMS,
@@ -324,7 +343,7 @@ mod tests {
     use super::*;
     use crate::mcp::{
         capabilities::ToolsCapability,
-        wire::{decode, request, validate_outbound},
+        wire::{decode, try_request},
     };
     struct Fixture;
     #[async_trait]
@@ -353,8 +372,7 @@ mod tests {
     #[tokio::test]
     async fn binds_capabilities_only_after_valid_legacy_handshake() {
         let mut dispatcher = McpServerDispatcher::new(Fixture);
-        let before =
-            validate_outbound(request(RequestId::Number(1), METHOD_TOOLS_LIST, None)).unwrap();
+        let before = try_request(RequestId::Number(1), METHOD_TOOLS_LIST, None).unwrap();
         let result = dispatcher.dispatch(before).await;
         assert!(matches!(
             result.body(),
@@ -367,13 +385,12 @@ mod tests {
         ));
         let init = serde_json::json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"test","version":"1"}});
         let result = dispatcher
-            .dispatch(
-                validate_outbound(request(RequestId::Number(2), METHOD_INITIALIZE, Some(init)))
-                    .unwrap(),
-            )
+            .dispatch(try_request(RequestId::Number(2), METHOD_INITIALIZE, Some(init)).unwrap())
             .await;
         assert!(matches!(result.body(), ResponseBody::Result { .. }));
         assert!(!dispatcher.initialized());
+        assert_eq!(dispatcher.era(), None);
+        assert_eq!(dispatcher.capabilities(), None);
         assert!(
             dispatcher
                 .notify(
@@ -386,9 +403,7 @@ mod tests {
                 .is_ok()
         );
         let result = dispatcher
-            .dispatch(
-                validate_outbound(request(RequestId::Number(3), METHOD_TOOLS_LIST, None)).unwrap(),
-            )
+            .dispatch(try_request(RequestId::Number(3), METHOD_TOOLS_LIST, None).unwrap())
             .await;
         assert!(matches!(result.body(), ResponseBody::Result { .. }));
         assert!(
