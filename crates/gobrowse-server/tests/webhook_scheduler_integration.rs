@@ -18,7 +18,13 @@ use gobrowse_server::{
 };
 use secrecy::SecretString;
 use sqlx::{PgPool, Row};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
+
 use time::OffsetDateTime;
+use tokio::sync::Barrier;
 use uuid::Uuid;
 
 #[test]
@@ -258,7 +264,91 @@ async fn claim_loop_skips_locked_rows_under_concurrent_workers() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 2: exponential backoff on retryable failure
+// Test 2: barrier-controlled competing workers have one winner
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn barrier_competing_workers_deliver_once_and_fence_loser() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+    let delivery_id = format!("barrier-race-{}", Uuid::now_v7());
+    insert_queued_delivery(
+        &pool,
+        webhook_id,
+        &delivery_id,
+        "https://hooks.example.test/barrier",
+        &secret,
+    )
+    .await;
+    let barrier = Arc::new(Barrier::new(3));
+    let deliveries = Arc::new(AtomicUsize::new(0));
+    let mut workers = Vec::new();
+    for worker in ["barrier-a", "barrier-b"] {
+        let barrier = barrier.clone();
+        let deliveries = deliveries.clone();
+        let pool = pool.clone();
+        let delivery_id = delivery_id.clone();
+        workers.push(tokio::spawn(async move {
+            barrier.wait().await;
+            let claimed = webhook_scheduler::claim_deliveries(&pool, worker, 1)
+                .await
+                .expect("competing claim");
+            let mine = claimed.into_iter().find(|delivery| {
+                delivery.webhook_id == webhook_id && delivery.delivery_id == delivery_id
+            });
+            if let Some(delivery) = mine {
+                deliveries.fetch_add(1, Ordering::SeqCst);
+                let outcome = webhook_scheduler::DeliveryOutcome {
+                    response_code: Some(204),
+                    success: true,
+                    retryable: false,
+                    error: None,
+                };
+                webhook_scheduler::persist_outcome(&pool, &delivery, &outcome, 5).await;
+                1usize
+            } else {
+                0usize
+            }
+        }));
+    }
+    barrier.wait().await;
+    let claims = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        futures_util::future::join_all(workers),
+    )
+    .await
+    .expect("competing workers timeout")
+    .into_iter()
+    .map(|result| result.expect("competing worker task"))
+    .sum::<usize>();
+    assert_eq!(claims, 1, "exactly one worker must claim the row");
+    assert_eq!(deliveries.load(Ordering::SeqCst), 1, "one delivery winner");
+    let row = sqlx::query(
+        "SELECT status, attempts, lease_token, lease_expires_at, last_response_code FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read barrier row");
+    assert_eq!(row.get::<String, _>("status"), "succeeded");
+    assert_eq!(row.get::<i32, _>("attempts"), 1);
+    assert_eq!(row.get::<Option<i32>, _>("last_response_code"), Some(204));
+    assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
+    assert!(
+        row.get::<Option<OffsetDateTime>, _>("lease_expires_at")
+            .is_none()
+    );
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 3: exponential backoff on retryable failure
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -454,126 +544,7 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 5: durable response status matrix
-
-#[tokio::test]
-async fn durable_response_status_matrix_preserves_attempt_fields() {
-    let Some(database_url) = database_url() else {
-        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
-        return;
-    };
-    let _lock = common::acquire_test_lock(&database_url).await;
-    let pool = test_pool().await.expect("test pool after lock");
-    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
-    let cases = [
-        (200_u16, "succeeded", false),
-        (204, "succeeded", false),
-        (300, "failed", false),
-        (302, "failed", false),
-        (307, "failed", false),
-        (400, "failed", false),
-        (404, "failed", false),
-        (408, "queued", true),
-        (429, "queued", true),
-        (500, "queued", true),
-        (503, "queued", true),
-    ];
-    let owner = format!("matrix-{}", Uuid::now_v7());
-    for (status, expected_status, retryable) in cases {
-        let delivery_id = format!("status-{status}-{}", Uuid::now_v7());
-        insert_queued_delivery(
-            &pool,
-            webhook_id,
-            &delivery_id,
-            "https://hooks.example.test/matrix",
-            &secret,
-        )
-        .await;
-        let claimed = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
-            .await
-            .expect("claim matrix row")
-            .into_iter()
-            .find(|delivery| delivery.delivery_id == delivery_id)
-            .expect("matrix claim");
-        let outcome = webhook_scheduler::DeliveryOutcome {
-            response_code: Some(status),
-            success: expected_status == "succeeded",
-            retryable,
-            error: (expected_status == "failed")
-                .then(|| format!("target returned non-retryable HTTP {status}")),
-        };
-        webhook_scheduler::persist_outcome(&pool, &claimed, &outcome, 5).await;
-        let row = sqlx::query(
-            "SELECT status, attempts, last_response_code, next_attempt_at, lease_token, last_error FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
-        )
-        .bind(webhook_id)
-        .bind(&delivery_id)
-        .fetch_one(&pool)
-        .await
-        .expect("read matrix row");
-        assert_eq!(row.get::<String, _>("status"), expected_status);
-        assert_eq!(row.get::<i32, _>("attempts"), 1);
-        assert_eq!(
-            row.get::<Option<i32>, _>("last_response_code"),
-            Some(status as i32)
-        );
-        assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
-        if retryable {
-            assert!(
-                row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
-                    .is_some()
-            );
-            assert!(row.get::<Option<String>, _>("last_error").is_none());
-        } else {
-            assert!(
-                row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
-                    .is_none()
-            );
-        }
-    }
-    let dead_id = format!("status-dead-{}", Uuid::now_v7());
-    insert_delivery_with_attempts(
-        &pool,
-        webhook_id,
-        &dead_id,
-        "https://hooks.example.test/matrix",
-        &secret,
-        4,
-    )
-    .await;
-    let claimed = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
-        .await
-        .expect("claim dead row")
-        .into_iter()
-        .find(|delivery| delivery.delivery_id == dead_id)
-        .expect("dead claim");
-    let outcome = webhook_scheduler::DeliveryOutcome {
-        response_code: Some(503),
-        success: false,
-        retryable: true,
-        error: None,
-    };
-    webhook_scheduler::persist_outcome(&pool, &claimed, &outcome, 5).await;
-    let row = sqlx::query(
-        "SELECT status, attempts, next_attempt_at, lease_token FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
-    )
-    .bind(webhook_id)
-    .bind(&dead_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read dead row");
-    assert_eq!(row.get::<String, _>("status"), "dead");
-    assert_eq!(row.get::<i32, _>("attempts"), 5);
-    assert!(
-        row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
-            .is_none()
-    );
-    assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
-    cleanup(&pool, webhook_id, profile_id).await;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Test 6: crashed worker running row is reclaimed on restart
+// Test 5: crashed worker running row is reclaimed on restart
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -768,6 +739,23 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
         stale.lease_token, current.lease_token,
         "reclaim must issue a new lease identity"
     );
+    let before_stale = sqlx::query(
+        "SELECT status, attempts, lease_token, lease_expires_at, next_attempt_at, last_error, last_response_code FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read current lease before stale writes");
+    let before_status = before_stale.get::<String, _>("status");
+    let before_attempts = before_stale.get::<i32, _>("attempts");
+    let before_token = before_stale.get::<Uuid, _>("lease_token");
+    let before_expiry = before_stale
+        .get::<Option<OffsetDateTime>, _>("lease_expires_at")
+        .expect("current expiry before stale writes");
+    let before_next = before_stale.get::<Option<OffsetDateTime>, _>("next_attempt_at");
+    let before_error = before_stale.get::<Option<String>, _>("last_error");
+    let before_response = before_stale.get::<Option<i32>, _>("last_response_code");
 
     let denied = webhook_scheduler::DeliveryOutcome {
         response_code: None,
@@ -776,6 +764,33 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
         error: Some("target_policy_denied".to_owned()),
     };
     webhook_scheduler::persist_outcome(&pool, &stale, &denied, 5).await;
+    let after_policy = sqlx::query(
+        "SELECT status, attempts, lease_token, lease_expires_at, next_attempt_at, last_error, last_response_code FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read after stale policy");
+    assert_eq!(after_policy.get::<String, _>("status"), before_status);
+    assert_eq!(after_policy.get::<i32, _>("attempts"), before_attempts);
+    assert_eq!(after_policy.get::<Uuid, _>("lease_token"), before_token);
+    assert_eq!(
+        after_policy.get::<Option<OffsetDateTime>, _>("lease_expires_at"),
+        Some(before_expiry)
+    );
+    assert_eq!(
+        after_policy.get::<Option<OffsetDateTime>, _>("next_attempt_at"),
+        before_next
+    );
+    assert_eq!(
+        after_policy.get::<Option<String>, _>("last_error"),
+        before_error
+    );
+    assert_eq!(
+        after_policy.get::<Option<i32>, _>("last_response_code"),
+        before_response
+    );
 
     let success = webhook_scheduler::DeliveryOutcome {
         response_code: Some(200),
@@ -794,19 +809,23 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
     .fetch_one(&pool)
     .await
     .expect("read fenced delivery");
-    assert_eq!(row.get::<String, _>("status"), "running");
-    assert_eq!(row.get::<i32, _>("attempts"), 2);
-    assert_eq!(row.get::<Uuid, _>("lease_token"), current.lease_token);
+    assert_eq!(row.get::<String, _>("status"), before_status);
+    assert_eq!(row.get::<i32, _>("attempts"), before_attempts);
+    assert_eq!(row.get::<Uuid, _>("lease_token"), before_token);
     let current_expiry = row
         .get::<Option<OffsetDateTime>, _>("lease_expires_at")
         .expect("current lease expiry");
+    assert_eq!(current_expiry, before_expiry);
     assert!(current_expiry > OffsetDateTime::now_utc());
-    assert!(
-        row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
-            .is_none()
+    assert_eq!(
+        row.get::<Option<OffsetDateTime>, _>("next_attempt_at"),
+        before_next
     );
-    assert!(row.get::<Option<String>, _>("last_error").is_none());
-    assert!(row.get::<Option<i32>, _>("last_response_code").is_none());
+    assert_eq!(row.get::<Option<String>, _>("last_error"), before_error);
+    assert_eq!(
+        row.get::<Option<i32>, _>("last_response_code"),
+        before_response
+    );
 
     // The current worker's outcome is still accepted by the same fence.
     webhook_scheduler::persist_outcome(&pool, &current, &success, 5).await;

@@ -47,6 +47,7 @@ pub struct ClaimedDelivery {
 }
 
 /// The result of attempting one outbound POST.
+#[derive(Debug, PartialEq, Eq)]
 pub struct DeliveryOutcome {
     pub response_code: Option<u16>,
     pub success: bool,
@@ -226,27 +227,7 @@ pub async fn deliver_one_with(
         )
         .await
     {
-        Ok(response) => {
-            let success = (200..300).contains(&response.status);
-            let retryable = match response.status {
-                408 | 429 => true,
-                status if status >= 500 => true,
-                _ => false,
-            };
-            DeliveryOutcome {
-                response_code: Some(response.status),
-                success,
-                retryable,
-                error: if success || retryable {
-                    None
-                } else {
-                    Some(format!(
-                        "target returned non-retryable HTTP {}",
-                        response.status
-                    ))
-                },
-            }
-        }
+        Ok(response) => classify_http_response(response.status),
         Err(error) => DeliveryOutcome {
             response_code: None,
             success: false,
@@ -259,6 +240,22 @@ pub async fn deliver_one_with(
                 }
                 .to_owned(),
             ),
+        },
+    }
+}
+
+/// Map a target HTTP status into the scheduler's accepted outcome matrix.
+pub(crate) fn classify_http_response(status: u16) -> DeliveryOutcome {
+    let success = (200..300).contains(&status);
+    let retryable = matches!(status, 408 | 429) || status >= 500;
+    DeliveryOutcome {
+        response_code: Some(status),
+        success,
+        retryable,
+        error: if success || retryable {
+            None
+        } else {
+            Some(format!("target returned non-retryable HTTP {status}"))
         },
     }
 }
@@ -278,7 +275,7 @@ pub async fn persist_outcome(
     if outcome.success {
         let result = sqlx::query(
             "UPDATE webhook_deliveries \
-             SET status='succeeded', last_response_code=$1, next_attempt_at=NULL, \
+             SET status='succeeded', last_response_code=$1, last_error=NULL, next_attempt_at=NULL, \
                  lease_token=NULL, lease_expires_at=NULL \
              WHERE webhook_id=$2 AND delivery_id=$3 \
                AND status='running' AND lease_token=$4 \
@@ -370,6 +367,7 @@ mod tests {
         OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture, TransportResponse,
         ValidatedOutboundTarget, WebhookDeliveryDeps,
     };
+    use sqlx::{Connection, PgConnection, PgPool};
 
     #[derive(Clone)]
     struct FixedResolver {
@@ -517,5 +515,237 @@ mod tests {
             signature.as_deref(),
             Some("sha256=7501aff799a68a731c5e250c9fa7d995b5491be28819843527a91b7ad5d8a307")
         );
+    }
+
+    async fn database_fixture() -> Option<(PgPool, PgConnection, Uuid, Uuid, Vec<u8>)> {
+        let url = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok()?;
+        let mut lock = PgConnection::connect(&url)
+            .await
+            .expect("database lock connection");
+        sqlx::query("SELECT pg_advisory_lock($1::bigint)")
+            .bind(2_025_080_801_i64)
+            .execute(&mut lock)
+            .await
+            .expect("database test lock");
+        let pool = PgPool::connect(&url).await.expect("database pool");
+        crate::db::migrate(&pool)
+            .await
+            .expect("database migrations");
+        let profile_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,$2)")
+            .bind(profile_id)
+            .bind("scheduler-unit-db-profile")
+            .execute(&pool)
+            .await
+            .expect("profile");
+        let webhook_id = Uuid::now_v7();
+        let secret = b"test-secret".to_vec();
+        sqlx::query(
+            "INSERT INTO webhooks (id,profile_id,name,secret_key,target,event_filter,enabled) VALUES ($1,$2,$3,$4,$5,$6,true)",
+        )
+        .bind(webhook_id)
+        .bind(profile_id)
+        .bind("scheduler-unit-db-webhook")
+        .bind(&secret)
+        .bind(serde_json::json!({"url":"https://hooks.example.test/deliver"}))
+        .bind(serde_json::json!({"events":["*"]}))
+        .execute(&pool)
+        .await
+        .expect("webhook");
+        Some((pool, lock, webhook_id, profile_id, secret))
+    }
+
+    #[tokio::test]
+    async fn database_delivery_path_persists_classifier_hmac_and_policy() {
+        let Some((pool, _lock, webhook_id, profile_id, secret)) = database_fixture().await else {
+            eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+            return;
+        };
+        let target_url = "https://hooks.example.test/deliver";
+        let delivery_id = "test-delivery";
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (webhook_id,delivery_id,status,attempts,next_attempt_at,target_url,secret_key,last_error) VALUES ($1,$2,'queued',0,clock_timestamp(),$3,$4,'prior failure')",
+        )
+        .bind(webhook_id)
+        .bind(delivery_id)
+        .bind(target_url)
+        .bind(&secret)
+        .execute(&pool)
+        .await
+        .expect("delivery");
+        let claimed = claim_deliveries(&pool, "unit-db-owner", 1)
+            .await
+            .expect("claim")
+            .into_iter()
+            .next()
+            .expect("claimed delivery");
+        let payload = Arc::new(std::sync::Mutex::new(None));
+        let deps = WebhookDeliveryDeps {
+            resolver: Arc::new(FixedResolver {
+                address: "1.1.1.1".parse().expect("public address"),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            transport: Arc::new(RecordingTransport {
+                calls: Arc::new(AtomicUsize::new(0)),
+                payload: payload.clone(),
+                status: 204,
+            }),
+        };
+        let outcome = deliver_one_with(&deps, &claimed).await;
+        assert_eq!(outcome.response_code, Some(204));
+        assert!(outcome.success);
+        let request = payload.lock().expect("payload").clone().expect("request");
+        assert_eq!(request.0, delivery_id);
+        assert_eq!(request.1, format!("{target_url}\n{delivery_id}"));
+        assert_eq!(
+            request.2.as_deref(),
+            Some("sha256=7501aff799a68a731c5e250c9fa7d995b5491be28819843527a91b7ad5d8a307")
+        );
+        persist_outcome(&pool, &claimed, &outcome, 5).await;
+        let row = sqlx::query("SELECT status,last_response_code,last_error,next_attempt_at,lease_token,lease_expires_at FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2")
+            .bind(webhook_id)
+            .bind(delivery_id)
+            .fetch_one(&pool)
+            .await
+            .expect("success row");
+        assert_eq!(row.get::<String, _>("status"), "succeeded");
+        assert_eq!(row.get::<Option<i32>, _>("last_response_code"), Some(204));
+        assert!(row.get::<Option<String>, _>("last_error").is_none());
+        assert!(
+            row.get::<Option<time::OffsetDateTime>, _>("next_attempt_at")
+                .is_none()
+        );
+        assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
+        assert!(
+            row.get::<Option<time::OffsetDateTime>, _>("lease_expires_at")
+                .is_none()
+        );
+
+        let policy_id = "policy-delivery";
+        sqlx::query("INSERT INTO webhook_deliveries (webhook_id,delivery_id,status,attempts,next_attempt_at,target_url,secret_key) VALUES ($1,$2,'queued',0,clock_timestamp(),$3,$4)")
+            .bind(webhook_id).bind(policy_id).bind(target_url).bind(&secret).execute(&pool).await.expect("policy delivery");
+        let policy_claim = claim_deliveries(&pool, "unit-db-policy", 1)
+            .await
+            .expect("policy claim")
+            .into_iter()
+            .next()
+            .expect("policy claimed");
+        let policy_calls = Arc::new(AtomicUsize::new(0));
+        let policy_deps = WebhookDeliveryDeps {
+            resolver: Arc::new(FixedResolver {
+                address: "127.0.0.1".parse().expect("loopback"),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            transport: Arc::new(RecordingTransport {
+                calls: policy_calls.clone(),
+                payload: Arc::new(std::sync::Mutex::new(None)),
+                status: 200,
+            }),
+        };
+        let policy = deliver_one_with(&policy_deps, &policy_claim).await;
+        assert_eq!(policy.error.as_deref(), Some("target_policy_denied"));
+        assert!(!policy.retryable);
+        assert_eq!(policy_calls.load(Ordering::SeqCst), 0);
+        persist_outcome(&pool, &policy_claim, &policy, 5).await;
+        let row = sqlx::query("SELECT status,attempts,last_response_code,last_error,next_attempt_at,lease_token FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2")
+            .bind(webhook_id).bind(policy_id).fetch_one(&pool).await.expect("policy row");
+        assert_eq!(row.get::<String, _>("status"), "failed");
+        assert_eq!(row.get::<i32, _>("attempts"), 1);
+        assert!(row.get::<Option<i32>, _>("last_response_code").is_none());
+        assert_eq!(
+            row.get::<Option<String>, _>("last_error").as_deref(),
+            Some("target_policy_denied")
+        );
+        assert!(
+            row.get::<Option<time::OffsetDateTime>, _>("next_attempt_at")
+                .is_none()
+        );
+        assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
+
+        for status in [200_u16, 204, 300, 302, 307, 400, 404, 408, 429, 500, 503] {
+            let matrix_id = format!("matrix-{status}");
+            sqlx::query("INSERT INTO webhook_deliveries (webhook_id,delivery_id,status,attempts,next_attempt_at,target_url,secret_key) VALUES ($1,$2,'queued',0,clock_timestamp(),$3,$4)")
+                .bind(webhook_id).bind(&matrix_id).bind(target_url).bind(&secret).execute(&pool).await.expect("matrix delivery");
+            let matrix_claim = claim_deliveries(&pool, "unit-db-matrix", 100)
+                .await
+                .expect("matrix claim")
+                .into_iter()
+                .find(|d| d.delivery_id == matrix_id)
+                .expect("matrix claimed");
+            let matrix_outcome = deliver_one_with(&deps_for_status(status), &matrix_claim).await;
+            assert_eq!(matrix_outcome, classify_http_response(status));
+            persist_outcome(&pool, &matrix_claim, &matrix_outcome, 5).await;
+            let matrix_row = sqlx::query("SELECT status,attempts,last_response_code,last_error,next_attempt_at,lease_token,lease_expires_at FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2")
+                .bind(webhook_id).bind(&matrix_id).fetch_one(&pool).await.expect("matrix row");
+            let expected_status = if (200..300).contains(&status) {
+                "succeeded"
+            } else if matches!(status, 408 | 429) || status >= 500 {
+                "queued"
+            } else {
+                "failed"
+            };
+            assert_eq!(matrix_row.get::<String, _>("status"), expected_status);
+            assert_eq!(matrix_row.get::<i32, _>("attempts"), 1);
+            assert_eq!(
+                matrix_row.get::<Option<i32>, _>("last_response_code"),
+                Some(status as i32)
+            );
+            assert!(matrix_row.get::<Option<Uuid>, _>("lease_token").is_none());
+            assert!(
+                matrix_row
+                    .get::<Option<time::OffsetDateTime>, _>("lease_expires_at")
+                    .is_none()
+            );
+            if expected_status == "queued" {
+                assert!(
+                    matrix_row
+                        .get::<Option<time::OffsetDateTime>, _>("next_attempt_at")
+                        .is_some()
+                );
+                assert!(matrix_row.get::<Option<String>, _>("last_error").is_none());
+            } else {
+                assert!(
+                    matrix_row
+                        .get::<Option<time::OffsetDateTime>, _>("next_attempt_at")
+                        .is_none()
+                );
+            }
+        }
+        let dead_id = "matrix-dead";
+        sqlx::query("INSERT INTO webhook_deliveries (webhook_id,delivery_id,status,attempts,next_attempt_at,target_url,secret_key) VALUES ($1,$2,'queued',4,clock_timestamp(),$3,$4)")
+            .bind(webhook_id).bind(dead_id).bind(target_url).bind(&secret).execute(&pool).await.expect("dead matrix delivery");
+        let dead_claim = claim_deliveries(&pool, "unit-db-dead", 100)
+            .await
+            .expect("dead claim")
+            .into_iter()
+            .find(|d| d.delivery_id == dead_id)
+            .expect("dead claimed");
+        let dead_outcome = deliver_one_with(&deps_for_status(503), &dead_claim).await;
+        persist_outcome(&pool, &dead_claim, &dead_outcome, 5).await;
+        let dead_row = sqlx::query("SELECT status,attempts,next_attempt_at,lease_token,lease_expires_at FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2")
+            .bind(webhook_id).bind(dead_id).fetch_one(&pool).await.expect("dead matrix row");
+        assert_eq!(dead_row.get::<String, _>("status"), "dead");
+        assert_eq!(dead_row.get::<i32, _>("attempts"), 5);
+        assert!(
+            dead_row
+                .get::<Option<time::OffsetDateTime>, _>("next_attempt_at")
+                .is_none()
+        );
+        assert!(dead_row.get::<Option<Uuid>, _>("lease_token").is_none());
+        assert!(
+            dead_row
+                .get::<Option<time::OffsetDateTime>, _>("lease_expires_at")
+                .is_none()
+        );
+        sqlx::query("DELETE FROM webhooks WHERE id=$1")
+            .bind(webhook_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup webhook");
+        sqlx::query("DELETE FROM profiles WHERE id=$1")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup profile");
     }
 }

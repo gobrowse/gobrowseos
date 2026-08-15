@@ -121,7 +121,7 @@ impl WebhookDeliveryDeps {
     pub fn production() -> Self {
         Self {
             resolver: Arc::new(SystemResolver),
-            transport: Arc::new(PinnedHttpsTransport),
+            transport: Arc::new(PinnedHttpsTransport::default()),
         }
     }
 }
@@ -142,7 +142,23 @@ impl OutboundResolver for SystemResolver {
 }
 
 /// Reqwest transport with no proxy/redirect behavior and static address pins.
-pub struct PinnedHttpsTransport;
+#[derive(Default)]
+pub struct PinnedHttpsTransport {
+    #[cfg(test)]
+    root: Option<reqwest::Certificate>,
+    #[cfg(test)]
+    timeout: Option<Duration>,
+}
+
+#[cfg(test)]
+impl PinnedHttpsTransport {
+    fn for_test(root: reqwest::Certificate, timeout: Duration) -> Self {
+        Self {
+            root: Some(root),
+            timeout: Some(timeout),
+        }
+    }
+}
 
 impl OutboundTransport for PinnedHttpsTransport {
     fn send<'a>(
@@ -153,7 +169,7 @@ impl OutboundTransport for PinnedHttpsTransport {
         signature: Option<&'a str>,
     ) -> TransportFuture<'a> {
         Box::pin(async move {
-            let client = pinned_client(target).map_err(|_| TransportError::Other)?;
+            let client = self.client(target).map_err(|_| TransportError::Other)?;
             let mut request = client
                 .post(target.url.clone())
                 .header("X-Gobrowse-Delivery", delivery_id)
@@ -249,19 +265,27 @@ pub async fn resolve_target_with<R: OutboundResolver + ?Sized>(
     validate_resolved_target(raw, &addresses)
 }
 
-fn pinned_client(target: &ValidatedOutboundTarget) -> Result<reqwest::Client, reqwest::Error> {
-    pinned_client_builder(target, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()
-}
-
-#[cfg(test)]
-fn pinned_client_for_test(
-    target: &ValidatedOutboundTarget,
-    root: reqwest::Certificate,
-    timeout: Duration,
-) -> Result<reqwest::Client, reqwest::Error> {
-    pinned_client_builder(target, timeout, timeout)
-        .add_root_certificate(root)
-        .build()
+impl PinnedHttpsTransport {
+    fn client(&self, target: &ValidatedOutboundTarget) -> Result<reqwest::Client, reqwest::Error> {
+        let timeout = {
+            #[cfg(test)]
+            {
+                self.timeout.unwrap_or(REQUEST_TIMEOUT)
+            }
+            #[cfg(not(test))]
+            {
+                REQUEST_TIMEOUT
+            }
+        };
+        let builder = pinned_client_builder(target, CONNECT_TIMEOUT.min(timeout), timeout);
+        #[cfg(test)]
+        let builder = if let Some(root) = &self.root {
+            builder.add_root_certificate(root.clone())
+        } else {
+            builder
+        };
+        builder.build()
+    }
 }
 
 fn pinned_client_builder(
@@ -280,15 +304,25 @@ fn pinned_client_builder(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::{
+        process::Stdio,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use base64::Engine;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        process::Command,
+    };
     use tokio_rustls::{
         TlsAcceptor,
         rustls::{
             self,
-            pki_types::{CertificateDer, PrivateKeyDer},
+            pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
+            time_provider::TimeProvider,
         },
     };
 
@@ -297,6 +331,15 @@ mod tests {
     const TEST_CERT: &[u8] = include_bytes!("../tests/fixtures/webhook-test-cert.pem");
     const TEST_CA: &[u8] = include_bytes!("../tests/fixtures/webhook-test-ca.pem");
     const TEST_KEY: &[u8] = include_bytes!("../tests/fixtures/webhook-test-key.pem");
+
+    #[derive(Debug)]
+    struct FixedTime(UnixTime);
+
+    impl TimeProvider for FixedTime {
+        fn current_time(&self) -> Option<UnixTime> {
+            Some(self.0)
+        }
+    }
 
     fn public() -> SocketAddr {
         "1.1.1.1:443".parse().expect("public address")
@@ -314,7 +357,7 @@ mod tests {
     }
 
     async fn tls_server(
-        response: &'static [u8],
+        response: Vec<u8>,
     ) -> (
         SocketAddr,
         Arc<Mutex<Option<String>>>,
@@ -339,7 +382,9 @@ mod tests {
                 return;
             };
             let mut request = vec![0u8; 8192];
-            let count = stream.read(&mut request).await.expect("read request");
+            let Ok(count) = stream.read(&mut request).await else {
+                return;
+            };
             let request = String::from_utf8_lossy(&request[..count]);
             let sni = stream
                 .get_ref()
@@ -352,7 +397,7 @@ mod tests {
             if response.is_empty() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             } else {
-                stream.write_all(response).await.expect("write response");
+                stream.write_all(&response).await.expect("write response");
             }
         });
         (address, seen, task)
@@ -364,6 +409,32 @@ mod tests {
             host: "hooks.example.test".to_owned(),
             addresses: vec![address],
         }
+    }
+
+    async fn sentinel_listener() -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        sentinel_listener_for(Duration::from_millis(200)).await
+    }
+
+    async fn sentinel_listener_for(
+        wait: Duration,
+    ) -> (SocketAddr, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("sentinel listener");
+        let address = listener.local_addr().expect("sentinel address");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_by_server = calls.clone();
+        let task = tokio::spawn(async move {
+            if tokio::time::timeout(wait, listener.accept())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .is_some()
+            {
+                calls_by_server.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        (address, calls, task)
     }
 
     #[test]
@@ -422,18 +493,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn trust_material_verifies_now_and_five_years_forward() {
+        let now = UnixTime::now();
+        let future = UnixTime::since_unix_epoch(std::time::Duration::from_secs(
+            now.as_secs() + 5 * 365 * 24 * 60 * 60,
+        ));
+        for verification_time in [now, future] {
+            let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
+            let (address, _seen, server_task) = tls_server(response).await;
+            let mut roots = rustls::RootCertStore::empty();
+            roots
+                .add(CertificateDer::from(pem_der(TEST_CA)))
+                .expect("test CA");
+            let config = rustls::ClientConfig::builder_with_details(
+                Arc::new(rustls::crypto::ring::default_provider()),
+                Arc::new(FixedTime(verification_time)),
+            )
+            .with_safe_default_protocol_versions()
+            .expect("TLS protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+            let stream = tokio::net::TcpStream::connect(address)
+                .await
+                .expect("future TLS connection");
+            let server_name = ServerName::try_from("hooks.example.test")
+                .expect("server name")
+                .to_owned();
+            connector
+                .connect(server_name, stream)
+                .await
+                .expect("certificate valid at verification time");
+            server_task.await.expect("TLS server");
+        }
+    }
+
+    #[tokio::test]
     async fn pinned_transport_preserves_hostname_and_sni() {
-        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
         let (address, seen, task) = tls_server(response).await;
         let target = target(SocketAddr::new(address.ip(), address.port()));
         let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
-        let client = pinned_client_for_test(&target, root, Duration::from_secs(2)).expect("client");
-        let response = client
-            .get(target.url.clone())
-            .send()
+        let transport = PinnedHttpsTransport::for_test(root, Duration::from_secs(2));
+        let response = transport
+            .send(&target, "delivery-123", "body", Some("sha256=fixture"))
             .await
             .expect("TLS request");
-        assert_eq!(response.status().as_u16(), 204);
+        assert_eq!(response.status, 204);
         task.await.expect("TLS server");
         let seen = seen
             .lock()
@@ -441,15 +547,17 @@ mod tests {
             .clone()
             .expect("metadata");
         assert!(seen.starts_with("hooks.example.test\n"));
-        assert!(
-            seen.to_ascii_lowercase()
-                .contains("host: hooks.example.test")
-        );
+        let request = seen.to_ascii_lowercase();
+        assert!(request.starts_with("hooks.example.test\npost /deliver http/1.1"));
+        assert!(request.contains("host: hooks.example.test"));
+        assert!(request.contains("x-gobrowse-delivery: delivery-123"));
+        assert!(request.contains("x-gobrowse-signature: sha256=fixture"));
+        assert!(request.ends_with("body"));
     }
 
     #[tokio::test]
     async fn wrong_hostname_certificate_is_a_redacted_transport_failure() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec();
         let (address, _seen, task) = tls_server(response).await;
         let target = ValidatedOutboundTarget {
             url: Url::parse("https://wrong.example.test/deliver").expect("wrong URL"),
@@ -457,52 +565,142 @@ mod tests {
             addresses: vec![SocketAddr::new(address.ip(), address.port())],
         };
         let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
-        let client = pinned_client_for_test(&target, root, Duration::from_secs(2)).expect("client");
-        let error = client
-            .get(target.url)
-            .send()
+        let transport = PinnedHttpsTransport::for_test(root, Duration::from_secs(2));
+        let error = transport
+            .send(&target, "delivery", "body", None)
             .await
             .expect_err("hostname mismatch");
-        let classified = classify_transport_error(&error);
         assert!(matches!(
-            classified,
+            error,
             TransportError::Connection | TransportError::Other
         ));
-        assert!(!classified.code().contains("wrong.example.test"));
+        assert!(!error.code().contains("wrong.example.test"));
         task.await.expect("TLS server");
     }
 
     #[tokio::test]
-    async fn redirect_is_returned_without_following_location() {
-        let response = b"HTTP/1.1 302 Found\r\nLocation: https://sentinel.example.test/hit\r\nContent-Length: 0\r\n\r\n";
-        let (address, _seen, task) = tls_server(response).await;
-        let target = target(SocketAddr::new(address.ip(), address.port()));
-        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
-        let client = pinned_client_for_test(&target, root, Duration::from_secs(2)).expect("client");
-        let response = client
-            .get(target.url)
-            .send()
+    async fn redirects_are_not_followed_to_302_or_307_sentinels() {
+        for status in [302, 307] {
+            let (sentinel, calls, sentinel_task) = sentinel_listener().await;
+            let response = format!(
+                "HTTP/1.1 {status} Redirect\r\nLocation: https://127.0.0.1:{}/hit\r\nContent-Length: 0\r\n\r\n",
+                sentinel.port()
+            )
+            .into_bytes();
+            let (address, _seen, task) = tls_server(response).await;
+            let target = target(SocketAddr::new(address.ip(), address.port()));
+            let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+            let transport = PinnedHttpsTransport::for_test(root, Duration::from_secs(2));
+            let response = transport
+                .send(&target, "delivery", "body", None)
+                .await
+                .expect("redirect response");
+            assert_eq!(response.status, status);
+            task.await.expect("TLS server");
+            sentinel_task.await.expect("redirect sentinel");
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "redirect target contacted");
+        }
+    }
+
+    #[tokio::test]
+    async fn refused_connection_is_a_stable_redacted_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
-            .expect("redirect response");
-        assert_eq!(response.status().as_u16(), 302);
-        task.await.expect("TLS server");
+            .expect("refused listener");
+        let address = listener.local_addr().expect("refused address");
+        drop(listener);
+        let target = target(address);
+        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+        let transport = PinnedHttpsTransport::for_test(root, Duration::from_millis(100));
+        let error = transport
+            .send(&target, "delivery", "body", None)
+            .await
+            .expect_err("refused connection");
+        assert_eq!(error, TransportError::Connection);
+        assert_eq!(error.code(), "target_connection_failed");
+    }
+
+    #[tokio::test]
+    async fn stalled_tls_handshake_is_a_bounded_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("stalled listener");
+        let address = listener.local_addr().expect("stalled address");
+        let task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.expect("stalled connection");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let target = target(address);
+        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+        let transport = PinnedHttpsTransport::for_test(root, Duration::from_millis(50));
+        let error = transport
+            .send(&target, "delivery", "body", None)
+            .await
+            .expect_err("stalled handshake");
+        assert_eq!(error, TransportError::Timeout);
+        task.await.expect("stalled server");
+    }
+
+    #[tokio::test]
+    async fn proxy_environment_is_ignored_in_an_isolated_child() {
+        if std::env::var_os("GOBROWSE_PROXY_CHILD").is_some() {
+            let port: u16 = std::env::var("GOBROWSE_PROXY_TARGET_PORT")
+                .expect("child target port")
+                .parse()
+                .expect("child target port number");
+            let target = target(SocketAddr::from(([127, 0, 0, 1], port)));
+            let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+            let transport = PinnedHttpsTransport::for_test(root, Duration::from_secs(2));
+            let response = transport
+                .send(&target, "delivery", "body", None)
+                .await
+                .expect("direct child request");
+            assert_eq!(response.status, 204);
+            return;
+        }
+
+        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n".to_vec();
+        let (address, _seen, server_task) = tls_server(response).await;
+        let (proxy, calls, proxy_task) = sentinel_listener_for(Duration::from_secs(5)).await;
+        let proxy_url = format!("http://127.0.0.1:{}/proxy", proxy.port());
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .arg("--exact")
+            .arg("outbound_http::tests::proxy_environment_is_ignored_in_an_isolated_child")
+            .arg("--nocapture")
+            .env("GOBROWSE_PROXY_CHILD", "1")
+            .env("GOBROWSE_PROXY_TARGET_PORT", address.port().to_string())
+            .env("HTTPS_PROXY", &proxy_url)
+            .env("https_proxy", &proxy_url)
+            .env("ALL_PROXY", &proxy_url)
+            .env("all_proxy", &proxy_url)
+            .env("NO_PROXY", "")
+            .env("no_proxy", "")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let status = tokio::time::timeout(Duration::from_secs(5), child.status())
+            .await
+            .expect("proxy child timeout")
+            .expect("proxy child status");
+        assert!(status.success(), "proxy child failed: {status}");
+        server_task.await.expect("TLS server");
+        proxy_task.await.expect("proxy sentinel");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "proxy sentinel contacted");
     }
 
     #[tokio::test]
     async fn request_timeout_is_bounded_and_redacted() {
-        let (address, _seen, task) = tls_server(b"").await;
+        let (address, _seen, task) = tls_server(Vec::new()).await;
         let target = target(SocketAddr::new(address.ip(), address.port()));
         let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
-        let client =
-            pinned_client_for_test(&target, root, Duration::from_millis(50)).expect("client");
-        let error = client
-            .get(target.url)
-            .send()
+        let transport = PinnedHttpsTransport::for_test(root, Duration::from_millis(50));
+        let error = transport
+            .send(&target, "delivery", "body", None)
             .await
             .expect_err("request timeout");
-        let classified = classify_transport_error(&error);
-        assert_eq!(classified, TransportError::Timeout);
-        assert!(!classified.code().contains("hooks.example.test"));
+        assert_eq!(error, TransportError::Timeout);
+        assert!(!error.code().contains("hooks.example.test"));
         task.await.expect("TLS server");
     }
 
