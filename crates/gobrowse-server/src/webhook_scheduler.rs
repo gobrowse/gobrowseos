@@ -17,6 +17,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::AppState;
+use crate::outbound_http::{pinned_client, resolve_target};
 use crate::webhooks::{hex_encode, hmac_sha256};
 
 /// How often the scheduler scans for pending deliveries.
@@ -204,11 +205,34 @@ pub async fn recover_stuck_deliveries(
 }
 
 /// POST the canonical outbound payload to the target URL with HMAC signature.
-pub async fn deliver_one(http: &reqwest::Client, delivery: &ClaimedDelivery) -> DeliveryOutcome {
+pub async fn deliver_one(_http: &reqwest::Client, delivery: &ClaimedDelivery) -> DeliveryOutcome {
+    let target = match resolve_target(&delivery.target_url).await {
+        Ok(target) => target,
+        Err(error) => {
+            return DeliveryOutcome {
+                response_code: None,
+                success: false,
+                retryable: false,
+                error: Some(error.code().to_owned()),
+            };
+        }
+    };
+    let http = match pinned_client(&target) {
+        Ok(http) => http,
+        Err(_) => {
+            return DeliveryOutcome {
+                response_code: None,
+                success: false,
+                retryable: false,
+                error: Some("target_policy_denied".to_owned()),
+            };
+        }
+    };
+
     // Canonical outbound signing payload: {target}\n{delivery_id}
     let payload = format!("{}\n{}", delivery.target_url, delivery.delivery_id);
 
-    let mut request = http.post(&delivery.target_url).body(payload.clone());
+    let mut request = http.post(target.url).body(payload.clone());
 
     // Attach delivery identifier header.
     request = request.header("X-Gobrowse-Delivery", &delivery.delivery_id);
@@ -242,16 +266,18 @@ pub async fn deliver_one(http: &reqwest::Client, delivery: &ClaimedDelivery) -> 
             }
         }
         Err(err) => {
-            // Network-level errors are retryable.
-            let retryable = !(err.is_timeout() && cfg!(test));
-            // In practice, all transport errors are retryable except perhaps
-            // some unrecoverable ones. Even timeouts are retryable.
-            let _ = retryable;
+            let error = if err.is_timeout() {
+                "target_timeout"
+            } else if err.is_connect() {
+                "target_connection_failed"
+            } else {
+                "target_transport_failed"
+            };
             DeliveryOutcome {
                 response_code: None,
                 success: false,
                 retryable: true,
-                error: Some(err.to_string()),
+                error: Some(error.to_owned()),
             }
         }
     }
