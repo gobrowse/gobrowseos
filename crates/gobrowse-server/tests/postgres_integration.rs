@@ -339,7 +339,12 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
     let unsafe_recurrence_task_id = Uuid::from_u128(0x00000000000770008000000000000007);
     let worktree_agent_id = Uuid::now_v7();
     let foreign_worktree_agent_id = Uuid::now_v7();
+    // PostgreSQL `TIMESTAMPTZ` persists microseconds, so seed the legacy value at that precision
+    // and retain exact equality as the migration-preservation check.
     let legacy_activity_at = OffsetDateTime::now_utc() - Duration::hours(1);
+    let legacy_activity_at = legacy_activity_at
+        .replace_nanosecond(legacy_activity_at.nanosecond() / 1_000 * 1_000)
+        .expect("truncate legacy activity timestamp to PostgreSQL microseconds");
     for task_id in [
         safe_worktree_task_id,
         unsafe_worktree_task_id,
