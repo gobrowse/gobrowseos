@@ -1,156 +1,206 @@
-# PLAN.md — M7 Negotiation-Handler Failure Boundary
+# PLAN.md — M7 Exhaustive Response-Correlation Core Matrix
 
-## Status and Prerequisite
+## Status, Decision, and Prerequisite
 
-The resource-payload encoding correction is accepted at
-`a9b603735b720ee4dfc7e26278f0246f309d9ee2`; its exact-SHA CI run
-`31904514287` passed Rust, web, supply-chain, and container jobs.  That
-correction remains the baseline: resource payloads with both `text` and
-`blob` are already rejected at the model and wire-result boundaries.
+The negotiation-handler failure-boundary correction is accepted at
+`f1df7983d672703555e0afaec6c05fe0a6a489d2`. Its exact-SHA CI run
+`31905108689` passed Rust (`95061580890`), web (`95061580770`),
+supply-chain (`95061580835`), and container (`95061580892`). It proved only
+that invalid handler-produced `DiscoverResult` and `InitializeResult` values
+reach the redacted `-32603` fallback.
 
-M7 is **not** complete.  In particular, this batch is a narrow core
-correction before transport work, not evidence of stdio or Streamable HTTP
-interoperability.  Real MCP/OAuth/JWKS infrastructure requirements remain
-`BLOCKED_EXTERNAL` and must not be replaced with mocks.
+**Decision: the next blocker is remaining transport-neutral core-matrix
+evidence, not a transport prerequisite.** Before an adapter is permitted to
+accept a peer response, the core must prove that every supported request
+method's successful result is accepted only under its own correlation method.
+`ValidatedResponse::correlate` is the sole receive-side method/result binding
+boundary, but its current cross-method test covers only four of the eleven
+supported request methods. The missing coverage includes the typed tool,
+resource, prompt, and legacy-initialize result families.
+
+This is the smallest safe next batch: test-only exhaustive evidence for that
+existing boundary. It neither implements nor pretends to prove stdio or
+Streamable HTTP. Real MCP/OAuth/JWKS infrastructure remains
+`BLOCKED_EXTERNAL`; a fixture, loopback server, mock IdP, or mock JWKS client
+must not be substituted for that gate.
 
 ## Goal
 
-Make the transport-neutral dispatcher classify invalid **handler-produced
-negotiation results** as a redacted server fault, never as client-invalid
-parameters.  `invalid parameters` (`-32602`) is reserved for malformed or
-invalid caller input; a handler that returns a `DiscoverResult` or
-`InitializeResult` failing `ValidateMcp` is an internal fault and must follow
-the existing bounded `-32603` fallback path.
+Add one deterministic, complete response-correlation matrix to the wire core.
+For each currently supported request method, construct one valid success
+result, pass it through the normal response construction and encode/decode
+path, prove same-method correlation succeeds with its request ID preserved,
+and prove correlation under every other supported request method fails closed
+with `WireError::InvalidValue`.
 
-This is the smallest missing member of the existing handler-result fallback
-family: `validated_result` already protects the typed operational handlers,
-and `McpServerDispatcher::dispatch` already provides the bounded fallback
-when response validation fails.  It must be corrected before any adapter is
-allowed to expose the dispatcher to an untrusted peer.
+The matrix is specifically the contract an eventual stdio or Streamable HTTP
+adapter will consume after it receives a JSON-RPC response. It establishes no
+connection, framing, child-process, HTTP, OAuth, or live interoperability
+claim.
 
 ## Exact Files and Symbols
 
 | File | Production scope | Test-only scope |
 |---|---|---|
-| `PLAN.md` | Replace the prior accepted correction plan with this one. | None. |
-| `crates/gobrowse-core/src/mcp/server.rs` | In `McpServerDispatcher::dispatch_request`, at the `METHOD_DISCOVER` and `METHOD_INITIALIZE` result-validation sites, map a handler result that fails `ValidateMcp` through the existing private `internal_handler_error()` (`-32603`) rather than `invalid_params()` (`-32602`). Do not add a public abstraction, API, or transport type. | Extend `server::tests` with deterministic handlers and focused async regressions for the two negotiation branches. |
+| `PLAN.md` | Replace the accepted negotiation-correction plan with this bounded next-batch plan. | None. |
+| `crates/gobrowse-core/src/mcp/wire.rs` | **None.** `ValidatedResponse::correlate`, `validate_success`, `validated_response_for_method`, `encode`, and `decode` must remain behaviorally and API-identical. | In `wire::tests`, add the exhaustive supported-response correlation matrix and any private test-only fixture/helper needed to keep the cases readable. |
 
-`crates/gobrowse-core/src/mcp/wire.rs` is deliberately **not** changed in this
-batch.  Its existing `validated_response_for_method` and
-`safe_internal_error_response` remain the sole JSON-RPC envelope/fallback
-boundary; the dispatcher correction must use that boundary rather than
-constructing a second response path.
+Do not edit `server.rs`, `model.rs`, `capabilities.rs`, `lifecycle.rs`,
+`validation.rs`, `mcp.rs`, server routes, or any transport/runtime code.
 
-## Required Behavior and Acceptance Tests
+## Required Test Matrix
 
-Add focused tests in `server::tests`; use `try_request`,
-`McpServerDispatcher::dispatch`, `ResponseBody`, and `encode` rather than
-calling private validation helpers directly.
+Use only the public wire construction/round-trip surface already exercised by
+nearby tests: `validated_response_for_method`, `ValidatedMessage::Response`,
+`encode`, `decode`, `ValidatedResponse::id`, and
+`ValidatedResponse::correlate`. After `decode`, match
+`ValidatedMessage::Response(response)` and fail the test on any other variant;
+then call `response.id()` and `response.correlate(...)`. Do not call
+`validate_success` directly and do not make the test pass through a private
+duplicate of production validation.
 
-1. A handler whose `discover()` returns a model-invalid `DiscoverResult`
-   (for example, duplicate supported versions) yields exactly a JSON-RPC
-   error with the request ID preserved, code `-32603`, message
-   `internal MCP handler error`, and `data: None`.  The response encodes below
-   `MAX_FRAME_BYTES`; `initialized()`, `era()`, and `capabilities()` remain
-   pristine.  A subsequent valid negotiation request on the same dispatcher
-   must still be permitted, proving rollback rather than poisoned state.
-2. A handler whose `initialize()` returns a model-invalid `InitializeResult`
-   (for example, an empty server-info identifier) yields that same exact
-   redacted `-32603` response and preserves pristine negotiation state.  A
-   subsequent valid legacy initialize request must still be permitted.
-3. A deliberately returned, already valid handler `RpcError` from each of the
-   two negotiation callbacks remains unchanged, including its code, message,
-   optional data, and request ID.  This proves the correction does not redact
-   intentional protocol errors.
-4. Keep the existing semantic negotiation behavior distinct: a structurally
-   valid initialization response whose protocol version does not match the
-   request remains the existing negotiation error (`-32003`), not an internal
-   fallback.  The test must assert no readiness/capability binding.
-5. Existing operational-handler fallback tests, including
-   `semantically_invalid_typed_handler_result_uses_internal_fallback` and the
-   bounded ping/subscription fallback test, remain unchanged in intent and
-   pass.  Together with the new two endpoint regressions they cover every
-   dispatcher handler-result category: negotiation typed result, operational
-   typed result, and `Value` result revalidated at the wire boundary.
+Define the exact ordered supported-request list once in the test. It contains
+all eleven request methods handled by `validate_success`:
 
-## Security Invariants
+1. `METHOD_DISCOVER` with a valid modern `DiscoverResult`: supported version
+   `2026-07-28`, empty capabilities, and optional server info omitted.
+2. `METHOD_INITIALIZE` with a valid legacy `InitializeResult`: protocol version
+   `2025-11-25`, empty capabilities, and non-empty `serverInfo.name` and
+   `serverInfo.version`.
+3. `METHOD_PING` with exactly `{}`.
+4. `METHOD_TOOLS_LIST` with a valid empty `Paginated<Tool>` result.
+5. `METHOD_TOOLS_CALL` with a valid empty `ToolCallResult.content` result.
+6. `METHOD_RESOURCES_LIST` with a valid empty `Paginated<Resource>` result.
+7. `METHOD_RESOURCES_READ` with a valid empty `ResourceReadResult.contents`
+   result.
+8. `METHOD_RESOURCES_SUBSCRIBE` with exactly `{}`.
+9. `METHOD_RESOURCES_UNSUBSCRIBE` with exactly `{}`.
+10. `METHOD_PROMPTS_LIST` with a valid empty `Paginated<Prompt>` result.
+11. `METHOD_PROMPTS_GET` with a valid empty `PromptGetResult.messages` result.
 
-- Never label handler-controlled output as a caller parameter error.  That
-  distinction prevents a remote peer from being blamed for server defects and
-  keeps malformed server output on the redacted internal-fault path.
-- The fallback must disclose no validation cause, payload, capability set,
-  handler error data, or negotiated state; it must retain only the safe
-  JSON-RPC request ID and fixed `-32603` message.
-- A failed handler result must not bind an era or capabilities, advance the
-  session to ready, or poison a pristine dispatcher.  The existing
-  `dispatch` rollback remains the atomicity mechanism.
-- Preserve intentional, valid `RpcError` responses and valid protocol
-  mismatch handling exactly; broad catch-all redaction would be a protocol
-  regression.
+For every row, the test must:
 
-## Explicit Scope Boundary
+- build the response with `validated_response_for_method` using a valid,
+  bounded request ID;
+- encode it and decode it back into a `ValidatedResponse`, asserting the
+  response shape and exact request-ID preservation;
+- show that `.correlate(row_method)` succeeds after the round trip; and
+- iterate the other ten known request methods and assert each
+  `.correlate(other_method)` is exactly `Err(WireError::InvalidValue)`.
 
-### Production change
+Add one distinct error-response assertion: a bounded valid `RpcError` with
+non-empty message and valid optional data must round-trip with its request ID
+preserved and correlate successfully for every method in that same list.
+This explicitly records the existing JSON-RPC rule that an error body has no
+success-result schema to reinterpret; it must not be broadened into acceptance
+of malformed error envelopes.
 
-Only the two `ValidateMcp` error mappings in `server.rs` may change
-production behavior.  No changes are permitted to model schemas, wire
-formatting, JSON-RPC envelopes, lifecycle state types, capability policy,
-server routes, persistence, credentials, HTTP clients, process spawning, or
-feature flags.
+Keep the existing focused tests
+`response_size_and_correlation_are_bounded`,
+`all_valid_success_results_reject_cross_method_correlation`, and the three
+resource-payload regressions. The new matrix supersedes no test: the former
+retains size/fallback boundaries, while the latter retain concise targeted
+regressions and failure diagnostics.
 
-### Test-only evidence
+## Security and Concurrency Invariants
 
-All other edits in `server.rs` are confined to its `#[cfg(test)]` module.
-The tests exercise the transport-neutral core in memory; they are not stdio,
-HTTP, OAuth, JWKS, conformance-server, or runtime evidence and must not be
-reported as such.
+- A valid result for one MCP method MUST NOT be usable as a successful result
+  for any different supported method. This prevents method/result confusion at
+  the untrusted peer boundary; rejection must be `WireError::InvalidValue`,
+  not coercion, fallback deserialization, or a panic.
+- The successful response's valid JSON-RPC request ID MUST survive
+  `validated_response_for_method` → `encode` → `decode` unchanged. No test
+  may bypass the real envelope path or use an unchecked response constructor.
+- The matrix must keep all values below `MAX_FRAME_BYTES`; it is evidence for
+  existing bounded validation, not permission to allocate boundary-sized
+  fixtures.
+- An existing valid `RpcError` remains a protocol error independent of the
+  request's success schema. Its code, message, optional data, and request ID
+  must remain intact; malformed/oversized errors remain covered by the
+  existing fail-closed tests.
+- This boundary is pure and has no shared dispatcher, network, process, clock,
+  filesystem, or task state. The new tests MUST be hermetic and safe to run
+  concurrently: no mutable static state, randomized values, test ordering,
+  background task, listener, or environment mutation.
 
-## Non-goals
+## Production/Test Boundary
 
-- No stdio framing/process lifecycle or Streamable HTTP client/server work.
-- No local fake transport, mock OIDC provider, mock JWKS client, or simulated
-  conformance claim.
-- No changes to `gobrowse-server`, `gobrowse-web`, sandbox code, database
-  schema/migrations, configuration, dependencies, routes, credentials, or
-  documentation.
-- No expansion of protocol eras, capabilities, request methods, result
-  models, retry policy, or public API.
-- No broad rewrite of the core response/correlation matrix.  That remaining
-  evidence work is separately planned after this specific failure-class
-  correction passes review.
+This batch adds evidence only. It MUST NOT modify production code, public
+interfaces, protocol-model schemas, version selection, state transitions,
+capability policy, JSON limits, response formatting, or error handling. If the
+matrix exposes a behavior defect, stop rather than changing production code in
+this test-only batch; the defect requires its own reviewed, narrowly scoped
+correction plan.
 
-## Stop-to-Correct Conditions
+The evidence is transport-neutral. It cannot establish line framing, child
+process lifecycle, EOF/error handling, HTTP request/response or SSE behavior,
+redirect/SSRF policy, session headers, authentication, OAuth discovery, JWKS
+key validation, cancellation delivery, reconnect I/O, conformance-server
+compatibility, or actual stdio/Streamable HTTP interoperability.
 
-Stop this batch and open a new bounded correction plan instead of widening
-scope if any of the following occurs:
+## No-goals
 
-1. The two focused tests show that `safe_internal_error_response` cannot
-   encode within `MAX_FRAME_BYTES`, cannot preserve a valid request ID, or
-   exposes handler-derived data.  That is a wire-boundary defect, not a reason
-   to add a second fallback in the dispatcher.
-2. Fixing either mapping changes a valid handler `RpcError`, a valid
-   mismatched-negotiation `-32003`, or post-failure pristine-state behavior.
-   Diagnose and correct the specific state/error boundary before continuing.
-3. The change requires a transport, dependency, database, configuration,
-   credential, public-interface, or protocol-model edit.  Do not smuggle that
-   work into this core batch.
-4. A test exposes an invalid operational handler result that bypasses the
-   existing `validated_result`/wire fallback family.  Record the exact method
-   and stop for a separate exhaustive core-matrix plan; do not generalize
-   speculative behavior here.
+- No stdio transport, subprocess spawning, Streamable HTTP client/server,
+  HTTP route, SSE parser, conformance harness, daemon, or service.
+- No mock transport, loopback TCP/HTTP fixture, fake MCP server, mock OIDC
+  provider, fake JWKS client, or simulated external-conformance claim.
+- No `gobrowse-server`, `gobrowse-web`, sandbox, database, migration,
+  configuration, dependency, credential, routing, feature-flag, or deployment
+  change.
+- No expansion of supported protocol eras, methods, capabilities, retry
+  policy, models, limits, or public API.
+- No cleanup/refactor of existing wire or model tests beyond the minimal local
+  helper necessary for this matrix.
 
-## Disk-Safe Validation
+## Per-part Stop Conditions
 
-The implementation task runs no dependency installation, Docker, browser,
-permanent daemon, formatter, linter, full workspace suite, or local build.
-It must run only the focused existing Rust test target covering
-`mcp::server::tests` with one build job and no ignored tests, provided the
-repository's existing build artifacts are available and free disk remains
-above 5 GiB.  If that prerequisite is not met, stop local validation rather
-than consuming cache space.
+### Part 1 — matrix fixture and known-method inventory
 
-After focused proof and independent review, exact-SHA CI must run the
-repository's existing Rust, web, supply-chain, and container jobs.  All must
-pass before accepting this bounded correction.  CI success proves only this
-core boundary; M7 remains open pending the later exhaustive core matrix and
-real stdio/Streamable HTTP interoperability evidence.
+Stop and open a new plan if the inventory discovers a request method accepted
+by `validate_success` that is absent from the wire constants/list, or a listed
+method cannot be represented by a valid bounded model result. Do not silently
+omit it, invent a wire shape, or alter a model/schema to make the test pass.
+The next plan must identify the exact divergent symbol and normative contract
+needed to resolve it.
+
+### Part 2 — normal construction and round trip
+
+Stop if a valid model result accepted by `validated_response_for_method` fails
+`encode` or `decode`, changes its ID, or exceeds `MAX_FRAME_BYTES`. That is an
+existing wire/envelope defect, not a reason to use `response`, hand-build JSON,
+or weaken the matrix. Preserve the fixture and plan a separate production
+correction at the failing boundary.
+
+### Part 3 — exhaustive correlation rejection
+
+Stop if a response correlates successfully under a different request method,
+if rejection is not `WireError::InvalidValue`, or if a valid error response is
+reinterpreted as a successful typed result. Do not add an adapter, special-case
+the test, or broaden a result schema. Record the exact source and destination
+methods and isolate the wire validation defect first.
+
+### Part 4 — scope and external gates
+
+Stop if proving any case requires a dispatcher change, lifecycle/capability
+state, network I/O, process spawning, dependency installation, a service, or
+external identity infrastructure. Those requirements are out of this test-only
+batch. Real stdio and Streamable HTTP remain subsequent work only after this
+core evidence is accepted; OAuth/JWKS and real conformance remain
+`BLOCKED_EXTERNAL` until live infrastructure is available.
+
+## Disk-safe Validation
+
+The implementation task MUST run no installation, Docker, browser, service,
+daemon, formatter, linter, full workspace suite, benchmark, or build-cache
+cleanup. With existing artifacts available and free disk strictly above 5 GiB,
+run only the focused existing `gobrowse-core` wire test target containing the
+new exhaustive matrix, with one build job and no ignored tests. The targeted
+run must exercise the added test and the adjacent wire tests it relies on. If
+the artifact or disk prerequisite is not met, stop local validation rather than
+expanding the cache.
+
+After focused proof and independent review, exact-SHA CI must run the existing
+Rust, web, supply-chain, and container jobs. Every job must pass before
+accepting this evidence. Passing it closes only this response-correlation
+slice; it does not close M7 or permit a claim of real stdio/Streamable HTTP,
+OAuth/JWKS, or conformance interoperability.

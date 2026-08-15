@@ -113,3 +113,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - Commit `a9b603735b720ee4dfc7e26278f0246f309d9ee2` accepts the MCP resource-payload correction: resource payload variants are mutually exclusive, with three wire-regression tests covering the corrected encoding.
 - Independent checker outcome: PASS. Exact-SHA CI run `31904514287` passed all required jobs: Rust `95060146421`, supply-chain `95060146448`, web `95060146474`, and container `95060146476`.
 - This accepts only the bounded resource-payload correction. M7 remains incomplete pending exhaustive core evidence and real stdio plus Streamable HTTP interoperability.
+
+## M7 negotiation-handler failure-boundary correction (2026-08-15)
+
+- Commit `f1df7983d672703555e0afaec6c05fe0a6a489d2` corrects invalid handler-produced `DiscoverResult` and `InitializeResult` classification: they now produce the redacted internal JSON-RPC fallback (`-32603`, `internal MCP handler error`, no data) rather than caller-invalid-parameters (`-32602`), while preserving the request ID and existing handler/protocol error behavior.
+- Independent checker outcome: PASS. Exact-SHA CI run `31905108689` passed all required jobs: Rust `95061580890`, web `95061580770`, supply-chain `95061580835`, and container `95061580892`.
+- This accepts only the negotiation-handler failure-boundary correction. M7 remains open pending the exhaustive core matrix and real stdio/Streamable HTTP interoperability proof.

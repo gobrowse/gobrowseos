@@ -766,6 +766,87 @@ mod tests {
     }
 
     #[test]
+    fn exhaustive_response_correlation_matrix_round_trips_all_supported_methods() {
+        let supported = [
+            (
+                METHOD_DISCOVER,
+                serde_json::json!({
+                    "supportedVersions":["2026-07-28"],
+                    "capabilities":{}
+                }),
+            ),
+            (
+                METHOD_INITIALIZE,
+                serde_json::json!({
+                    "protocolVersion":"2025-11-25",
+                    "capabilities":{},
+                    "serverInfo":{"name":"server","version":"1"}
+                }),
+            ),
+            (METHOD_PING, serde_json::json!({})),
+            (METHOD_TOOLS_LIST, serde_json::json!({"items":[]})),
+            (METHOD_TOOLS_CALL, serde_json::json!({"content":[]})),
+            (METHOD_RESOURCES_LIST, serde_json::json!({"items":[]})),
+            (METHOD_RESOURCES_READ, serde_json::json!({"contents":[]})),
+            (METHOD_RESOURCES_SUBSCRIBE, serde_json::json!({})),
+            (METHOD_RESOURCES_UNSUBSCRIBE, serde_json::json!({})),
+            (METHOD_PROMPTS_LIST, serde_json::json!({"items":[]})),
+            (METHOD_PROMPTS_GET, serde_json::json!({"messages":[]})),
+        ];
+
+        for (index, (method, result)) in supported.iter().enumerate() {
+            let id = RequestId::Number(index as i64 + 1);
+            let response = validated_response_for_method(*method, id.clone(), Ok(result.clone()))
+                .expect("valid bounded success result");
+            let encoded = encode(&ValidatedMessage::Response(response)).expect("encode response");
+            let response = match decode(&encoded).expect("decode response") {
+                ValidatedMessage::Response(response) => response,
+                _ => panic!("decoded success response as a non-response"),
+            };
+
+            assert_eq!(response.id(), &id, "{method}");
+            assert!(response.clone().correlate(method).is_ok(), "{method}");
+            for (other_method, _) in &supported {
+                if *other_method != *method {
+                    assert_eq!(
+                        response.clone().correlate(other_method),
+                        Err(WireError::InvalidValue),
+                        "{method} accepted under {other_method}"
+                    );
+                }
+            }
+        }
+
+        let id = RequestId::String("error-matrix".into());
+        let error = RpcError {
+            code: -32001,
+            message: "bounded error".into(),
+            data: Some(serde_json::json!({"detail":"bounded"})),
+        };
+        let response =
+            validated_response_for_method(supported[0].0, id.clone(), Err(error.clone()))
+                .expect("valid bounded error response");
+        let encoded = encode(&ValidatedMessage::Response(response)).expect("encode error response");
+        let response = match decode(&encoded).expect("decode error response") {
+            ValidatedMessage::Response(response) => response,
+            _ => panic!("decoded error response as a non-response"),
+        };
+
+        assert_eq!(response.id(), &id);
+        for (method, _) in &supported {
+            let correlated = response
+                .clone()
+                .correlate(method)
+                .expect("error response correlates for every known method");
+            assert_eq!(correlated.id(), &id, "{method}");
+            match correlated.body() {
+                ResponseBody::Error { error: actual } => assert_eq!(actual, &error, "{method}"),
+                ResponseBody::Result { .. } => panic!("decoded error response as a success result"),
+            }
+        }
+    }
+
+    #[test]
     fn resource_result_rejects_simultaneous_text_and_blob() {
         assert_eq!(
             validated_response_for_method(
