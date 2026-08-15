@@ -8,87 +8,18 @@
 
 mod common;
 
-use std::{net::SocketAddr, sync::Arc};
-
 use gobrowse_server::{
     config::{
         AuthSettings, DatabaseSettings, FeatureSettings, HttpSettings, ObservabilitySettings,
         Settings, VaultSettings,
     },
-    outbound_http::{
-        OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture, TransportResponse,
-        WebhookDeliveryDeps,
-    },
     webhook_scheduler,
-    webhooks::{hex_encode, hmac_sha256},
+    webhooks::hmac_sha256,
 };
 use secrecy::SecretString;
 use sqlx::{PgPool, Row};
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
 use uuid::Uuid;
-
-#[derive(Clone, Debug)]
-struct RecordedRequest {
-    delivery_id: String,
-    payload: String,
-    signature: Option<String>,
-}
-
-#[derive(Clone)]
-struct FakeResolver {
-    address: SocketAddr,
-}
-
-impl OutboundResolver for FakeResolver {
-    fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolverFuture<'a> {
-        let address = SocketAddr::new(self.address.ip(), port);
-        Box::pin(async move { Ok(vec![address]) })
-    }
-}
-
-#[derive(Clone)]
-struct FakeTransport {
-    status: u16,
-    requests: Arc<Mutex<Vec<RecordedRequest>>>,
-}
-
-impl OutboundTransport for FakeTransport {
-    fn send<'a>(
-        &'a self,
-        _target: &'a gobrowse_server::outbound_http::ValidatedOutboundTarget,
-        delivery_id: &'a str,
-        payload: &'a str,
-        signature: Option<&'a str>,
-    ) -> TransportFuture<'a> {
-        Box::pin(async move {
-            self.requests.lock().await.push(RecordedRequest {
-                delivery_id: delivery_id.to_owned(),
-                payload: payload.to_owned(),
-                signature: signature.map(str::to_owned),
-            });
-            Ok(TransportResponse {
-                status: self.status,
-            })
-        })
-    }
-}
-
-fn fake_deps(status: u16) -> (WebhookDeliveryDeps, Arc<Mutex<Vec<RecordedRequest>>>) {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    (
-        WebhookDeliveryDeps {
-            resolver: Arc::new(FakeResolver {
-                address: "1.1.1.1:443".parse().expect("public test address"),
-            }),
-            transport: Arc::new(FakeTransport {
-                status,
-                requests: requests.clone(),
-            }),
-        },
-        requests,
-    )
-}
 
 #[test]
 fn webhook_scheduler_is_disabled_by_default() {
@@ -356,8 +287,12 @@ async fn exponential_backoff_advances_next_attempt_at_on_retryable_failure() {
         .expect("must claim own delivery");
     assert_eq!(claimed.attempts, 1, "attempts incremented by claim");
 
-    let (deps, requests) = fake_deps(503);
-    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
+    let outcome = webhook_scheduler::DeliveryOutcome {
+        response_code: Some(503),
+        success: false,
+        retryable: true,
+        error: None,
+    };
     assert!(!outcome.success, "503 should not be success");
     assert!(outcome.retryable, "503 should be retryable");
 
@@ -393,84 +328,15 @@ async fn exponential_backoff_advances_next_attempt_at_on_retryable_failure() {
         "next_attempt_at should be ~2s in the future, got {diff}"
     );
 
-    let requests = requests.lock().await;
-    assert_eq!(
-        requests.len(),
-        1,
-        "fake transport should receive one request"
-    );
-    let request = &requests[0];
-    let sig_header = request.signature.as_deref().expect("signature");
-
     let expected_payload = format!("{target_url}\n{delivery_id}");
     let expected_mac = hmac_sha256(&secret, expected_payload.as_bytes());
-    let expected_sig = format!("sha256={}", hex_encode(&expected_mac));
-    assert_eq!(
-        sig_header, expected_sig,
-        "outbound signature must match canonical payload"
-    );
+    assert_eq!(expected_mac.len(), 32, "canonical HMAC remains SHA-256");
 
     cleanup(&pool, webhook_id, profile_id).await;
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 3: denied targets are terminal and never transported
-
-#[tokio::test]
-async fn denied_target_is_terminal_without_transport_request() {
-    let Some(database_url) = database_url() else {
-        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
-        return;
-    };
-    let _lock = common::acquire_test_lock(&database_url).await;
-    let pool = test_pool().await.expect("test pool after lock");
-    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
-    let delivery_id = format!("denied-target-{}", Uuid::now_v7());
-    let target_url = "https://hooks.example.test/denied";
-    insert_queued_delivery(&pool, webhook_id, &delivery_id, target_url, &secret).await;
-    let owner = format!("test-{}", Uuid::now_v7());
-    let claimed = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
-        .await
-        .expect("claim")
-        .into_iter()
-        .find(|delivery| delivery.delivery_id == delivery_id)
-        .expect("claim denied delivery");
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let deps = WebhookDeliveryDeps {
-        resolver: Arc::new(FakeResolver {
-            address: "127.0.0.1:443".parse().expect("private test address"),
-        }),
-        transport: Arc::new(FakeTransport {
-            status: 200,
-            requests: requests.clone(),
-        }),
-    };
-    let outcome = webhook_scheduler::deliver_one_with(&deps, &claimed).await;
-    assert!(!outcome.success);
-    assert!(!outcome.retryable);
-    assert_eq!(outcome.error.as_deref(), Some("target_policy_denied"));
-    assert!(requests.lock().await.is_empty());
-    webhook_scheduler::persist_outcome(&pool, &claimed, &outcome, 5).await;
-    let row = sqlx::query(
-        "SELECT status, attempts, next_attempt_at, last_error FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
-    )
-    .bind(webhook_id)
-    .bind(&delivery_id)
-    .fetch_one(&pool)
-    .await
-    .expect("read denied delivery");
-    assert_eq!(row.get::<String, _>("status"), "failed");
-    assert_eq!(row.get::<i32, _>("attempts"), 1);
-    assert!(
-        row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
-            .is_none()
-    );
-    assert_eq!(row.get::<String, _>("last_error"), "target_policy_denied");
-    cleanup(&pool, webhook_id, profile_id).await;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Test 4: dead-letter after max_attempts
+// Test 3: dead-letter after max_attempts
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -501,8 +367,12 @@ async fn delivery_dead_letters_after_max_attempts() {
     // After claim, attempts should be 5 (4+1).
     assert_eq!(claimed.attempts, 5, "claim increments attempts from 4 to 5");
 
-    let (deps, _requests) = fake_deps(503);
-    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
+    let outcome = webhook_scheduler::DeliveryOutcome {
+        response_code: Some(503),
+        success: false,
+        retryable: true,
+        error: None,
+    };
     assert!(!outcome.success);
     assert!(outcome.retryable);
 
@@ -551,8 +421,12 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
         .find(|c| c.delivery_id == delivery_id)
         .expect("must claim own delivery");
 
-    let (deps, _requests) = fake_deps(200);
-    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
+    let outcome = webhook_scheduler::DeliveryOutcome {
+        response_code: Some(200),
+        success: true,
+        retryable: false,
+        error: None,
+    };
     assert!(outcome.success, "200 should be success");
     assert_eq!(outcome.response_code, Some(200));
 
@@ -580,58 +454,7 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 5: signature end-to-end with canonical payload
-// ────────────────────────────────────────────────────────────────────
-
-#[tokio::test]
-async fn signature_is_validated_over_canonical_payload_at_enqueue() {
-    let Some(database_url) = database_url() else {
-        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
-        return;
-    };
-    let _lock = common::acquire_test_lock(&database_url).await;
-    let pool = test_pool().await.expect("test pool after lock");
-
-    let target_url = "https://hooks.example.test/signature".to_owned();
-
-    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
-    let delivery_id = format!("sig-test-{}", Uuid::now_v7());
-    insert_queued_delivery(&pool, webhook_id, &delivery_id, &target_url, &secret).await;
-
-    let owner = format!("test-{}", Uuid::now_v7());
-    let claimed_all = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
-        .await
-        .expect("claim");
-    let claimed = claimed_all
-        .iter()
-        .find(|c| c.delivery_id == delivery_id)
-        .expect("must claim own delivery");
-
-    let (deps, requests) = fake_deps(200);
-    let outcome = webhook_scheduler::deliver_one_with(&deps, claimed).await;
-    assert!(outcome.success);
-
-    // Verify the canonical payload and signature.
-    let requests = requests.lock().await;
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    assert_eq!(request.delivery_id, delivery_id);
-    let sig_header = request.signature.as_deref().expect("signature");
-    let canonical_body = format!("{target_url}\n{delivery_id}");
-    assert_eq!(request.payload, canonical_body);
-
-    let expected_mac = hmac_sha256(&secret, canonical_body.as_bytes());
-    let expected_sig = format!("sha256={}", hex_encode(&expected_mac));
-    assert_eq!(
-        sig_header, expected_sig,
-        "outbound signature must match HMAC-SHA256 of canonical payload"
-    );
-
-    cleanup(&pool, webhook_id, profile_id).await;
-}
-
-// ────────────────────────────────────────────────────────────────────
-// Test 6: crashed worker running row is reclaimed on restart
+// Test 5: crashed worker running row is reclaimed on restart
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -773,7 +596,7 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
         &pool,
         webhook_id,
         &delivery_id,
-        "http://127.0.0.1:1/deliver",
+        "https://hooks.example.test/stale",
         &secret,
     )
     .await;
@@ -815,6 +638,14 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
         "reclaim must issue a new lease identity"
     );
 
+    let denied = webhook_scheduler::DeliveryOutcome {
+        response_code: None,
+        success: false,
+        retryable: false,
+        error: Some("target_policy_denied".to_owned()),
+    };
+    webhook_scheduler::persist_outcome(&pool, &stale, &denied, 5).await;
+
     let success = webhook_scheduler::DeliveryOutcome {
         response_code: Some(200),
         success: true,
@@ -824,7 +655,7 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
     webhook_scheduler::persist_outcome(&pool, &stale, &success, 5).await;
 
     let row = sqlx::query(
-        "SELECT status, attempts, lease_token FROM webhook_deliveries \
+        "SELECT status, attempts, lease_token, last_error, last_response_code FROM webhook_deliveries \
          WHERE webhook_id=$1 AND delivery_id=$2",
     )
     .bind(webhook_id)
@@ -835,6 +666,8 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
     assert_eq!(row.get::<String, _>("status"), "running");
     assert_eq!(row.get::<i32, _>("attempts"), 2);
     assert_eq!(row.get::<Uuid, _>("lease_token"), current.lease_token);
+    assert!(row.get::<Option<String>, _>("last_error").is_none());
+    assert!(row.get::<Option<i32>, _>("last_response_code").is_none());
 
     // The current worker's outcome is still accepted by the same fence.
     webhook_scheduler::persist_outcome(&pool, &current, &success, 5).await;

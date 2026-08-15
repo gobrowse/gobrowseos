@@ -354,3 +354,169 @@ pub async fn persist_outcome(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        net::{IpAddr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
+
+    use super::*;
+    use crate::outbound_http::{
+        OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture, TransportResponse,
+        ValidatedOutboundTarget, WebhookDeliveryDeps,
+    };
+
+    #[derive(Clone)]
+    struct FixedResolver {
+        address: IpAddr,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl OutboundResolver for FixedResolver {
+        fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolverFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let address = SocketAddr::new(self.address, port);
+            Box::pin(async move { Ok(vec![address]) })
+        }
+    }
+
+    type RequestRecord = (String, String, Option<String>);
+    type RequestLog = Arc<std::sync::Mutex<Option<RequestRecord>>>;
+
+    #[derive(Clone)]
+    struct RecordingTransport {
+        calls: Arc<AtomicUsize>,
+        payload: RequestLog,
+        status: u16,
+    }
+
+    impl OutboundTransport for RecordingTransport {
+        fn send<'a>(
+            &'a self,
+            _target: &'a ValidatedOutboundTarget,
+            delivery_id: &'a str,
+            body: &'a str,
+            signature: Option<&'a str>,
+        ) -> TransportFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let payload = self.payload.clone();
+            let delivery_id = delivery_id.to_owned();
+            let body = body.to_owned();
+            let signature = signature.map(str::to_owned);
+            let status = self.status;
+            Box::pin(async move {
+                *payload.lock().expect("record payload") = Some((delivery_id, body, signature));
+                Ok(TransportResponse { status })
+            })
+        }
+    }
+
+    fn delivery(secret_key: Option<Vec<u8>>) -> ClaimedDelivery {
+        ClaimedDelivery {
+            webhook_id: Uuid::now_v7(),
+            delivery_id: "test-delivery".to_owned(),
+            lease_token: Uuid::now_v7(),
+            target_url: "https://hooks.example.test/deliver".to_owned(),
+            secret_key,
+            attempts: 1,
+        }
+    }
+
+    fn deps_for_status(status: u16) -> WebhookDeliveryDeps {
+        WebhookDeliveryDeps {
+            resolver: Arc::new(FixedResolver {
+                address: "1.1.1.1".parse().expect("public address"),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            transport: Arc::new(RecordingTransport {
+                calls: Arc::new(AtomicUsize::new(0)),
+                payload: Arc::new(std::sync::Mutex::new(None)),
+                status,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn response_statuses_preserve_scheduler_matrix() {
+        for (status, success, retryable) in [
+            (200, true, false),
+            (204, true, false),
+            (300, false, false),
+            (302, false, false),
+            (307, false, false),
+            (400, false, false),
+            (404, false, false),
+            (408, false, true),
+            (429, false, true),
+            (500, false, true),
+            (503, false, true),
+        ] {
+            let outcome = deliver_one_with(&deps_for_status(status), &delivery(None)).await;
+            assert_eq!(outcome.response_code, Some(status));
+            assert_eq!(outcome.success, success, "status={status}");
+            assert_eq!(outcome.retryable, retryable, "status={status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_denial_is_terminal_and_never_calls_transport() {
+        let resolver_calls = Arc::new(AtomicUsize::new(0));
+        let transport_calls = Arc::new(AtomicUsize::new(0));
+        let deps = WebhookDeliveryDeps {
+            resolver: Arc::new(FixedResolver {
+                address: "127.0.0.1".parse().expect("loopback"),
+                calls: resolver_calls.clone(),
+            }),
+            transport: Arc::new(RecordingTransport {
+                calls: transport_calls.clone(),
+                payload: Arc::new(std::sync::Mutex::new(None)),
+                status: 200,
+            }),
+        };
+        let outcome = deliver_one_with(&deps, &delivery(None)).await;
+        assert!(!outcome.success);
+        assert!(!outcome.retryable);
+        assert_eq!(outcome.error.as_deref(), Some("target_policy_denied"));
+        assert_eq!(resolver_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(transport_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn delivery_preserves_canonical_payload_id_and_hmac() {
+        let payload = Arc::new(std::sync::Mutex::new(None));
+        let deps = WebhookDeliveryDeps {
+            resolver: Arc::new(FixedResolver {
+                address: "1.1.1.1".parse().expect("public address"),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            transport: Arc::new(RecordingTransport {
+                calls: Arc::new(AtomicUsize::new(0)),
+                payload: payload.clone(),
+                status: 204,
+            }),
+        };
+        let secret = b"test-secret".to_vec();
+        let delivery = delivery(Some(secret.clone()));
+        let expected_body = format!("{}\n{}", delivery.target_url, delivery.delivery_id);
+        let outcome = deliver_one_with(&deps, &delivery).await;
+        assert!(outcome.success);
+        assert_eq!(outcome.response_code, Some(204));
+        let (id, body, signature) = payload
+            .lock()
+            .expect("read payload")
+            .clone()
+            .expect("request");
+        assert_eq!(id, delivery.delivery_id);
+        assert_eq!(body, expected_body);
+        let expected = format!(
+            "sha256={}",
+            hex_encode(&hmac_sha256(&secret, body.as_bytes()))
+        );
+        assert_eq!(signature.as_deref(), Some(expected.as_str()));
+    }
+}

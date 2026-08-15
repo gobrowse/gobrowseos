@@ -11,7 +11,7 @@ pub mod embedding_api;
 pub mod error;
 pub mod library_api;
 pub mod model_api;
-pub mod outbound_http;
+mod outbound_http;
 pub mod realtime;
 pub mod run_api;
 pub mod skills_api;
