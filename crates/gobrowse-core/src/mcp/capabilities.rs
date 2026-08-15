@@ -1,8 +1,9 @@
-//! Capability negotiation and method authorization for the MCP core surface.
+//! Strict capability negotiation and method authorization for the MCP core surface.
 
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClientCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roots: Option<RootsCapability>,
@@ -13,6 +14,7 @@ pub struct ClientCapabilities {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ServerCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<ToolsCapability>,
@@ -27,40 +29,41 @@ pub struct ServerCapabilities {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RootsCapability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SamplingCapability {}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ToolsCapability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ResourcesCapability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscribe: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PromptsCapability {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub list_changed: Option<bool>,
 }
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LoggingCapability {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CapabilityError {
-    #[error("MCP method is not supported by the negotiated server capabilities")]
+    #[error("MCP method is not supported by negotiated server capabilities")]
     Unsupported,
 }
 
@@ -76,7 +79,6 @@ pub enum CapabilityMethod {
     PromptsGet,
     Ping,
 }
-
 impl CapabilityMethod {
     pub fn allowed(self, capabilities: &ServerCapabilities) -> bool {
         match self {
@@ -91,7 +93,6 @@ impl CapabilityMethod {
             Self::Ping => true,
         }
     }
-
     pub fn require(self, capabilities: &ServerCapabilities) -> Result<(), CapabilityError> {
         self.allowed(capabilities)
             .then_some(())
@@ -99,23 +100,58 @@ impl CapabilityMethod {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityNotification {
+    ToolsListChanged,
+    ResourcesListChanged,
+    ResourceUpdated,
+    Progress,
+    Logging,
+}
+pub fn notification_allowed(
+    notification: CapabilityNotification,
+    capabilities: &ServerCapabilities,
+) -> bool {
+    match notification {
+        CapabilityNotification::ToolsListChanged => capabilities
+            .tools
+            .as_ref()
+            .and_then(|c| c.list_changed)
+            .unwrap_or(false),
+        CapabilityNotification::ResourcesListChanged => capabilities
+            .resources
+            .as_ref()
+            .and_then(|c| c.list_changed)
+            .unwrap_or(false),
+        CapabilityNotification::ResourceUpdated => capabilities
+            .resources
+            .as_ref()
+            .and_then(|c| c.subscribe)
+            .unwrap_or(false),
+        CapabilityNotification::Progress => false,
+        CapabilityNotification::Logging => capabilities.logging.is_some(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn gates_methods_without_inventing_capabilities() {
+    fn gates_methods_and_serializes_list_changed() {
         let capabilities = ServerCapabilities {
             tools: Some(ToolsCapability::default()),
             resources: Some(ResourcesCapability {
                 subscribe: Some(false),
-                list_changed: None,
+                list_changed: Some(true),
             }),
-            ..ServerCapabilities::default()
+            ..Default::default()
         };
         assert!(CapabilityMethod::ToolsCall.allowed(&capabilities));
         assert!(!CapabilityMethod::PromptsList.allowed(&capabilities));
         assert!(!CapabilityMethod::ResourcesSubscribe.allowed(&capabilities));
-        assert!(CapabilityMethod::Ping.allowed(&capabilities));
+        assert_eq!(
+            serde_json::to_value(capabilities.resources.expect("resources")).expect("json")["listChanged"],
+            true
+        );
     }
 }

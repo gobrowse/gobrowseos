@@ -1,4 +1,4 @@
-//! Shared bounds for untrusted MCP messages and returned content.
+//! Shared bounded validation for every untrusted MCP message and model.
 
 use serde_json::Value;
 
@@ -22,6 +22,18 @@ pub enum ValidationError {
     TooDeep,
     #[error("MCP cursor is not opaque UTF-8 data")]
     InvalidCursor,
+    #[error("MCP value is invalid")]
+    InvalidValue,
+}
+
+pub trait ValidateMcp {
+    fn validate_mcp(&self) -> Result<(), ValidationError>;
+}
+
+impl ValidateMcp for Value {
+    fn validate_mcp(&self) -> Result<(), ValidationError> {
+        validate_json(self)
+    }
 }
 
 pub fn validate_collection_len(len: usize) -> Result<(), ValidationError> {
@@ -63,8 +75,14 @@ pub fn validate_json(value: &Value) -> Result<(), ValidationError> {
             return Err(ValidationError::TooDeep);
         }
         match value {
-            Value::Array(values) => values.iter().try_for_each(|value| walk(value, depth + 1)),
-            Value::Object(values) => values.values().try_for_each(|value| walk(value, depth + 1)),
+            Value::Array(values) => {
+                validate_collection_len(values.len())?;
+                values.iter().try_for_each(|value| walk(value, depth + 1))
+            }
+            Value::Object(values) => {
+                validate_collection_len(values.len())?;
+                values.values().try_for_each(|value| walk(value, depth + 1))
+            }
             _ => Ok(()),
         }
     }

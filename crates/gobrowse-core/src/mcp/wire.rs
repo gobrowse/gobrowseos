@@ -1,13 +1,17 @@
-//! Bounded JSON-RPC 2.0 wire envelopes used by MCP transports.
+//! Strict, bounded JSON-RPC 2.0 envelopes for MCP.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
+
+use super::{
+    model::*,
+    validation::{self, ValidateMcp},
+};
 
 pub const JSONRPC_VERSION: &str = "2.0";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 pub const MAX_METHOD_BYTES: usize = 128;
 pub const MAX_ID_BYTES: usize = 128;
-
 pub const METHOD_INITIALIZE: &str = "initialize";
 pub const METHOD_INITIALIZED: &str = "notifications/initialized";
 pub const METHOD_DISCOVER: &str = "server/discover";
@@ -21,6 +25,11 @@ pub const METHOD_RESOURCES_UNSUBSCRIBE: &str = "resources/unsubscribe";
 pub const METHOD_PROMPTS_LIST: &str = "prompts/list";
 pub const METHOD_PROMPTS_GET: &str = "prompts/get";
 pub const METHOD_CANCELLED: &str = "notifications/cancelled";
+pub const METHOD_TOOLS_LIST_CHANGED: &str = "notifications/tools/list_changed";
+pub const METHOD_RESOURCES_LIST_CHANGED: &str = "notifications/resources/list_changed";
+pub const METHOD_RESOURCE_UPDATED: &str = "notifications/resources/updated";
+pub const METHOD_PROGRESS: &str = "notifications/progress";
+pub const METHOD_LOGGING_MESSAGE: &str = "notifications/message";
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -28,7 +37,6 @@ pub enum RequestId {
     Number(i64),
     String(String),
 }
-
 impl RequestId {
     pub fn validate(&self) -> Result<(), WireError> {
         if let Self::String(value) = self
@@ -41,6 +49,7 @@ impl RequestId {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Request {
     pub jsonrpc: String,
     pub id: RequestId,
@@ -48,31 +57,44 @@ pub struct Request {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Notification {
     pub jsonrpc: String,
     pub method: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Value>,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Response {
     pub jsonrpc: String,
     pub id: RequestId,
     #[serde(flatten)]
     pub result: ResponseBody,
 }
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ResponseBody {
     Result { result: Value },
     Error { error: RpcError },
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SuccessEnvelope {
+    jsonrpc: String,
+    id: RequestId,
+    result: Value,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ErrorEnvelope {
+    jsonrpc: String,
+    id: RequestId,
+    error: RpcError,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RpcError {
     pub code: i64,
     pub message: String,
@@ -80,12 +102,60 @@ pub struct RpcError {
     pub data: Option<Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Message {
-    Request(Request),
-    Notification(Notification),
-    Response(Response),
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedRequest(Request);
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedNotification(Notification);
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValidatedResponse(Response);
+#[derive(Debug, Clone, PartialEq)]
+pub enum ValidatedMessage {
+    Request(ValidatedRequest),
+    Notification(ValidatedNotification),
+    Response(ValidatedResponse),
+}
+impl ValidatedRequest {
+    pub fn id(&self) -> &RequestId {
+        &self.0.id
+    }
+    pub fn method(&self) -> &str {
+        &self.0.method
+    }
+    pub fn params(&self) -> Option<&Value> {
+        self.0.params.as_ref()
+    }
+}
+impl ValidatedNotification {
+    pub fn method(&self) -> &str {
+        &self.0.method
+    }
+    pub fn params(&self) -> Option<&Value> {
+        self.0.params.as_ref()
+    }
+}
+impl ValidatedResponse {
+    pub fn id(&self) -> &RequestId {
+        &self.0.id
+    }
+    pub fn body(&self) -> &ResponseBody {
+        &self.0.result
+    }
+}
+impl ValidatedMessage {
+    pub fn request(self) -> Option<ValidatedRequest> {
+        if let Self::Request(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
+    pub fn into_notification(self) -> Option<ValidatedNotification> {
+        if let Self::Notification(value) = self {
+            Some(value)
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -94,56 +164,144 @@ pub enum WireError {
     FrameTooLarge,
     #[error("malformed JSON-RPC message")]
     Malformed,
+    #[error("JSON-RPC message must be an object")]
+    NotObject,
     #[error("JSON-RPC version must be 2.0")]
     InvalidVersion,
     #[error("JSON-RPC method is empty or too long")]
     InvalidMethod,
     #[error("JSON-RPC id is invalid or too long")]
     InvalidId,
-    #[error("JSON-RPC response id is missing or invalid")]
-    InvalidResponse,
+    #[error("JSON-RPC envelope shape is invalid")]
+    InvalidShape,
+    #[error("method-specific MCP value is invalid")]
+    InvalidValue,
 }
 
-pub fn encode(message: &Message) -> Result<Vec<u8>, WireError> {
-    let bytes = serde_json::to_vec(message).map_err(|_| WireError::Malformed)?;
-    validate_bytes(&bytes)?;
-    Ok(bytes)
-}
-
-pub fn decode(bytes: &[u8]) -> Result<Message, WireError> {
-    validate_bytes(bytes)?;
-    let message: Message = serde_json::from_slice(bytes).map_err(|_| WireError::Malformed)?;
-    validate_message(&message)?;
-    Ok(message)
-}
-
-pub fn validate_bytes(bytes: &[u8]) -> Result<(), WireError> {
+pub fn decode(bytes: &[u8]) -> Result<ValidatedMessage, WireError> {
+    if bytes.is_empty() {
+        return Err(WireError::Malformed);
+    }
     if bytes.len() > MAX_FRAME_BYTES {
-        Err(WireError::FrameTooLarge)
+        return Err(WireError::FrameTooLarge);
+    }
+    let value: Value = serde_json::from_slice(bytes).map_err(|_| WireError::Malformed)?;
+    validation::validate_json(&value).map_err(|_| WireError::InvalidValue)?;
+    let object = value.as_object().ok_or(WireError::NotObject)?;
+    classify(object)
+}
+
+fn classify(object: &Map<String, Value>) -> Result<ValidatedMessage, WireError> {
+    let has = |key: &str| object.contains_key(key);
+    if has("method") {
+        if has("id") {
+            if has("result") || has("error") {
+                return Err(WireError::InvalidShape);
+            }
+            let request: Request = serde_json::from_value(Value::Object(object.clone()))
+                .map_err(|_| WireError::InvalidShape)?;
+            validate_request(request).map(ValidatedMessage::Request)
+        } else {
+            if has("result") || has("error") {
+                return Err(WireError::InvalidShape);
+            }
+            let notification: Notification = serde_json::from_value(Value::Object(object.clone()))
+                .map_err(|_| WireError::InvalidShape)?;
+            validate_notification(notification).map(ValidatedMessage::Notification)
+        }
+    } else if has("result") ^ has("error") {
+        let response = if has("result") {
+            let envelope: SuccessEnvelope = serde_json::from_value(Value::Object(object.clone()))
+                .map_err(|_| WireError::InvalidShape)?;
+            Response {
+                jsonrpc: envelope.jsonrpc,
+                id: envelope.id,
+                result: ResponseBody::Result {
+                    result: envelope.result,
+                },
+            }
+        } else {
+            let envelope: ErrorEnvelope = serde_json::from_value(Value::Object(object.clone()))
+                .map_err(|_| WireError::InvalidShape)?;
+            Response {
+                jsonrpc: envelope.jsonrpc,
+                id: envelope.id,
+                result: ResponseBody::Error {
+                    error: envelope.error,
+                },
+            }
+        };
+        validate_response(response).map(ValidatedMessage::Response)
     } else {
-        Ok(())
+        Err(WireError::InvalidShape)
     }
 }
 
-pub fn validate_message(message: &Message) -> Result<(), WireError> {
-    match message {
-        Message::Request(request) => {
-            validate_common(&request.jsonrpc, &request.method)?;
-            request.id.validate()
-        }
-        Message::Notification(notification) => {
-            validate_common(&notification.jsonrpc, &notification.method)
-        }
-        Message::Response(response) => {
-            if response.jsonrpc != JSONRPC_VERSION {
-                return Err(WireError::InvalidVersion);
-            }
-            response
-                .id
-                .validate()
-                .map_err(|_| WireError::InvalidResponse)
-        }
+fn validate_request(request: Request) -> Result<ValidatedRequest, WireError> {
+    validate_common(&request.jsonrpc, &request.method)?;
+    request.id.validate()?;
+    if let Some(params) = &request.params {
+        validation::validate_json(params).map_err(|_| WireError::InvalidValue)?;
     }
+    validate_method_params(&request.method, request.params.as_ref())?;
+    Ok(ValidatedRequest(request))
+}
+fn validate_notification(notification: Notification) -> Result<ValidatedNotification, WireError> {
+    validate_common(&notification.jsonrpc, &notification.method)?;
+    if let Some(params) = &notification.params {
+        validation::validate_json(params).map_err(|_| WireError::InvalidValue)?;
+    }
+    validate_method_params(&notification.method, notification.params.as_ref())?;
+    Ok(ValidatedNotification(notification))
+}
+fn validate_response(response: Response) -> Result<ValidatedResponse, WireError> {
+    if response.jsonrpc != JSONRPC_VERSION {
+        return Err(WireError::InvalidVersion);
+    }
+    response.id.validate()?;
+    if let ResponseBody::Error { error } = &response.result
+        && error.message.len() > MAX_METHOD_BYTES
+    {
+        return Err(WireError::InvalidValue);
+    }
+    Ok(ValidatedResponse(response))
+}
+fn validate_method_params(method: &str, params: Option<&Value>) -> Result<(), WireError> {
+    let Some(params) = params else {
+        if matches!(
+            method,
+            METHOD_INITIALIZE
+                | METHOD_TOOLS_CALL
+                | METHOD_RESOURCES_READ
+                | METHOD_RESOURCES_SUBSCRIBE
+                | METHOD_RESOURCES_UNSUBSCRIBE
+                | METHOD_PROMPTS_GET
+                | METHOD_CANCELLED
+        ) {
+            return Err(WireError::InvalidValue);
+        }
+        return Ok(());
+    };
+    macro_rules! typed {
+        ($ty:ty) => {{
+            let value: $ty =
+                serde_json::from_value(params.clone()).map_err(|_| WireError::InvalidValue)?;
+            value.validate_mcp().map_err(|_| WireError::InvalidValue)?;
+        }};
+    }
+    match method {
+        METHOD_INITIALIZE => typed!(InitializeParams),
+        METHOD_TOOLS_LIST | METHOD_RESOURCES_LIST | METHOD_PROMPTS_LIST => typed!(ListParams),
+        METHOD_TOOLS_CALL => typed!(ToolCallParams),
+        METHOD_RESOURCES_READ => typed!(ResourceReadParams),
+        METHOD_RESOURCES_SUBSCRIBE | METHOD_RESOURCES_UNSUBSCRIBE => {
+            typed!(ResourceSubscriptionParams)
+        }
+        METHOD_PROMPTS_GET => typed!(PromptGetParams),
+        METHOD_CANCELLED => typed!(CancelledParams),
+        _ => {}
+    }
+    Ok(())
 }
 
 fn validate_common(version: &str, method: &str) -> Result<(), WireError> {
@@ -156,44 +314,98 @@ fn validate_common(version: &str, method: &str) -> Result<(), WireError> {
     Ok(())
 }
 
+pub fn encode(message: &ValidatedMessage) -> Result<Vec<u8>, WireError> {
+    let value = match message {
+        ValidatedMessage::Request(value) => serde_json::to_value(&value.0),
+        ValidatedMessage::Notification(value) => serde_json::to_value(&value.0),
+        ValidatedMessage::Response(value) => serde_json::to_value(&value.0),
+    }
+    .map_err(|_| WireError::Malformed)?;
+    let bytes = serde_json::to_vec(&value).map_err(|_| WireError::Malformed)?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        Err(WireError::FrameTooLarge)
+    } else {
+        Ok(bytes)
+    }
+}
+
 pub fn request(id: RequestId, method: impl Into<String>, params: Option<Value>) -> Request {
     Request {
-        jsonrpc: JSONRPC_VERSION.to_owned(),
+        jsonrpc: JSONRPC_VERSION.into(),
         id,
         method: method.into(),
         params,
     }
 }
-
 pub fn notification(method: impl Into<String>, params: Option<Value>) -> Notification {
     Notification {
-        jsonrpc: JSONRPC_VERSION.to_owned(),
+        jsonrpc: JSONRPC_VERSION.into(),
         method: method.into(),
         params,
     }
+}
+pub fn validate_outbound(request: Request) -> Result<ValidatedRequest, WireError> {
+    validate_request(request)
+}
+pub fn validate_outbound_notification(
+    notification: Notification,
+) -> Result<ValidatedNotification, WireError> {
+    validate_notification(notification)
+}
+pub fn response(
+    id: RequestId,
+    result: Result<Value, RpcError>,
+) -> Result<ValidatedResponse, WireError> {
+    validate_response(Response {
+        jsonrpc: JSONRPC_VERSION.into(),
+        id,
+        result: match result {
+            Ok(result) => ResponseBody::Result { result },
+            Err(error) => ResponseBody::Error { error },
+        },
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
     #[test]
-    fn preserves_integer_and_string_ids_without_coercion() {
-        for id in [RequestId::Number(7), RequestId::String("seven".into())] {
-            let bytes =
-                encode(&Message::Request(request(id.clone(), METHOD_PING, None))).expect("encode");
-            let decoded = decode(&bytes).expect("decode");
-            assert_eq!(decoded, Message::Request(request(id, METHOD_PING, None)));
+    fn accepts_four_exclusive_shapes_and_rejects_hybrids() {
+        let valid = [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":"x","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"bad"}}"#,
+        ];
+        for raw in valid {
+            assert!(decode(raw.as_bytes()).is_ok(), "{raw}");
+        }
+        for raw in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":-1,"message":"x"}}"#,
+            r#"{"jsonrpc":"2.0","method":"x","id":null}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"extra":true}"#,
+            r#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}{"x":1}"#,
+        ] {
+            assert!(decode(raw.as_bytes()).is_err(), "accepted {raw}");
         }
     }
-
     #[test]
-    fn notifications_have_no_id_and_oversized_frames_are_rejected() {
-        let message = Message::Notification(notification(METHOD_CANCELLED, None));
-        assert!(decode(&encode(&message).expect("encode")).is_ok());
+    fn rejects_deep_and_large_containers_before_dispatch() {
+        let mut deep = Value::Null;
+        for _ in 0..=validation::MAX_JSON_DEPTH {
+            deep = Value::Array(vec![deep]);
+        }
         assert_eq!(
-            decode(&vec![b'x'; MAX_FRAME_BYTES + 1]),
-            Err(WireError::FrameTooLarge)
+            decode(serde_json::to_string(&deep).expect("json").as_bytes()),
+            Err(WireError::InvalidValue)
+        );
+        let params = Value::Array((0..=validation::MAX_ITEMS).map(Value::from).collect());
+        let raw = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"ping","params":params});
+        assert_eq!(
+            decode(serde_json::to_string(&raw).expect("json").as_bytes()),
+            Err(WireError::InvalidValue)
         );
     }
 }
