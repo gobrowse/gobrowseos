@@ -295,7 +295,7 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     .expect("read repaired revision");
     assert!(evaluation.is_none());
     assert!(sources.is_empty());
-    let (nil_original,nil_repaired):(Vec<Uuid>,Vec<Uuid>)=sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(revision_id).fetch_one(&mut connection).await.expect("nil quarantine");
+    let (nil_original,nil_repaired):(Vec<Uuid>,Vec<Uuid>)=sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1 AND issue='invalid_source_conversation_ids'").bind(revision_id).fetch_one(&mut connection).await.expect("nil quarantine");
     assert_eq!(nil_original, vec![Uuid::nil()]);
     assert!(nil_repaired.is_empty());
     let duplicate_sources: Vec<Uuid> = sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='duplicate-source')")
