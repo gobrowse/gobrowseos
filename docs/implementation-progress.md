@@ -107,3 +107,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - The correction added the focused `semantically_invalid_typed_handler_result_uses_internal_fallback` regression and changed only `crates/gobrowse-core/src/mcp/server.rs` plus its current correction plan. It preserves intentionally returned handler `RpcError` values and adds no transport, runtime, credential, database, route, migration, frontend, or deployment behavior.
 - Independent review reported PASS with no blocker. Exact-SHA CI run `31903353191` passed: Rust (`95057374683`, including format, native/WASM Clippy, Nextest, and migrations), web/Trunk (`95057374702`), supply-chain (`95057374705`), and container (`95057374736`). The workflow emitted only GitHub’s Node.js 20 action-runtime deprecation notices.
 - This accepts the bounded correction only. M7 remains active: the deferred exhaustive core matrix and real stdio/Streamable HTTP interoperability gate are not complete.
+
+## M7 resource-payload correction acceptance (2026-08-15)
+
+- Commit `a9b603735b720ee4dfc7e26278f0246f309d9ee2` accepts the MCP resource-payload correction: resource payload variants are mutually exclusive, with three wire-regression tests covering the corrected encoding.
+- Independent checker outcome: PASS. Exact-SHA CI run `31904514287` passed all required jobs: Rust `95060146421`, supply-chain `95060146448`, web `95060146474`, and container `95060146476`.
+- This accepts only the bounded resource-payload correction. M7 remains incomplete pending exhaustive core evidence and real stdio plus Streamable HTTP interoperability.

@@ -193,7 +193,9 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                     return Err(negotiation_error());
                 }
                 let discovered = self.handler.discover().await?;
-                discovered.validate_mcp().map_err(|_| invalid_params())?;
+                discovered
+                    .validate_mcp()
+                    .map_err(|_| internal_handler_error())?;
                 let mut versions = std::collections::BTreeSet::new();
                 if discovered.supported_versions.iter().any(|version| {
                     !versions.insert(version)
@@ -226,7 +228,9 @@ impl<H: McpServerHandler> McpServerDispatcher<H> {
                     return Err(negotiation_error());
                 }
                 let result = self.handler.initialize(params.clone()).await?;
-                result.validate_mcp().map_err(|_| invalid_params())?;
+                result
+                    .validate_mcp()
+                    .map_err(|_| internal_handler_error())?;
                 if result.protocol_version != params.protocol_version
                     || super::McpProtocolEra::from_wire_version(&result.protocol_version)
                         != Some(McpProtocolEra::Legacy20251125)
@@ -493,6 +497,99 @@ mod tests {
             })
         }
     }
+    struct InvalidDiscoverThenValidHandler {
+        returned_invalid: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl McpServerHandler for InvalidDiscoverThenValidHandler {
+        async fn discover(&self) -> Result<DiscoverResult, RpcError> {
+            if !self
+                .returned_invalid
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(DiscoverResult {
+                    supported_versions: vec!["2026-07-28".into(), "2026-07-28".into()],
+                    capabilities: ServerCapabilities::default(),
+                    server_info: None,
+                });
+            }
+            Ok(DiscoverResult {
+                supported_versions: vec!["2026-07-28".into()],
+                capabilities: ServerCapabilities::default(),
+                server_info: None,
+            })
+        }
+    }
+    struct InvalidInitializeThenValidHandler {
+        returned_invalid: std::sync::atomic::AtomicBool,
+    }
+    #[async_trait]
+    impl McpServerHandler for InvalidInitializeThenValidHandler {
+        async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult, RpcError> {
+            if !self
+                .returned_invalid
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                return Ok(InitializeResult {
+                    protocol_version: params.protocol_version,
+                    capabilities: ServerCapabilities::default(),
+                    server_info: ClientInfo {
+                        name: String::new(),
+                        version: "1".into(),
+                    },
+                    instructions: None,
+                });
+            }
+            Ok(InitializeResult {
+                protocol_version: params.protocol_version,
+                capabilities: ServerCapabilities::default(),
+                server_info: ClientInfo {
+                    name: "fixture".into(),
+                    version: "1".into(),
+                },
+                instructions: None,
+            })
+        }
+    }
+    struct IntentionalNegotiationErrorHandler;
+    #[async_trait]
+    impl McpServerHandler for IntentionalNegotiationErrorHandler {
+        async fn discover(&self) -> Result<DiscoverResult, RpcError> {
+            Err(intentional_negotiation_error())
+        }
+        async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult, RpcError> {
+            Err(intentional_negotiation_error())
+        }
+    }
+    struct ProtocolMismatchHandler;
+    #[async_trait]
+    impl McpServerHandler for ProtocolMismatchHandler {
+        async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult, RpcError> {
+            Ok(InitializeResult {
+                protocol_version: "2026-07-28".into(),
+                capabilities: ServerCapabilities::default(),
+                server_info: ClientInfo {
+                    name: "fixture".into(),
+                    version: "1".into(),
+                },
+                instructions: None,
+            })
+        }
+    }
+    fn intentional_negotiation_error() -> RpcError {
+        RpcError {
+            code: -32099,
+            message: "intentional negotiation error".into(),
+            data: Some(json!({"reason": "intentional"})),
+        }
+    }
+    fn legacy_initialize_params() -> Value {
+        json!({
+            "protocolVersion": "2025-11-25",
+            "capabilities": {},
+            "clientInfo": {"name": "test", "version": "1"},
+        })
+    }
     #[tokio::test]
     async fn logging_notification_requires_negotiated_logging_capability() {
         let mut dispatcher = McpServerDispatcher::new(LoggingHandler);
@@ -573,6 +670,150 @@ mod tests {
                 .len()
                 < MAX_FRAME_BYTES
         );
+    }
+
+    #[tokio::test]
+    async fn invalid_discover_result_uses_redacted_fallback_and_rolls_back() {
+        let mut dispatcher = McpServerDispatcher::new(InvalidDiscoverThenValidHandler {
+            returned_invalid: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let response = dispatcher
+            .dispatch(try_request(RequestId::Number(1), METHOD_DISCOVER, None).unwrap())
+            .await;
+        assert!(matches!(
+            response.body(),
+            ResponseBody::Error { error: RpcError { code: -32603, message, data: None } }
+                if message == "internal MCP handler error"
+        ));
+        assert_eq!(response.id(), &RequestId::Number(1));
+        assert!(
+            encode(&ValidatedMessage::Response(response))
+                .expect("fallback frame")
+                .len()
+                < MAX_FRAME_BYTES
+        );
+        assert!(!dispatcher.initialized());
+        assert_eq!(dispatcher.era(), None);
+        assert_eq!(dispatcher.capabilities(), None);
+
+        let valid = dispatcher
+            .dispatch(try_request(RequestId::Number(2), METHOD_DISCOVER, None).unwrap())
+            .await;
+        assert!(matches!(valid.body(), ResponseBody::Result { .. }));
+        assert!(dispatcher.initialized());
+        assert_eq!(
+            dispatcher.era(),
+            Some(crate::mcp::McpProtocolEra::Modern20260728)
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_initialize_result_uses_redacted_fallback_and_rolls_back() {
+        let mut dispatcher = McpServerDispatcher::new(InvalidInitializeThenValidHandler {
+            returned_invalid: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let response = dispatcher
+            .dispatch(
+                try_request(
+                    RequestId::Number(1),
+                    METHOD_INITIALIZE,
+                    Some(legacy_initialize_params()),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            response.body(),
+            ResponseBody::Error { error: RpcError { code: -32603, message, data: None } }
+                if message == "internal MCP handler error"
+        ));
+        assert_eq!(response.id(), &RequestId::Number(1));
+        assert!(
+            encode(&ValidatedMessage::Response(response))
+                .expect("fallback frame")
+                .len()
+                < MAX_FRAME_BYTES
+        );
+        assert!(!dispatcher.initialized());
+        assert_eq!(dispatcher.era(), None);
+        assert_eq!(dispatcher.capabilities(), None);
+
+        let valid = dispatcher
+            .dispatch(
+                try_request(
+                    RequestId::Number(2),
+                    METHOD_INITIALIZE,
+                    Some(legacy_initialize_params()),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(valid.body(), ResponseBody::Result { .. }));
+        assert!(!dispatcher.initialized());
+        assert_eq!(dispatcher.era(), None);
+        assert_eq!(dispatcher.capabilities(), None);
+    }
+
+    #[tokio::test]
+    async fn intentional_negotiation_handler_errors_are_preserved() {
+        let mut dispatcher = McpServerDispatcher::new(IntentionalNegotiationErrorHandler);
+
+        let discover = dispatcher
+            .dispatch(try_request(RequestId::Number(1), METHOD_DISCOVER, None).unwrap())
+            .await;
+        assert_eq!(discover.id(), &RequestId::Number(1));
+        assert_eq!(
+            discover.body(),
+            &ResponseBody::Error {
+                error: intentional_negotiation_error(),
+            }
+        );
+
+        let initialize = dispatcher
+            .dispatch(
+                try_request(
+                    RequestId::Number(2),
+                    METHOD_INITIALIZE,
+                    Some(legacy_initialize_params()),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert_eq!(initialize.id(), &RequestId::Number(2));
+        assert_eq!(
+            initialize.body(),
+            &ResponseBody::Error {
+                error: intentional_negotiation_error(),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn protocol_version_mismatch_remains_negotiation_error_without_binding() {
+        let mut dispatcher = McpServerDispatcher::new(ProtocolMismatchHandler);
+
+        let response = dispatcher
+            .dispatch(
+                try_request(
+                    RequestId::Number(1),
+                    METHOD_INITIALIZE,
+                    Some(legacy_initialize_params()),
+                )
+                .unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            response.body(),
+            ResponseBody::Error {
+                error: RpcError { code: -32003, .. }
+            }
+        ));
+        assert_eq!(response.id(), &RequestId::Number(1));
+        assert!(!dispatcher.initialized());
+        assert_eq!(dispatcher.era(), None);
+        assert_eq!(dispatcher.capabilities(), None);
     }
 
     #[tokio::test]
