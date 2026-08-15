@@ -232,12 +232,24 @@ LEFT JOIN skill_revisions p ON p.skill_id = s.id AND p.promoted
 WHERE (s.active_revision IS NULL AND p.revision IS NOT NULL)
    OR (s.active_revision IS NOT NULL AND (p.revision IS NULL OR p.revision <> s.active_revision));
 
+-- Demote a conflicting winner before promoting the active revision. The
+-- schema-13 partial unique index rejects a single statement that swaps both
+-- rows when PostgreSQL updates the active row first.
 UPDATE skill_revisions r
-SET promoted = (r.revision = s.active_revision)
+SET promoted = false
 FROM skills s
-WHERE s.id = r.skill_id AND s.active_revision IS NOT NULL
-  AND ((r.promoted AND r.revision <> s.active_revision)
-       OR (NOT r.promoted AND r.revision = s.active_revision));
+WHERE s.id = r.skill_id
+  AND s.active_revision IS NOT NULL
+  AND r.promoted
+  AND r.revision <> s.active_revision;
+
+UPDATE skill_revisions r
+SET promoted = true
+FROM skills s
+WHERE s.id = r.skill_id
+  AND s.active_revision IS NOT NULL
+  AND r.revision = s.active_revision
+  AND NOT r.promoted;
 UPDATE skills s
 SET active_revision = p.revision
 FROM skill_revisions p

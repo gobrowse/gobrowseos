@@ -233,6 +233,22 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         .execute(&mut connection)
         .await
         .expect("active pointer");
+    let pre_active_revision: i64 =
+        sqlx::query_scalar("SELECT active_revision FROM skills WHERE id=$1")
+            .bind(active_skill)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read pre-migration active revision");
+    let pre_promoted: (bool, bool) = sqlx::query_as(
+        "SELECT (SELECT promoted FROM skill_revisions WHERE id=$1), (SELECT promoted FROM skill_revisions WHERE id=$2)",
+    )
+    .bind(active_one)
+    .bind(active_two)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read pre-migration promotion state");
+    assert_eq!(pre_active_revision, 1);
+    assert_eq!(pre_promoted, (false, true));
     let none_skill = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'none-promoted','')",
@@ -323,6 +339,40 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     let (oversized_original,oversized_repaired):(Vec<Uuid>,Vec<Uuid>)=sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(oversized_revision).fetch_one(&mut connection).await.expect("oversized quarantine");
     assert_eq!(oversized_original, oversized);
     assert_eq!(oversized_repaired, oversized[..100].to_vec());
+    let repaired_active_revision: i64 =
+        sqlx::query_scalar("SELECT active_revision FROM skills WHERE id=$1")
+            .bind(active_skill)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read canonical active revision");
+    let repaired_promoted: (bool, bool) = sqlx::query_as(
+        "SELECT (SELECT promoted FROM skill_revisions WHERE id=$1), (SELECT promoted FROM skill_revisions WHERE id=$2)",
+    )
+    .bind(active_one)
+    .bind(active_two)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read canonical promotion state");
+    let promoted_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM skill_revisions WHERE skill_id=$1 AND promoted")
+            .bind(active_skill)
+            .fetch_one(&mut connection)
+            .await
+            .expect("count canonical promoted revisions");
+    assert_eq!(repaired_active_revision, 1);
+    assert_eq!(repaired_promoted, (true, false));
+    assert_eq!(promoted_count, 1);
+    let promotion_detail: String = sqlx::query_scalar(
+        "SELECT detail FROM skill_integrity_quarantine WHERE skill_id=$1 AND issue='promotion_state_mismatch'",
+    )
+    .bind(active_skill)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read canonical promotion quarantine");
+    let promotion_detail: serde_json::Value =
+        serde_json::from_str(&promotion_detail).expect("parse promotion quarantine detail");
+    assert_eq!(promotion_detail["active_revision"], 1);
+    assert_eq!(promotion_detail["promoted_revision"], 2);
     let promoted_canonical: i64 = sqlx::query_scalar("SELECT revision FROM skill_revisions WHERE skill_id=(SELECT id FROM skills WHERE name='active-canonical') AND promoted")
         .fetch_one(&mut connection).await.expect("active repair");
     assert_eq!(promoted_canonical, 1);

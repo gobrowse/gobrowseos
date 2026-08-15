@@ -7,9 +7,12 @@
 
 PostgreSQL is authoritative for Skill evaluation shape and single assignment,
 source provenance scope, promotion consistency, and repair evidence. Migration
-0015 repairs legacy rows before installing these checks. Invalid legacy evidence
-is retained in append-only `skill_revision_integrity_quarantine`; promotion
-repairs are retained in `skill_integrity_quarantine`.
+0015 repairs legacy rows before installing these checks. Promotion repair is
+ordered as a two-phase demotion of conflicting winners followed by promotion of
+the active revision, within the migration transaction, so the existing partial
+unique index cannot reject the canonical swap. Invalid legacy evidence is
+retained in append-only `skill_revision_integrity_quarantine`; promotion repairs
+are retained in `skill_integrity_quarantine`.
 
 Revision identity, content, author, reason, source IDs, and creation time are
 immutable. Evaluation can transition only from `NULL` to one valid JSON object;
