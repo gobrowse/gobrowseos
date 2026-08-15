@@ -873,7 +873,7 @@ async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
         1
     );
     let state: (i64, i64) = sqlx::query_as(
-        "SELECT active_revision,(SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted)",
+        "SELECT s.active_revision, (SELECT r.revision FROM skill_revisions r WHERE r.skill_id=s.id AND r.promoted) FROM skills s WHERE s.id=$1",
     )
     .bind(skill_id)
     .fetch_one(&pool)
@@ -1576,7 +1576,7 @@ async fn automatic_promotion_requires_recorded_non_regression() {
         .expect("case promoted");
         assert_eq!((persisted, persisted_promoted), (expected, expected));
     }
-    let state:(i64,i64)=sqlx::query_as("SELECT active_revision,(SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted)").bind(skill_id).fetch_one(&pool).await.expect("promotion state");
+    let state:(i64,i64)=sqlx::query_as("SELECT s.active_revision, (SELECT r.revision FROM skill_revisions r WHERE r.skill_id=s.id AND r.promoted) FROM skills s WHERE s.id=$1").bind(skill_id).fetch_one(&pool).await.expect("promotion state");
     assert_eq!(state, (7, 7));
     let eval_audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.evaluated' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("evaluation audits");
     assert_eq!(eval_audits, 7);
