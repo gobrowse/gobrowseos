@@ -1,10 +1,10 @@
-# PLAN.md — M7 Bounded Stdio JSON-RPC Framing
+# PLAN.md — M4 Rootless Podman `keep-id` Runtime Proof
 
-## Status, Decision, and External Prerequisite
+## Status, Decision, and Preserved M7 External Record
 
-The exhaustive response-correlation matrix is accepted at
-`0724ebf8155229bc46e7320bf8745078e05baf48`. Its exact-SHA CI run
-`31906615609` passed Rust, web, supply-chain, and container.
+**M4 is `BLOCKED_EXTERNAL`.** The sandbox remains release-gated and off. This
+plan records no successful runtime proof and authorizes no source or CI change
+until the approved execution prerequisite below is available.
 
 The caller-provided-pipe bounded stdio JSON-RPC framing slice is accepted at
 `4c2bff3796ec7ac15b86a167d49828a1eb556b98`. Exact-SHA CI run
@@ -21,132 +21,74 @@ real-peer integration test that performs `server/discover` and a
 capability-authorized `tools/list` against that peer. A fixture, mock,
 loopback peer, or in-repository substitute does not satisfy this requirement.
 
-## Goal
+That independent pinned MCP peer prerequisite remains blocked; this M4 plan
+does not alter, replace, or satisfy it.
 
-Add `McpStdioTransport<R, W>` over caller-provided Tokio async pipes. It must:
+## External Prerequisite
 
-- send a validated JSON-RPC request or notification with the existing `encode`,
-  then write exactly one `LF` byte and flush;
-- receive exactly one incrementally bounded `LF`- or `CRLF`-terminated
-  JSON-RPC payload and validate it with the existing `decode`; and
-- return distinct transport outcomes for I/O failure, clean EOF, partial-frame
-  EOF, framing over-limit, and `WireError`.
+The smallest honest M4 proof requires all of the following, none of which is
+available in the current environment:
 
-`McpStdioTransport` is a framing boundary, not a protocol/session boundary. A
-decoded response remains merely a `ValidatedMessage::Response`; this slice
-MUST NOT infer its method or correlate it to a request.
+1. an approved ephemeral **local** runner executing as a non-root user with a
+   real rootless Podman installation;
+2. preconfigured `/etc/subuid` and `/etc/subgid` entries for that non-root
+   runner user;
+3. the exact immutable image reference preloaded locally by digest; and
+4. a trusted, required, non-ignored CI job bound to that runner.
 
-## Exact Files and Symbols
+The runner and its Podman storage must be provisioned before the job starts.
+The proof must neither pull nor install anything and must not use `sudo` or
+make any host mutation. A Docker shim, remote Podman service, rootful Podman,
+fixture, mock, or fake executable is not a substitute for this prerequisite.
 
-| File | Production scope | Test-only scope |
-|---|---|---|
-| `PLAN.md` | Records this accepted checkpoint and the bounded stdio framing batch. | None. |
-| `crates/gobrowse-core/Cargo.toml` | Promote the existing workspace-pinned `tokio` dependency from `[dev-dependencies]` to `[dependencies]` for production Tokio async I/O; no new crate/package or `Cargo.lock` change. | None. |
-| `crates/gobrowse-core/src/mcp.rs` | Declare and export the new `stdio` module only. | None. |
-| `crates/gobrowse-core/src/mcp/stdio.rs` | Add `McpStdioTransport<R, W>` and its bounded framing/error API over caller-provided Tokio async pipes. | Unit tests for framing behavior only. |
-| `crates/gobrowse-core/src/mcp/wire.rs` | **None.** Reuse `encode`, `decode`, `ValidatedRequest`, `ValidatedNotification`, `ValidatedMessage`, `WireError`, and `MAX_FRAME_BYTES` unchanged. | None. |
+## Goal and Smallest Eventual Test/CI Scope
 
-Do not alter `server.rs`, `model.rs`, `capabilities.rs`, `lifecycle.rs`,
-`validation.rs`, protocol eras, capability policy, or any existing transport
-configuration. Do not change `docs/architecture-plan.md` in this batch.
+Once the prerequisite exists, add one deterministic runtime-backed M4 test and
+one trusted required CI invocation for it—nothing in production code. The test
+must run as the approved non-root user against the preloaded immutable digest
+image with real local Podman, use `--pull=never` and `--userns=keep-id`, and
+prove that the container's effective UID equals that non-root host user's
+effective UID. It must fail if the host user is root, Podman is not operating
+rootlessly, the image is unavailable locally at the approved digest, or the
+observed container UID differs.
 
-## Transport Contract
+The trusted CI job must execute that test non-ignored on the approved runner,
+record the immutable image digest and runner identity in its evidence, and be
+required for the change that introduces the test. It must verify the existing
+`/etc/subuid` and `/etc/subgid` setup without creating, editing, or otherwise
+mutating it.
 
-`McpStdioTransport<R, W>` owns its caller-provided reader and writer; it does
-not open them, spawn a child process, or retain any global/runtime state. Its
-implementation is generic over Tokio `AsyncRead` and `AsyncWrite` pipes, with
-the usual `Unpin` bounds needed for asynchronous I/O. Construction only wraps
-those supplied pipes for bounded incremental reading.
+| File | Eventual scope |
+|---|---|
+| `crates/gobrowse-sandboxd/src/runtime.rs` | Add the single test-only real-local-Podman `keep-id` identity proof beside the existing runtime tests. |
+| `.github/workflows/ci.yml` | Add only the trusted required non-ignored M4 job that runs that proof on the approved runner. |
+| `PLAN.md` | Replace the completed M7 batch plan with this bounded M4 external-gate record. |
+| `docs/implementation-progress.md` | Record the matching external block. |
 
-The public sending surface accepts only validated requests and notifications,
-not arbitrary JSON or responses. For each send:
+No source, CI, or test change is authorized while the listed external
+prerequisite is absent.
 
-1. construct the corresponding `ValidatedMessage`;
-2. call the existing `encode` exactly once;
-3. write the resulting bytes;
-4. write exactly one `b'\n'`; and
-5. flush the supplied writer before returning success.
+## Non-goals
 
-It MUST NOT use raw `serde_json` serialization, add a `CR`, batch multiple
-messages, or defer/flout the flush.
+- No Docker compatibility shim, remote daemon/service, rootful runtime, fake
+  executable, fixture, mock, or simulated user namespace result.
+- No image pull, runtime installation, privilege escalation, `sudo`,
+  `/etc/subuid` or `/etc/subgid` edit, storage setup, host configuration, or
+  other host mutation.
+- No sandbox route enablement, deployment enablement, release claim,
+  production behavior change, container-hardening claim, or expansion into
+  network, escape, resource, or lifecycle coverage.
+- No claim that existing fake or Docker-backed tests prove the rootless Podman
+  `keep-id` user-namespace mapping.
 
-The receive surface reads one line incrementally. It recognizes `LF` and
-`CRLF`, removes only the terminator, and passes the remaining payload
-unchanged to the existing `decode`. It MUST NOT use an unbounded line-read API
-or raw `serde_json` decoding. The payload buffer grows only as bytes arrive
-and is capped: a payload longer than `MAX_FRAME_BYTES` is a framing
-over-limit error, including a line without a terminator. A possible trailing
-`CR` may be retained only long enough to distinguish a legal `CRLF`
-terminator from payload data; it does not enlarge the permitted decoded
-payload.
+## Stop Conditions and Evidence
 
-Define a transport error type that preserves the following distinct cases:
+Do not start the eventual test or CI work until every external prerequisite is
+approved and present. Do not bypass a missing prerequisite with Docker,
+rootful/remote Podman, a downloaded image, an install, `sudo`, a configuration
+change, or a locally fabricated result.
 
-- `Io` for reader, writer, or flush failures;
-- `CleanEof` when EOF occurs before any byte of the next frame;
-- `PartialEof` when EOF occurs after any non-terminated frame byte;
-- `FrameTooLarge` for a frame that exceeds the incremental framing limit; and
-- `Wire(WireError)` when `encode` or `decode` rejects an otherwise completely
-  framed message.
-
-An empty terminated line reaches `decode` and is therefore a `WireError`; it
-is not EOF. A completed `CRLF` frame is valid framing even when its payload
-subsequently fails `decode`. Neither clean EOF nor partial EOF is converted
-into I/O, malformed JSON, or an invented response.
-
-## Test-only Framing Evidence
-
-The unit tests in `stdio.rs` use in-memory caller-provided async pipes only.
-They are test-only framing evidence and MUST NOT be described as external MCP
-interoperability. Cover:
-
-1. request and notification sends use existing `encode`, append exactly one
-   `LF`, and flush;
-2. a valid LF frame and an equivalent CRLF frame each decode through the
-   existing `decode`;
-3. a frame exactly at `MAX_FRAME_BYTES` is accepted when `decode` accepts it,
-   while the first payload byte beyond that limit yields `FrameTooLarge`
-   incrementally rather than an unbounded allocation/read;
-4. EOF before a frame yields `CleanEof`, while EOF after one or more
-   unterminated bytes yields `PartialEof`;
-5. malformed or semantically invalid completed JSON-RPC frames preserve the
-   underlying `WireError`; and
-6. decoding a response neither infers a response method nor performs
-   correlation.
-
-Keep these tests deterministic, bounded, and free of process spawning,
-listeners, background tasks, clocks, network I/O, or mutable global state.
-
-## No-goals
-
-- No subprocess spawning, child-process lifecycle, shell command, stdio
-  endpoint configuration, or process supervision.
-- No session driver, initialization/discovery choreography, pending-request
-  map, response-method inference, response correlation, background task,
-  cancellation, retry, reconnect, timeout, or concurrency policy.
-- No Streamable HTTP, HTTP route/client, SSE, authentication, OAuth, JWKS,
-  credentials, configuration, external integration, or conformance claim.
-- No raw serde decode/encode path, unbounded line read, protocol-model change,
-  wire change, capability change, or public-era expansion.
-- No fixture/mock/loopback replacement for the real-peer CI prerequisite.
-
-## Stop Conditions and Validation
-
-Stop and open a separate plan if correct incremental framing requires changing
-the wire boundary, protocol models, response correlation, session state,
-process lifecycle, or Tokio/runtime ownership beyond caller-provided pipes.
-Do not work around such a defect with raw serde, a larger/unbounded buffer, a
-special-case response, or a hidden background task.
-
-For this implementation, run only focused non-ignored unit tests covering the
-new stdio framing module, subject to existing local artifact and disk
-prerequisites. After focused proof and review, exact-SHA CI must pass the
-existing Rust, web, supply-chain, and container jobs. This validation proves
-only local framing behavior; it does not close M7 or the real-peer CI gate.
-
-## Documentation Reconciliation Follow-up
-
-`docs/architecture-plan.md` currently labels M8 as dual-era. Record that as a
-documentation reconciliation follow-up after this slice. Do not retag
-milestones, change that document now, or widen this bounded stdio framing
-batch to resolve the discrepancy.
+When the approved runner exists, the only acceptance evidence is the focused
+non-ignored real-local-rootless-Podman test and its trusted required CI job.
+Until then, M4 remains `BLOCKED_EXTERNAL`, the sandbox remains release-gated
+and off, and there is no M4 runtime-proof success claim.

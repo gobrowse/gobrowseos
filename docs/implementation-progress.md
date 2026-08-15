@@ -125,3 +125,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - Commit `4c2bff3796ec7ac15b86a167d49828a1eb556b98` accepts bounded JSON-RPC stdio line framing over caller-provided Tokio async pipes. Exact-SHA CI run `31908353273` passed Rust `95069542559`, web `95069542603`, supply-chain `95069542548`, and container `95069542574`.
 - This is framing-only evidence and its bounded tests, not a claim of process management, session establishment, or real MCP interoperability. M7 remains incomplete.
 - The sole remaining M7 gate is `BLOCKED_EXTERNAL`: an approved immutable/pinned independently implemented MCP stdio peer, with provenance, version, and content hash recorded and verified, plus a non-ignored CI real-peer test that performs `server/discover` and capability-authorized `tools/list`. Fixtures, mocks, loopback peers, and in-repository substitutes do not satisfy the gate.
+
+## M4 rootless Podman `keep-id` external gate (2026-08-15)
+
+- **`BLOCKED_EXTERNAL`:** M4 has no real runtime-proof success claim. The required approved ephemeral local runner is absent: it must run real rootless Podman as a non-root user, already have that user's `/etc/subuid` and `/etc/subgid` entries configured, hold the approved immutable digest image locally, and back a trusted required non-ignored CI job.
+- No Docker shim, remote or rootful Podman fallback, image pull, installation, `sudo`, or host mutation is permitted. The smallest eventual scope is one deterministic test-only real-local-Podman `--userns=keep-id` UID-identity proof against the preloaded digest image and its trusted required CI invocation.
+- The sandbox remains release-gated and off. Existing fake and Docker-backed tests do not prove the rootless Podman `keep-id` user-namespace mapping.
