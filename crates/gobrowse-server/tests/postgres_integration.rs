@@ -330,13 +330,24 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
     let unsafe_base_commit_worktree_id = Uuid::now_v7();
     let unsafe_path_worktree_id = Uuid::now_v7();
     let unsafe_changed_files_worktree_id = Uuid::now_v7();
-    let safe_worktree_task_id = Uuid::now_v7();
-    let unsafe_worktree_task_id = Uuid::now_v7();
-    let foreign_worktree_task_id = Uuid::now_v7();
+    let safe_worktree_task_id = Uuid::from_u128(0x00000000000170008000000000000001);
+    let unsafe_worktree_task_id = Uuid::from_u128(0x00000000000270008000000000000002);
+    let foreign_worktree_task_id = Uuid::from_u128(0x00000000000370008000000000000003);
+    let cross_workspace_owner_task_id = Uuid::from_u128(0x00000000000470008000000000000004);
+    let unsafe_base_commit_task_id = Uuid::from_u128(0x00000000000570008000000000000005);
+    let unsafe_changed_files_task_id = Uuid::from_u128(0x00000000000670008000000000000006);
+    let unsafe_recurrence_task_id = Uuid::from_u128(0x00000000000770008000000000000007);
     let worktree_agent_id = Uuid::now_v7();
     let foreign_worktree_agent_id = Uuid::now_v7();
     let legacy_activity_at = OffsetDateTime::now_utc() - Duration::hours(1);
-    for task_id in [safe_worktree_task_id, unsafe_worktree_task_id] {
+    for task_id in [
+        safe_worktree_task_id,
+        unsafe_worktree_task_id,
+        cross_workspace_owner_task_id,
+        unsafe_base_commit_task_id,
+        unsafe_changed_files_task_id,
+        unsafe_recurrence_task_id,
+    ] {
         sqlx::query(
             "INSERT INTO tasks (id,workspace_id,title,state) VALUES ($1,$2,'Legacy worktree task','BACKLOG')",
         )
@@ -409,20 +420,20 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
         ),
         (
             cross_workspace_owner_worktree_id,
-            unsafe_worktree_task_id,
+            cross_workspace_owner_task_id,
             foreign_worktree_agent_id,
             "agent/schema-15-cross-owner".to_string(),
             "a".repeat(40),
-            worktree_path(unsafe_worktree_task_id),
+            worktree_path(cross_workspace_owner_task_id),
             vec!["legacy.rs".to_string()],
         ),
         (
             unsafe_base_commit_worktree_id,
-            unsafe_worktree_task_id,
+            unsafe_base_commit_task_id,
             worktree_agent_id,
             "agent/schema-15-unsafe-base".to_string(),
             "not-a-full-object-id".to_string(),
-            worktree_path(unsafe_worktree_task_id),
+            worktree_path(unsafe_base_commit_task_id),
             vec!["legacy.rs".to_string()],
         ),
         (
@@ -436,11 +447,11 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
         ),
         (
             unsafe_changed_files_worktree_id,
-            unsafe_worktree_task_id,
+            unsafe_changed_files_task_id,
             worktree_agent_id,
             "agent/schema-15-unsafe-files".to_string(),
             "a".repeat(40),
-            worktree_path(unsafe_worktree_task_id),
+            worktree_path(unsafe_changed_files_task_id),
             vec!["a/../legacy.rs".to_string()],
         ),
     ];
@@ -560,13 +571,10 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
         )
         .bind(Uuid::now_v7())
         .bind(workspace)
-        .bind(safe_worktree_task_id)
+        .bind(unsafe_recurrence_task_id)
         .bind(worktree_agent_id)
         .bind("a".repeat(40))
-        .bind(format!(
-            "/srv/legacy/worktrees/task-{}",
-            &safe_worktree_task_id.simple().to_string()[..12]
-        ))
+        .bind(worktree_path(unsafe_recurrence_task_id))
         .execute(&mut connection)
         .await
         .is_err(),
