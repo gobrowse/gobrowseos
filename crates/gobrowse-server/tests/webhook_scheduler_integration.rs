@@ -454,7 +454,126 @@ async fn successful_delivery_sets_status_succeeded_and_clears_next_attempt() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// Test 5: crashed worker running row is reclaimed on restart
+// Test 5: durable response status matrix
+
+#[tokio::test]
+async fn durable_response_status_matrix_preserves_attempt_fields() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+    let cases = [
+        (200_u16, "succeeded", false),
+        (204, "succeeded", false),
+        (300, "failed", false),
+        (302, "failed", false),
+        (307, "failed", false),
+        (400, "failed", false),
+        (404, "failed", false),
+        (408, "queued", true),
+        (429, "queued", true),
+        (500, "queued", true),
+        (503, "queued", true),
+    ];
+    let owner = format!("matrix-{}", Uuid::now_v7());
+    for (status, expected_status, retryable) in cases {
+        let delivery_id = format!("status-{status}-{}", Uuid::now_v7());
+        insert_queued_delivery(
+            &pool,
+            webhook_id,
+            &delivery_id,
+            "https://hooks.example.test/matrix",
+            &secret,
+        )
+        .await;
+        let claimed = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+            .await
+            .expect("claim matrix row")
+            .into_iter()
+            .find(|delivery| delivery.delivery_id == delivery_id)
+            .expect("matrix claim");
+        let outcome = webhook_scheduler::DeliveryOutcome {
+            response_code: Some(status),
+            success: expected_status == "succeeded",
+            retryable,
+            error: (expected_status == "failed")
+                .then(|| format!("target returned non-retryable HTTP {status}")),
+        };
+        webhook_scheduler::persist_outcome(&pool, &claimed, &outcome, 5).await;
+        let row = sqlx::query(
+            "SELECT status, attempts, last_response_code, next_attempt_at, lease_token, last_error FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+        )
+        .bind(webhook_id)
+        .bind(&delivery_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read matrix row");
+        assert_eq!(row.get::<String, _>("status"), expected_status);
+        assert_eq!(row.get::<i32, _>("attempts"), 1);
+        assert_eq!(
+            row.get::<Option<i32>, _>("last_response_code"),
+            Some(status as i32)
+        );
+        assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
+        if retryable {
+            assert!(
+                row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
+                    .is_some()
+            );
+            assert!(row.get::<Option<String>, _>("last_error").is_none());
+        } else {
+            assert!(
+                row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
+                    .is_none()
+            );
+        }
+    }
+    let dead_id = format!("status-dead-{}", Uuid::now_v7());
+    insert_delivery_with_attempts(
+        &pool,
+        webhook_id,
+        &dead_id,
+        "https://hooks.example.test/matrix",
+        &secret,
+        4,
+    )
+    .await;
+    let claimed = webhook_scheduler::claim_deliveries(&pool, &owner, 100)
+        .await
+        .expect("claim dead row")
+        .into_iter()
+        .find(|delivery| delivery.delivery_id == dead_id)
+        .expect("dead claim");
+    let outcome = webhook_scheduler::DeliveryOutcome {
+        response_code: Some(503),
+        success: false,
+        retryable: true,
+        error: None,
+    };
+    webhook_scheduler::persist_outcome(&pool, &claimed, &outcome, 5).await;
+    let row = sqlx::query(
+        "SELECT status, attempts, next_attempt_at, lease_token FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&dead_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read dead row");
+    assert_eq!(row.get::<String, _>("status"), "dead");
+    assert_eq!(row.get::<i32, _>("attempts"), 5);
+    assert!(
+        row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
+            .is_none()
+    );
+    assert!(row.get::<Option<Uuid>, _>("lease_token").is_none());
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 6: crashed worker running row is reclaimed on restart
 // ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
@@ -621,6 +740,18 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
     .execute(&pool)
     .await
     .expect("expire stale lease");
+    let (expired_at, observed_at): (OffsetDateTime, OffsetDateTime) = sqlx::query_as(
+        "SELECT lease_expires_at, clock_timestamp() FROM webhook_deliveries WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read expired lease");
+    assert!(
+        expired_at < observed_at,
+        "stale lease must expire before recovery"
+    );
 
     let reclaimed = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
         .await
@@ -655,7 +786,7 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
     webhook_scheduler::persist_outcome(&pool, &stale, &success, 5).await;
 
     let row = sqlx::query(
-        "SELECT status, attempts, lease_token, last_error, last_response_code FROM webhook_deliveries \
+        "SELECT status, attempts, lease_token, lease_expires_at, next_attempt_at, last_error, last_response_code FROM webhook_deliveries \
          WHERE webhook_id=$1 AND delivery_id=$2",
     )
     .bind(webhook_id)
@@ -666,6 +797,14 @@ async fn stale_worker_cannot_persist_after_recovery_and_reclaim() {
     assert_eq!(row.get::<String, _>("status"), "running");
     assert_eq!(row.get::<i32, _>("attempts"), 2);
     assert_eq!(row.get::<Uuid, _>("lease_token"), current.lease_token);
+    let current_expiry = row
+        .get::<Option<OffsetDateTime>, _>("lease_expires_at")
+        .expect("current lease expiry");
+    assert!(current_expiry > OffsetDateTime::now_utc());
+    assert!(
+        row.get::<Option<OffsetDateTime>, _>("next_attempt_at")
+            .is_none()
+    );
     assert!(row.get::<Option<String>, _>("last_error").is_none());
     assert!(row.get::<Option<i32>, _>("last_response_code").is_none());
 

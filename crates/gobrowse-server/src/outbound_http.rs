@@ -100,6 +100,16 @@ impl TransportError {
     }
 }
 
+fn classify_transport_error(error: &reqwest::Error) -> TransportError {
+    if error.is_timeout() {
+        TransportError::Timeout
+    } else if error.is_connect() {
+        TransportError::Connection
+    } else {
+        TransportError::Other
+    }
+}
+
 /// Resolver/transport pair passed through every delivery task.
 #[derive(Clone)]
 pub struct WebhookDeliveryDeps {
@@ -151,15 +161,10 @@ impl OutboundTransport for PinnedHttpsTransport {
             if let Some(signature) = signature {
                 request = request.header("X-Gobrowse-Signature", signature);
             }
-            let response = request.send().await.map_err(|error| {
-                if error.is_timeout() {
-                    TransportError::Timeout
-                } else if error.is_connect() {
-                    TransportError::Connection
-                } else {
-                    TransportError::Other
-                }
-            })?;
+            let response = request
+                .send()
+                .await
+                .map_err(|error| classify_transport_error(&error))?;
             Ok(TransportResponse {
                 status: response.status().as_u16(),
             })
@@ -245,22 +250,120 @@ pub async fn resolve_target_with<R: OutboundResolver + ?Sized>(
 }
 
 fn pinned_client(target: &ValidatedOutboundTarget) -> Result<reqwest::Client, reqwest::Error> {
+    pinned_client_builder(target, CONNECT_TIMEOUT, REQUEST_TIMEOUT).build()
+}
+
+#[cfg(test)]
+fn pinned_client_for_test(
+    target: &ValidatedOutboundTarget,
+    root: reqwest::Certificate,
+    timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    pinned_client_builder(target, timeout, timeout)
+        .add_root_certificate(root)
+        .build()
+}
+
+fn pinned_client_builder(
+    target: &ValidatedOutboundTarget,
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
         .redirect(Policy::none())
         .no_proxy()
         .resolve_to_addrs(&target.host, &target.addresses)
         .user_agent(concat!("gobrowse-os/", env!("CARGO_PKG_VERSION")))
-        .build()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{
+        TlsAcceptor,
+        rustls::{
+            self,
+            pki_types::{CertificateDer, PrivateKeyDer},
+        },
+    };
+
     use super::*;
+
+    const TEST_CERT: &[u8] = include_bytes!("../tests/fixtures/webhook-test-cert.pem");
+    const TEST_CA: &[u8] = include_bytes!("../tests/fixtures/webhook-test-ca.pem");
+    const TEST_KEY: &[u8] = include_bytes!("../tests/fixtures/webhook-test-key.pem");
 
     fn public() -> SocketAddr {
         "1.1.1.1:443".parse().expect("public address")
+    }
+
+    fn pem_der(pem: &[u8]) -> Vec<u8> {
+        let mut lines = std::str::from_utf8(pem)
+            .expect("PEM UTF-8")
+            .lines()
+            .filter(|line| !line.starts_with('-'));
+        let body: String = lines.by_ref().collect();
+        base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .expect("decode PEM")
+    }
+
+    async fn tls_server(
+        response: &'static [u8],
+    ) -> (
+        SocketAddr,
+        Arc<Mutex<Option<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let cert = CertificateDer::from(pem_der(TEST_CERT));
+        let key = PrivateKeyDer::Pkcs8(pem_der(TEST_KEY).into());
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("TLS test config");
+        let acceptor = TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("TLS listener");
+        let address = listener.local_addr().expect("TLS address");
+        let seen = Arc::new(Mutex::new(None));
+        let seen_by_server = seen.clone();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("TLS connection");
+            let Ok(mut stream) = acceptor.accept(stream).await else {
+                return;
+            };
+            let mut request = vec![0u8; 8192];
+            let count = stream.read(&mut request).await.expect("read request");
+            let request = String::from_utf8_lossy(&request[..count]);
+            let sni = stream
+                .get_ref()
+                .1
+                .server_name()
+                .unwrap_or_default()
+                .to_owned();
+            *seen_by_server.lock().expect("record TLS metadata") =
+                Some(format!("{sni}\n{request}"));
+            if response.is_empty() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            } else {
+                stream.write_all(response).await.expect("write response");
+            }
+        });
+        (address, seen, task)
+    }
+
+    fn target(address: SocketAddr) -> ValidatedOutboundTarget {
+        ValidatedOutboundTarget {
+            url: Url::parse("https://hooks.example.test/deliver").expect("test URL"),
+            host: "hooks.example.test".to_owned(),
+            addresses: vec![address],
+        }
     }
 
     #[test]
@@ -316,6 +419,91 @@ mod tests {
             TargetPolicyError::PrivateAddress.code(),
             "target_policy_denied"
         );
+    }
+
+    #[tokio::test]
+    async fn pinned_transport_preserves_hostname_and_sni() {
+        let response = b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n";
+        let (address, seen, task) = tls_server(response).await;
+        let target = target(SocketAddr::new(address.ip(), address.port()));
+        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+        let client = pinned_client_for_test(&target, root, Duration::from_secs(2)).expect("client");
+        let response = client
+            .get(target.url.clone())
+            .send()
+            .await
+            .expect("TLS request");
+        assert_eq!(response.status().as_u16(), 204);
+        task.await.expect("TLS server");
+        let seen = seen
+            .lock()
+            .expect("read metadata")
+            .clone()
+            .expect("metadata");
+        assert!(seen.starts_with("hooks.example.test\n"));
+        assert!(
+            seen.to_ascii_lowercase()
+                .contains("host: hooks.example.test")
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_hostname_certificate_is_a_redacted_transport_failure() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let (address, _seen, task) = tls_server(response).await;
+        let target = ValidatedOutboundTarget {
+            url: Url::parse("https://wrong.example.test/deliver").expect("wrong URL"),
+            host: "wrong.example.test".to_owned(),
+            addresses: vec![SocketAddr::new(address.ip(), address.port())],
+        };
+        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+        let client = pinned_client_for_test(&target, root, Duration::from_secs(2)).expect("client");
+        let error = client
+            .get(target.url)
+            .send()
+            .await
+            .expect_err("hostname mismatch");
+        let classified = classify_transport_error(&error);
+        assert!(matches!(
+            classified,
+            TransportError::Connection | TransportError::Other
+        ));
+        assert!(!classified.code().contains("wrong.example.test"));
+        task.await.expect("TLS server");
+    }
+
+    #[tokio::test]
+    async fn redirect_is_returned_without_following_location() {
+        let response = b"HTTP/1.1 302 Found\r\nLocation: https://sentinel.example.test/hit\r\nContent-Length: 0\r\n\r\n";
+        let (address, _seen, task) = tls_server(response).await;
+        let target = target(SocketAddr::new(address.ip(), address.port()));
+        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+        let client = pinned_client_for_test(&target, root, Duration::from_secs(2)).expect("client");
+        let response = client
+            .get(target.url)
+            .send()
+            .await
+            .expect("redirect response");
+        assert_eq!(response.status().as_u16(), 302);
+        task.await.expect("TLS server");
+    }
+
+    #[tokio::test]
+    async fn request_timeout_is_bounded_and_redacted() {
+        let (address, _seen, task) = tls_server(b"").await;
+        let target = target(SocketAddr::new(address.ip(), address.port()));
+        let root = reqwest::Certificate::from_pem(TEST_CA).expect("test root");
+        let client =
+            pinned_client_for_test(&target, root, Duration::from_millis(50)).expect("client");
+        let error = client
+            .get(target.url)
+            .send()
+            .await
+            .expect_err("request timeout");
+        let classified = classify_transport_error(&error);
+        assert_eq!(classified, TransportError::Timeout);
+        assert!(!classified.code().contains("hooks.example.test"));
+        task.await.expect("TLS server");
     }
 
     #[test]

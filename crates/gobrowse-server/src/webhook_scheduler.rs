@@ -513,10 +513,9 @@ mod tests {
             .expect("request");
         assert_eq!(id, delivery.delivery_id);
         assert_eq!(body, expected_body);
-        let expected = format!(
-            "sha256={}",
-            hex_encode(&hmac_sha256(&secret, body.as_bytes()))
+        assert_eq!(
+            signature.as_deref(),
+            Some("sha256=7501aff799a68a731c5e250c9fa7d995b5491be28819843527a91b7ad5d8a307")
         );
-        assert_eq!(signature.as_deref(), Some(expected.as_str()));
     }
 }
