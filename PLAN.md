@@ -1,77 +1,110 @@
-# PLAN.md — Final Skills Assertions and External Validation
+# PLAN.md — Skills Schema-15 Acceptance Attestation and Documentation Closure
 
 ## Goal
 
-Close the last two static acceptance-test gaps on committed HEAD, then obtain real PostgreSQL 17+pgvector and release-tool evidence for schema-15 Skills.
+Close the documentation gap left by commit `8823dac` by committing this authoritative PLAN attestation on its own. The release-owner authorization, live inventory, and implementation-progress evidence are already recorded; no application content changes remain.
 
-This is a test/evidence-only batch. Production source, migrations, schema, routes, core, contract docs, dependencies, frontend, and unrelated subsystems remain frozen unless real execution reveals a new defect and a reviewer re-triages scope.
+No application source, tests, migrations, schema, APIs, frontend, sandbox, dependencies, or deployment state may change in this batch.
 
 ## Current State
 
-### Committed baseline
+### Green exact-SHA CI
 
-- Root HEAD is `7496c8d`; it is a test-only commit modifying `crates/gobrowse-server/tests/skills_integration.rs` and `crates/gobrowse-server/tests/postgres_integration.rs`.
-- Migrations 0013–0015 and production source are unchanged from `77ed260`; schema remains 15.
-- Static review confirms prior authorization, promotion-response, provenance-fixture, denial-audit, and deterministic-race fixes are present.
-- Formatting, native/workspace/WASM Clippy, test compilation/discovery, and diff checks pass. No files are staged.
-- Checker round five reports **FAIL** for exactly two remaining assertion/numbering gaps plus unavailable external validation. No new production defect was found.
+Observed GitHub Actions evidence for commit `4d0b0b30ace33e9f3bd807883575742f6ae094da`, run `31858799443`:
 
-### Remaining gap 1 — privileged success assertions
+- Overall workflow conclusion: success.
+- Rust job `94948272589`: success.
+- Nextest summary: 307 tests run, 307 passed, 6 configured skipped, duration 55.070s.
+- `schema_v14_to_v15_repairs_skill_lifecycle_state`: passed in 0.443s.
+- `deployed_schema_v3_upgrades_to_v15`: passed in 52.463s.
+- `automatic_promotion_requires_recorded_non_regression`: passed in 0.773s.
+- `duplicate_and_inaccessible_skill_sources_return_validation`: passed in 0.725s.
+- `skills_reject_cross_profile_workspace_links_and_duplicate_globals`: passed in 0.146s.
+- `workspace_skill_promotion_and_rollback_require_profile_admin`: passed in 0.757s.
+- `skill_database_enforces_evaluation_source_and_promotion_invariants`: passed in 15.259s.
+- Migration CLI step completed successfully and logged `migrations applied`.
+- Web/Trunk job `94948272573`: success.
+- Supply-chain deny/audit job `94948272638`: success.
+- Container job `94948272578`: success.
 
-In `skills_integration.rs:779-839`, workspace OWNER/EDITOR evaluation calls assert HTTP 200 and audit rows but do not assert that evaluation JSON was persisted on each revision.
+All previously reported code, fixture, migration, authorization, audit, provenance, and release-tool blockers are closed for this exact SHA.
 
-The same test performs profile OWNER promotion and profile ADMIN rollback but asserts status only. Required exact success audits are missing:
+Commit `8823dac3ea793373d5c466692bea1097232562da` (`docs: record skills schema15 acceptance evidence`) committed the required nine-line `docs/implementation-progress.md` closure record but omitted the already-prepared `PLAN.md` attestation. The current PLAN diff is therefore the sole remaining closure artifact.
 
-- OWNER promote: action `skill.promoted`, resource type `skill_revision`, resource ID `{skill_id}:2`;
-- ADMIN rollback: action `skill.rolled_back`, resource type `skill`, resource ID `{skill_id}`.
+### Release-owner authorization
 
-### Remaining gap 2 — globally distinct attempted revision numbers
+The user/release owner explicitly authorized the in-place pre-release repair of migration 0015. Repository tags stop at `milestone-7`; the schema-15 repair commit postdates that release line. `docs/implementation-progress.md` identifies the private deployment at `root@178.128.179.216` as the sole known supported deployment and records it at schema 3.
 
-The six-case raw-SQL source matrix uses revision 100 for both nil and wrong-workspace attempts because they target different Skills. The schema-14 post-upgrade matrix uses 10–14, then revision 1 for wrong-workspace on another Skill.
+### Read-only live inventory attestation
 
-Although different Skills prevent direct uniqueness masking, the required evidence calls for six globally distinct numbers so each logged/asserted case is unambiguous:
+Read-only SSH and SQL inventory was executed on 2026-08-15 without changing containers, data, migration rows, or service state.
 
-- raw-SQL matrix: 100, 101, 102, 103, 104, 105;
-- post-upgrade matrix: 10, 11, 12, 13, 14, 15.
+Observed deployment identity:
 
-All cases must retain exact `skill_revisions_sources_valid` constraint assertions.
+```text
+host = gobrowseos (178.128.179.216)
+SSH user = root
+inventory UTC = 2026-08-15T02:26:06Z
+app container = gobrowse-os-app-1, healthy
+PostgreSQL container = gobrowse-os-postgres-1, pgvector/pgvector:0.8.1-pg17, healthy
+application database = gobrowse
+PostgreSQL server = 17.8
+```
 
-### External environment blocker
+Observed application schema:
 
-- `GOBROWSE_TEST_DATABASE_URL` is unset; DB-facing tests return at guards in 0.00s.
-- `cargo-nextest`, PostgreSQL client tools, Trunk, cargo-deny, and cargo-audit are unavailable locally. Docker exists but the image build has not run.
-- Therefore authorization, provenance, migration repair, audit, concurrency, migration CLI, release web, supply-chain, and container proof remain not run. Guarded test success is not acceptance evidence.
+```text
+schema_metadata.schema_version = 3
+schema_metadata.updated_at = 2026-08-11T06:59:24.853223Z
+_sqlx_migrations successful versions = 1, 2, 3
+_sqlx_migrations max(version) = 3
+_sqlx_migrations rows where version=15 = 0
+```
+
+The only other connectable database is the standard administrative `postgres` database; read-only catalog checks show it has neither `public._sqlx_migrations` nor `public.schema_metadata`.
+
+Checksum evidence:
+
+```text
+former 0015 file SHA-256 = b05865e0503b0d43836d622f7917f5972bba260a81e3009c50a334e13c7646b4
+former SQLx SHA-384 checksum = bd6b27777a076a077e23763b87a1effec21c1a3a8dbadd714f958e7ef2ab8508bbb3ed6b37a92c041d4ab4aabfd89d40
+current 0015 file SHA-256 = be16df41b493d1a40f883d6abe5a460ffb50381bdf325fc9e60f658b5f3547dd
+current SQLx SHA-384 checksum = f63824fd941dd823afccd7344809c4379de8085380bf58be16dbc24763b1af92c8e0ab0126e8ace9a6248fbae35e329e
+live version-15 rows = 0
+live former-checksum version-15 rows = 0
+live current-checksum version-15 rows = 0
+```
+
+The absence of any version-15 ledger row is the controlling evidence: neither the former nor current 0015 was applied. Combined with the owner's supported-estate declaration and explicit authorization, the in-place pre-release repair is safe for the declared supported estate. The prior release-attestation blocker is closed.
 
 ## Relevant Existing Code
 
-- `crates/gobrowse-server/tests/skills_integration.rs::workspace_skill_promotion_and_rollback_require_profile_admin`.
-- `skills_integration.rs::skill_database_enforces_evaluation_source_and_promotion_invariants`.
-- Test helper `audit_count`, which already supports actor/profile/action/resource-type/exact-resource assertions.
-- `crates/gobrowse-server/tests/postgres_integration.rs::schema_v14_to_v15_repairs_skill_lifecycle_state` post-upgrade source matrix.
-- Existing focused/full validation commands in `AGENTS.md` and CI.
+- `crates/gobrowse-server/migrations/0015_skill_lifecycle_hardening.sql`: accepted current migration, unchanged in this batch.
+- `crates/gobrowse-server/src/db.rs:14-37`: SQLx migration ledger/checksum enforcement and advisory lock.
+- `docs/implementation-progress.md`: authoritative deployment and validation handoff record.
+- `docs/deployment.md:23-32`: backup/stop/migrate/restore procedure for any future live schema upgrade.
+- `.github/workflows/ci.yml`: exact CI acceptance workflow.
 
 ## Architectural Decisions
 
-1. Modify assertions/fixtures only; do not alter behavior under test.
-2. Persisted evaluation proof compares stored JSON with the exact submitted `valid_evaluation(1)` value, not merely `evaluation IS NOT NULL`.
-3. Successful privileged audits are matched by actor, profile, action, resource type, exact resource ID, and outcome through `audit_count`.
-4. Source-case revision numbers are globally distinct within each six-case test matrix, including the wrong-workspace case on another Skill.
-5. Every failed source insert continues to assert the database constraint name, not generic failure.
-6. If real PostgreSQL reveals a production or migration defect, stop and obtain reviewer scope approval before touching frozen code.
+1. Treat the user's explicit authorization plus the sole-supported-deployment inventory as the release-owner attestation.
+2. Use `version=15` ledger absence as primary proof; SHA-256 identifies repository files while SQLx stores SHA-384 migration checksums.
+3. Record evidence in durable repository documentation without altering code or migration content.
+4. Do not migrate the live schema-3 deployment as part of documentation closure.
+5. Do not claim that CI deploys production; it proves the candidate against ephemeral PostgreSQL 17+pgvector.
+6. Preserve unrelated working-tree drift and commit only `PLAN.md` after review.
 
 ## Files To Modify
 
 | File | Exact scope |
 |---|---|
-| `crates/gobrowse-server/tests/skills_integration.rs` | Add persisted evaluation and privileged success-audit assertions; assign raw provenance revisions 100–105. |
-| `crates/gobrowse-server/tests/postgres_integration.rs` | Assign post-upgrade provenance revisions 10–15. |
-| `docs/implementation-progress.md` | Record results only after real external validation passes. |
+| `PLAN.md` | Commit the evidence-backed attestation and closure checklist omitted from `8823dac`. |
 
-No production source or migration change is planned.
+`docs/implementation-progress.md` is already committed in `8823dac`; it must not be amended in this follow-up. No other file is in scope.
 
 ## Database/Migration Changes
 
-None. Schema remains 15 and migrations remain unchanged.
+None. The SSH/SQL inventory was read-only. Live schema remains 3; candidate schema remains 15.
 
 ## API Changes
 
@@ -87,143 +120,62 @@ None.
 
 ## Security Requirements
 
-- Workspace OWNER/EDITOR evaluation success must be proven in durable rows, not only responses/audits.
-- Profile OWNER promote and profile ADMIN rollback success must have exact attributable audit evidence.
-- Provenance failures must be individually identifiable by revision number and exact source constraint.
-- No weakened assertion, generic `is_err()`, or catalog-only substitute is accepted.
+- Do not commit credentials, environment values, SSH keys, database URLs, or container secrets.
+- Record only host identity, non-secret container/image names, schema/ledger metadata, checksums, and CI identifiers.
+- Preserve the live service and database without writes or restarts.
+- Require reviewer confirmation that the attestation is bounded to the owner-declared supported estate.
 
 ## Concurrency Requirements
 
-No synchronization changes. Retain all existing Barrier, lock-wait polling, timeout, final-state, and audit assertions.
-
-Real PostgreSQL must execute the five race tests before acceptance.
+None. No runtime or database write occurs in this documentation batch.
 
 ## Tests Required
 
-### 1. Persist both workspace evaluations
+No new tests. Existing acceptance evidence is the green exact-SHA CI run `31858799443`.
 
-Inside `workspace_skill_promotion_and_rollback_require_profile_admin`, after each successful evaluate response:
-
-1. Parse `evaluated["id"]` as `Uuid`.
-2. Query `SELECT evaluation FROM skill_revisions WHERE id=$1`.
-3. Assert the returned `serde_json::Value` equals `valid_evaluation(1)` exactly.
-4. Retain the existing exact `skill.evaluated` audit assertion for that revision ID.
-
-This must run once for the MEMBER+workspace OWNER revision and once for the MEMBER+workspace EDITOR revision.
-
-### 2. Assert privileged success audits
-
-After profile OWNER promotes revision 2:
-
-```text
-actor = profile owner user ID
-profile = fixture profile ID
-action = skill.promoted
-resource_type = skill_revision
-resource_id = "{skill_id}:2"
-expected count = 1
-```
-
-After profile ADMIN rolls back to revision 1:
-
-```text
-actor = profile admin user ID
-profile = fixture profile ID
-action = skill.rolled_back
-resource_type = skill
-resource_id = skill_id string
-expected count = 1
-```
-
-Keep the successful response assertions and final active/promoted state checks. If no final state check exists, add `(active_revision,promoted_revision) == (1,1)` after rollback.
-
-### 3. Raw-SQL six-case numbering
-
-In `skill_database_enforces_evaluation_source_and_promotion_invariants`, use exactly:
-
-| Revision | Invalid source array |
-|---:|---|
-| 100 | `[Uuid::nil()]` |
-| 101 | `[valid, valid]` |
-| 102 | `[missing]` |
-| 103 | `[deleted]` |
-| 104 | `[cross_profile]` |
-| 105 | `[wrong_workspace_conversation]` on the scoped Skill |
-
-Do not reuse 100 for the wrong-workspace Skill. Each result must assert constraint `skill_revisions_sources_valid`.
-
-### 4. Schema-14 post-upgrade six-case numbering
-
-After applying migration 0015, use exactly:
-
-| Revision | Invalid source array |
-|---:|---|
-| 10 | nil |
-| 11 | non-nil duplicate |
-| 12 | missing |
-| 13 | deleted |
-| 14 | cross-profile |
-| 15 | wrong-workspace on the post-upgrade scoped Skill |
-
-Retain exact `skill_revisions_sources_valid` assertions for all six.
-
-### 5. Focused real execution
-
-Run these first with a real PostgreSQL 17+pgvector URL:
-
-```bash
-GOBROWSE_TEST_DATABASE_URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test CARGO_BUILD_JOBS=1 cargo nextest run -p gobrowse-server --test skills_integration -E 'test(workspace_skill_promotion_and_rollback_require_profile_admin) or test(skill_database_enforces_evaluation_source_and_promotion_invariants)'
-GOBROWSE_TEST_DATABASE_URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test CARGO_BUILD_JOBS=1 cargo nextest run -p gobrowse-server --test postgres_integration -E 'test(schema_v14_to_v15_repairs_skill_lifecycle_state)'
-```
-
-Then run the full acceptance matrix:
+Documentation validation:
 
 ```bash
 cargo fmt --all -- --check
-CARGO_BUILD_JOBS=1 cargo clippy -p gobrowse-server --all-targets --all-features -- -D warnings
-CARGO_BUILD_JOBS=1 cargo clippy --workspace --all-targets --all-features -- -D warnings
-CARGO_BUILD_JOBS=1 cargo clippy -p gobrowse-web --target wasm32-unknown-unknown -- -D warnings
-GOBROWSE_TEST_DATABASE_URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test CARGO_BUILD_JOBS=1 cargo nextest run -p gobrowse-server --test skills_integration
-GOBROWSE_TEST_DATABASE_URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test CARGO_BUILD_JOBS=1 cargo nextest run -p gobrowse-server --test postgres_integration
-GOBROWSE_TEST_DATABASE_URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test CARGO_BUILD_JOBS=1 cargo nextest run --workspace
-GOBROWSE__DATABASE__URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test CARGO_BUILD_JOBS=1 cargo run -p gobrowse-server --bin gobrowse -- migrate
-(cd crates/gobrowse-web && trunk build index.html --release --dist ../../dist)
-cargo deny check
-cargo audit --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0436 --ignore RUSTSEC-2026-0173
-docker build -t gobrowse-os:skills-final-evidence .
-git diff --check 7496c8d..HEAD
+git diff --check
+git diff --name-only
 git diff --cached --name-only
 git status --short
 ```
 
-Record focused/full nextest summaries, test durations, schema 15, migration CLI, Trunk, deny, audit, and Docker results. Guarded 0.00s tests are explicitly rejected.
+Before committing, verify the staged set contains only:
+
+```text
+PLAN.md
+```
+
+No need to rerun CI for a plan-only evidence commit unless repository policy or reviewer requests it.
 
 ## Deployment Considerations
 
-- No production or schema change is planned.
-- Do not deploy without real database and release-tool evidence.
-- Follow existing backup/stop/migrate/start/restore procedures.
-- Exclude unrelated unstaged drift from release packaging.
+- The private deployment remains healthy at schema 3; no schema-15 deployment occurred during attestation.
+- A future deployment must independently follow backup → stop old app → migrate with target image → verify schema/quarantine → start → readiness checks.
+- The inventory establishes checksum compatibility for that future 3→15 path; it is not authorization to bypass the deployment runbook.
+- Any newly discovered supported database outside the owner-declared inventory must be checked before migration.
 
 ## Ordered Implementation Steps
 
-1. Preserve unrelated drift and confirm the index is empty.
-2. Add exact persisted evaluation assertions for workspace OWNER/EDITOR.
-3. Add exact profile OWNER promote and profile ADMIN rollback audit assertions plus final `(1,1)` state.
-4. Change wrong-workspace raw-SQL attempted revision from 100 to 105.
-5. Change wrong-workspace post-upgrade attempted revision from 1 to 15.
-6. Run the three focused tests against real PostgreSQL and fix test-only failures.
-7. Run focused binaries, full workspace nextest, migration CLI, Trunk, deny, audit, and Docker build.
-8. Update implementation progress with observed totals/durations only.
-9. Obtain required security, migration, concurrency/reliability, QA, and API review; rerun after findings.
+1. Preserve `.gitignore`, `AGENTS.md`, deleted setup script, and untracked output/session drift.
+2. Verify `8823dac` contains only the intended `docs/implementation-progress.md` acceptance record.
+3. Review the existing PLAN attestation for consistency with committed progress evidence; make no unrelated content changes.
+4. Run documentation diff/whitespace checks and inspect for secrets.
+5. Obtain reviewer approval of the PLAN-only closure diff.
+6. Stage only `PLAN.md` and verify the cached name/status and diff.
+7. Commit with a documentation-only conventional message such as `docs: commit skills schema15 closure plan`.
+8. Confirm the new commit contains only `PLAN.md`, the index is empty, and unrelated drift is unchanged.
 
 ## Acceptance Criteria
 
-- Both workspace OWNER/EDITOR evaluation calls persist exactly the submitted evaluation JSON and retain exact evaluation audits.
-- Profile OWNER promote and profile ADMIN rollback each produce exactly one expected success audit with exact resource ID.
-- Final rollback state is active/promoted revision 1.
-- Raw-SQL provenance cases use revisions 100–105 exactly once each and assert the source constraint.
-- Post-upgrade provenance cases use revisions 10–15 exactly once each and assert the source constraint.
-- No production source, migration, schema, route, dependency, frontend, or unrelated subsystem changes are included.
-- Focused/full nextest, schema-15 migration CLI, Trunk release build, deny, audit, and Docker build pass in an approved environment with recorded non-guarded durations.
-- Required reviewers report no unresolved blocker or high-severity finding.
+- Committed `docs/implementation-progress.md` at `8823dac` contains the exact green CI SHA/run/jobs and test/migration results.
+- The committed progress record and PLAN record the owner's explicit authorization and declared sole supported deployment.
+- PLAN records live schema 3, successful migration ledger versions 1–3, and zero version-15 rows.
+- PLAN distinguishes file SHA-256 values from SQLx SHA-384 checksums.
+- PLAN states that the inventory was read-only and no deployment occurred.
+- No application source, test, migration, schema, configuration, dependency, or unrelated documentation changes are included.
+- Reviewers confirm no remaining blocker or high-severity finding.
+- The final plan-closure commit contains only `PLAN.md`; `8823dac` remains the separate progress-documentation commit.
