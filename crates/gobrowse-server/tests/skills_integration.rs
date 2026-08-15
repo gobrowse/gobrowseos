@@ -150,13 +150,8 @@ async fn skills_reject_cross_profile_workspace_links_and_duplicate_globals() {
     let pool = test_pool().await.expect("test pool");
     let first = profile(&pool, "skills-profile-a").await;
     let second = profile(&pool, "skills-profile-b").await;
-    let workspace = Uuid::now_v7();
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'other workspace')")
-        .bind(workspace)
-        .bind(second)
-        .execute(&pool)
-        .await
-        .expect("create workspace");
+    let (second_owner, _) = create_session(&pool, second, "OWNER").await;
+    let workspace = insert_workspace(&pool, second, second_owner).await;
 
     let cross_profile = sqlx::query(
         "INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'cross','')",
