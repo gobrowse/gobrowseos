@@ -344,8 +344,16 @@ fn validated_result<T: serde::Serialize + ValidateMcp>(
     result: Result<T, RpcError>,
 ) -> Result<Value, RpcError> {
     let value = result?;
-    value.validate_mcp().map_err(|_| invalid_params())?;
+    value.validate_mcp().map_err(|_| internal_handler_error())?;
     serde_json::to_value(value).map_err(internal_error)
+}
+
+fn internal_handler_error() -> RpcError {
+    RpcError {
+        code: -32603,
+        message: "internal MCP handler error".into(),
+        data: None,
+    }
 }
 fn invalid_params() -> RpcError {
     RpcError {
@@ -457,6 +465,34 @@ mod tests {
             Ok(serde_json::json!(["unexpected"]))
         }
     }
+    struct SemanticallyInvalidTypedHandler;
+    #[async_trait]
+    impl McpServerHandler for SemanticallyInvalidTypedHandler {
+        async fn discover(&self) -> Result<DiscoverResult, RpcError> {
+            Ok(DiscoverResult {
+                supported_versions: vec!["2026-07-28".into()],
+                capabilities: ServerCapabilities {
+                    tools: Some(ToolsCapability::default()),
+                    ..Default::default()
+                },
+                server_info: None,
+            })
+        }
+
+        async fn tools_list(&self, _: ListParams) -> Result<Paginated<Tool>, RpcError> {
+            let duplicate = Tool {
+                name: "duplicate".into(),
+                title: None,
+                description: None,
+                input_schema: json!({"type": "object"}),
+                output_schema: None,
+            };
+            Ok(Paginated {
+                items: vec![duplicate.clone(), duplicate],
+                next_cursor: None,
+            })
+        }
+    }
     #[tokio::test]
     async fn logging_notification_requires_negotiated_logging_capability() {
         let mut dispatcher = McpServerDispatcher::new(LoggingHandler);
@@ -510,6 +546,33 @@ mod tests {
             let encoded = encode(&ValidatedMessage::Response(response)).expect("fallback frame");
             assert!(encoded.len() < MAX_FRAME_BYTES);
         }
+    }
+
+    #[tokio::test]
+    async fn semantically_invalid_typed_handler_result_uses_internal_fallback() {
+        let mut dispatcher = McpServerDispatcher::new(SemanticallyInvalidTypedHandler);
+        let discover = dispatcher
+            .dispatch(try_request(RequestId::Number(1), METHOD_DISCOVER, None).unwrap())
+            .await;
+        assert!(matches!(discover.body(), ResponseBody::Result { .. }));
+
+        let response = dispatcher
+            .dispatch(
+                try_request(RequestId::Number(2), METHOD_TOOLS_LIST, Some(json!({}))).unwrap(),
+            )
+            .await;
+        assert!(matches!(
+            response.body(),
+            ResponseBody::Error { error: RpcError { code: -32603, message, data: None } }
+                if message == "internal MCP handler error"
+        ));
+        assert_eq!(response.id(), &RequestId::Number(2));
+        assert!(
+            encode(&ValidatedMessage::Response(response))
+                .expect("fallback frame")
+                .len()
+                < MAX_FRAME_BYTES
+        );
     }
 
     #[tokio::test]
