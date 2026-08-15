@@ -119,3 +119,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - Commit `f1df7983d672703555e0afaec6c05fe0a6a489d2` corrects invalid handler-produced `DiscoverResult` and `InitializeResult` classification: they now produce the redacted internal JSON-RPC fallback (`-32603`, `internal MCP handler error`, no data) rather than caller-invalid-parameters (`-32602`), while preserving the request ID and existing handler/protocol error behavior.
 - Independent checker outcome: PASS. Exact-SHA CI run `31905108689` passed all required jobs: Rust `95061580890`, web `95061580770`, supply-chain `95061580835`, and container `95061580892`.
 - This accepts only the negotiation-handler failure-boundary correction. M7 remains open pending the exhaustive core matrix and real stdio/Streamable HTTP interoperability proof.
+
+## M7 bounded stdio framing acceptance (2026-08-15)
+
+- Commit `4c2bff3796ec7ac15b86a167d49828a1eb556b98` accepts bounded JSON-RPC stdio line framing over caller-provided Tokio async pipes. Exact-SHA CI run `31908353273` passed Rust `95069542559`, web `95069542603`, supply-chain `95069542548`, and container `95069542574`.
+- This is framing-only evidence and its bounded tests, not a claim of process management, session establishment, or real MCP interoperability. M7 remains incomplete.
+- The sole remaining M7 gate is `BLOCKED_EXTERNAL`: an approved immutable/pinned independently implemented MCP stdio peer, with provenance, version, and content hash recorded and verified, plus a non-ignored CI real-peer test that performs `server/discover` and capability-authorized `tools/list`. Fixtures, mocks, loopback peers, and in-repository substitutes do not satisfy the gate.

@@ -4,20 +4,22 @@
 
 The exhaustive response-correlation matrix is accepted at
 `0724ebf8155229bc46e7320bf8745078e05baf48`. Its exact-SHA CI run
-`31906615609` passed Rust, web, supply-chain, and container. That evidence
-closes the response-schema matrix slice only; **M7 remains incomplete.**
+`31906615609` passed Rust, web, supply-chain, and container.
 
-**Decision: the smallest next production slice is caller-provided-pipe stdio
-JSON-RPC line framing.** It adds only a bounded transport over Tokio async
-pipes. It does not create a process, establish a session, or make an external
-interoperability claim.
+The caller-provided-pipe bounded stdio JSON-RPC framing slice is accepted at
+`4c2bff3796ec7ac15b86a167d49828a1eb556b98`. Exact-SHA CI run
+`31908353273` passed Rust `95069542559`, web `95069542603`,
+supply-chain `95069542548`, and container `95069542574`. This accepts only
+bounded stdio framing over caller-provided Tokio async pipes and its tests; it
+does not create a process, establish a session, or prove real MCP
+interoperability. **M7 remains incomplete.**
 
-The real-peer CI gate remains `BLOCKED_EXTERNAL`. Before this gate can close,
-CI must run a non-ignored integration test against a pinned, independent MCP
-stdio peer that supports protocol version `2026-07-28`, `server/discover`, and
-capability-backed `tools/list`. The test's peer provenance, version, and
-content hash must be recorded and verified. A fixture, mock, loopback peer, or
-in-repository substitute does not satisfy this requirement.
+The sole remaining M7 gate is `BLOCKED_EXTERNAL`. It requires an approved,
+immutable/pinned, independently implemented MCP stdio peer with recorded and
+verified provenance, version, and content hash. Non-ignored CI must run a
+real-peer integration test that performs `server/discover` and a
+capability-authorized `tools/list` against that peer. A fixture, mock,
+loopback peer, or in-repository substitute does not satisfy this requirement.
 
 ## Goal
 
