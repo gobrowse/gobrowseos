@@ -1054,8 +1054,8 @@ async fn deployed_schema_v3_upgrades_to_v15() {
             .is_err()
     );
     let other_profile = Uuid::now_v7();
+    let other_user_id = Uuid::now_v7();
     let same_profile_workspace = Uuid::now_v7();
-    let other_workspace = Uuid::now_v7();
     let cross_source = Uuid::now_v7();
     let wrong_source = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'v3-other-profile')")
@@ -1063,26 +1063,36 @@ async fn deployed_schema_v3_upgrades_to_v15() {
         .execute(&mut connection)
         .await
         .expect("other profile");
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'v3 same-profile workspace'),($3,$4,'v3 other workspace')")
+    sqlx::query(
+        "INSERT INTO users (id,email,display_name,password_hash,role,primary_profile_id) \
+         VALUES ($1,$2,'Other Owner','unused','OWNER',$3)",
+    )
+    .bind(other_user_id)
+    .bind(format!("{other_user_id}@example.test"))
+    .bind(other_profile)
+    .execute(&mut connection)
+    .await
+    .expect("other profile owner");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title,created_by_user_id) VALUES ($1,$2,'v3 same-profile workspace',$3)")
         .bind(same_profile_workspace)
         .bind(profile_id)
-        .bind(other_workspace)
-        .bind(other_profile)
+        .bind(user_id)
         .execute(&mut connection)
         .await
-        .expect("other workspace");
-    sqlx::query("INSERT INTO conversations (id,profile_id,title) VALUES ($1,$2,'cross source')")
+        .expect("same-profile workspace");
+    sqlx::query("INSERT INTO conversations (id,profile_id,created_by_user_id,title) VALUES ($1,$2,$3,'cross source')")
         .bind(cross_source)
         .bind(other_profile)
+        .bind(other_user_id)
         .execute(&mut connection)
         .await
         .expect("cross source");
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'wrong source')").bind(wrong_source).bind(profile_id).bind(same_profile_workspace).execute(&mut connection).await.expect("wrong source");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,created_by_user_id,title) VALUES ($1,$2,$3,$4,'wrong source')").bind(wrong_source).bind(profile_id).bind(same_profile_workspace).bind(user_id).execute(&mut connection).await.expect("wrong source");
     let post_valid = Uuid::now_v7();
     let post_deleted = Uuid::now_v7();
     let post_cross = Uuid::now_v7();
     let post_wrong = Uuid::now_v7();
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title,status) VALUES ($1,$2,$3,'post valid','active'),($4,$2,NULL,'post deleted','deleted'),($5,$6,NULL,'post cross','active'),($7,$2,$8,'post wrong','active')").bind(post_valid).bind(profile_id).bind(workspace_id).bind(post_deleted).bind(post_cross).bind(other_profile).bind(post_wrong).bind(same_profile_workspace).execute(&mut connection).await.expect("post upgrade source fixtures");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,created_by_user_id,title,status) VALUES ($1,$2,$3,$4,'post valid','active'),($5,$2,NULL,$4,'post deleted','deleted'),($6,$7,NULL,$8,'post cross','active'),($9,$2,$10,$4,'post wrong','active')").bind(post_valid).bind(profile_id).bind(workspace_id).bind(user_id).bind(post_deleted).bind(post_cross).bind(other_profile).bind(other_user_id).bind(post_wrong).bind(same_profile_workspace).execute(&mut connection).await.expect("post upgrade source fixtures");
     let post_missing = Uuid::now_v7();
     let mut post_revision = 2_i64;
     for ids in [
