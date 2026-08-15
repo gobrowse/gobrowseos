@@ -623,6 +623,9 @@ async fn authorize_scope(
     if access.is_none() {
         return Err(AppError::NotFound);
     }
+    if privileged {
+        return Err(AppError::Forbidden);
+    }
     if write && user.role == "VIEWER" {
         return Err(AppError::Forbidden);
     }

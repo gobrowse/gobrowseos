@@ -114,19 +114,20 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     }
     let other_profile = Uuid::now_v7();
     let workspace = Uuid::now_v7();
+    let same_profile_workspace = Uuid::now_v7();
     let other_workspace = Uuid::now_v7();
     sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'skills-v14-other')")
         .bind(other_profile)
         .execute(&mut connection)
         .await
         .expect("other profile");
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'same workspace'),($3,$4,'other workspace')").bind(workspace).bind(profile_id).bind(other_workspace).bind(other_profile).execute(&mut connection).await.expect("workspaces");
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'same workspace'),($3,$2,'same profile other workspace'),($4,$5,'other workspace')").bind(workspace).bind(profile_id).bind(same_profile_workspace).bind(other_workspace).bind(other_profile).execute(&mut connection).await.expect("workspaces");
     let source = Uuid::now_v7();
     let wrong_source = Uuid::now_v7();
     let deleted_source = Uuid::now_v7();
     let cross_source = Uuid::now_v7();
     let missing_source = Uuid::now_v7();
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'source'),($4,$2,$5,'wrong'),($6,$2,NULL,'deleted'),($7,$8,NULL,'cross')").bind(source).bind(profile_id).bind(workspace).bind(wrong_source).bind(other_workspace).bind(deleted_source).bind(cross_source).bind(other_profile).execute(&mut connection).await.expect("source fixtures");
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'source'),($4,$2,$5,'wrong'),($6,$2,NULL,'deleted'),($7,$8,NULL,'cross')").bind(source).bind(profile_id).bind(workspace).bind(wrong_source).bind(same_profile_workspace).bind(deleted_source).bind(cross_source).bind(other_profile).execute(&mut connection).await.expect("source fixtures");
     sqlx::query("UPDATE conversations SET status='deleted' WHERE id=$1")
         .bind(deleted_source)
         .execute(&mut connection)
@@ -147,6 +148,23 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
     let inaccessible_revision = Uuid::now_v7();
     sqlx::query("INSERT INTO skills (id,profile_id,name,description) VALUES ($1,$2,'inaccessible-source','')").bind(inaccessible_skill).bind(profile_id).execute(&mut connection).await.expect("inaccessible skill");
     sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3)").bind(inaccessible_revision).bind(inaccessible_skill).bind(vec![missing_source,cross_source]).execute(&mut connection).await.expect("inaccessible sources");
+    let missing_skill = Uuid::now_v7();
+    let missing_revision = Uuid::now_v7();
+    let cross_skill = Uuid::now_v7();
+    let cross_revision = Uuid::now_v7();
+    let deleted_skill = Uuid::now_v7();
+    let deleted_revision = Uuid::now_v7();
+    let wrong_skill = Uuid::now_v7();
+    let wrong_revision = Uuid::now_v7();
+    for (sid, name, wid) in [
+        (missing_skill, "missing-source", None),
+        (cross_skill, "cross-source", None),
+        (deleted_skill, "deleted-source", None),
+        (wrong_skill, "wrong-workspace-source", Some(workspace)),
+    ] {
+        sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,$4,'')").bind(sid).bind(profile_id).bind(wid).bind(name).execute(&mut connection).await.expect("independent source skill");
+    }
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'x','x','x',$3),($4,$5,1,'x','x','x',$6),($7,$8,1,'x','x','x',$9),($10,$11,1,'x','x','x',$12)").bind(missing_revision).bind(missing_skill).bind(vec![missing_source]).bind(cross_revision).bind(cross_skill).bind(vec![cross_source]).bind(deleted_revision).bind(deleted_skill).bind(vec![deleted_source]).bind(wrong_revision).bind(wrong_skill).bind(vec![wrong_source]).execute(&mut connection).await.expect("independent source revisions");
     let workspace_skill = Uuid::now_v7();
     let workspace_revision = Uuid::now_v7();
     sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'workspace-source','')").bind(workspace_skill).bind(profile_id).bind(workspace).execute(&mut connection).await.expect("workspace skill");
@@ -259,6 +277,16 @@ async fn schema_v14_to_v15_repairs_skill_lifecycle_state() {
         vec![source, wrong_source, deleted_source]
     );
     assert_eq!(workspace_repaired, vec![source]);
+    for (id, original) in [
+        (missing_revision, vec![missing_source]),
+        (cross_revision, vec![cross_source]),
+        (deleted_revision, vec![deleted_source]),
+        (wrong_revision, vec![wrong_source]),
+    ] {
+        let (before,after):(Vec<Uuid>,Vec<Uuid>)=sqlx::query_as("SELECT original_source_conversation_ids,repaired_source_conversation_ids FROM skill_revision_integrity_quarantine WHERE revision_id=$1").bind(id).fetch_one(&mut connection).await.expect("independent source quarantine");
+        assert_eq!(before, original);
+        assert!(after.is_empty());
+    }
     let repaired_oversized: Vec<Uuid> =
         sqlx::query_scalar("SELECT source_conversation_ids FROM skill_revisions WHERE id=$1")
             .bind(oversized_revision)
@@ -985,6 +1013,7 @@ async fn deployed_schema_v3_upgrades_to_v15() {
             .is_err()
     );
     let other_profile = Uuid::now_v7();
+    let same_profile_workspace = Uuid::now_v7();
     let other_workspace = Uuid::now_v7();
     let cross_source = Uuid::now_v7();
     let wrong_source = Uuid::now_v7();
@@ -993,7 +1022,9 @@ async fn deployed_schema_v3_upgrades_to_v15() {
         .execute(&mut connection)
         .await
         .expect("other profile");
-    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'v3 other workspace')")
+    sqlx::query("INSERT INTO workspaces (id,profile_id,title) VALUES ($1,$2,'v3 same-profile workspace'),($3,$4,'v3 other workspace')")
+        .bind(same_profile_workspace)
+        .bind(profile_id)
         .bind(other_workspace)
         .bind(other_profile)
         .execute(&mut connection)
@@ -1005,11 +1036,26 @@ async fn deployed_schema_v3_upgrades_to_v15() {
         .execute(&mut connection)
         .await
         .expect("cross source");
-    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'wrong source')").bind(wrong_source).bind(profile_id).bind(other_workspace).execute(&mut connection).await.expect("wrong source");
-    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,2,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(vec![cross_source]).execute(&mut connection).await.is_err());
+    sqlx::query("INSERT INTO conversations (id,profile_id,workspace_id,title) VALUES ($1,$2,$3,'wrong source')").bind(wrong_source).bind(profile_id).bind(same_profile_workspace).execute(&mut connection).await.expect("wrong source");
+    let post_deleted = Uuid::now_v7();
+    let post_cross = Uuid::now_v7();
+    let post_wrong = Uuid::now_v7();
+    sqlx::query("INSERT INTO conversations (id,profile_id,title,status) VALUES ($1,$2,'post deleted','deleted'),($3,$4,'post cross','active'),($5,$2,'post wrong','active')").bind(post_deleted).bind(profile_id).bind(post_cross).bind(other_profile).bind(post_wrong).bind(same_profile_workspace).execute(&mut connection).await.expect("post upgrade source fixtures");
+    let post_missing = Uuid::now_v7();
+    let mut post_revision = 2_i64;
+    for ids in [
+        vec![Uuid::nil()],
+        vec![post_missing],
+        vec![post_deleted],
+        vec![post_cross],
+    ] {
+        assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,$3,'bad','owner','bad',$4)").bind(Uuid::now_v7()).bind(skill_id).bind(post_revision).bind(ids).execute(&mut connection).await.is_err());
+        post_revision += 1;
+    }
+
     let workspace_skill = Uuid::now_v7();
     sqlx::query("INSERT INTO skills (id,profile_id,workspace_id,name,description) VALUES ($1,$2,$3,'v3-scoped','')").bind(workspace_skill).bind(profile_id).bind(workspace_id).execute(&mut connection).await.expect("v3 scoped skill");
-    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(workspace_skill).bind(vec![wrong_source]).execute(&mut connection).await.is_err());
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,1,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(workspace_skill).bind(vec![post_wrong]).execute(&mut connection).await.is_err());
     assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,2,'bad','owner','bad',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(vec![Uuid::nil()]).execute(&mut connection).await.is_err());
     let mut divergence = connection.begin().await.expect("begin divergence");
     sqlx::query("UPDATE skill_revisions SET promoted=true WHERE id=$1")

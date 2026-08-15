@@ -30,8 +30,9 @@ OWNER/ADMIN. Workspace membership is checked before mutation privilege: a
 same-profile nonmember is indistinguishable from a nonexistent or foreign
 workspace Skill and receives 404; only a visible member with insufficient access
 (including global MEMBER with workspace VIEWER access) receives 403. Workspace
-membership continues to govern workspace access; only
-profile OWNER/ADMIN may promote or roll back. Evaluation responses serialize
+membership continues to govern workspace access: OWNER/EDITOR membership
+permits revision/evaluation writes only. Profile OWNER/ADMIN alone may promote
+or roll back, even for a workspace OWNER/EDITOR member. Evaluation responses serialize
 persisted promotion state rather than merely whether this request auto-promoted.
 Race tests synchronize on observable PostgreSQL lock waits under bounded timeouts
 and assert final state plus attributable audit rows; scheduler timing is not

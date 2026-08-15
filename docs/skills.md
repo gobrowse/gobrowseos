@@ -13,8 +13,10 @@ revise or evaluate; profile `OWNER`/`ADMIN` can promote or roll back. Workspace
 membership is resolved before mutation privilege: nonexistent, foreign-profile,
 and same-profile nonmember resources all return `404`, while a visible member
 (including global `MEMBER` with workspace `VIEWER` access) without sufficient
-write privilege receives `403`. Resources outside the
-authenticated profile are deliberately reported as not found. Evaluation
+write privilege receives `403`. Workspace `OWNER` or `EDITOR` membership
+grants revision/evaluation writes only; promote and rollback remain profile
+`OWNER`/`ADMIN` operations. Resources outside the authenticated profile are
+deliberately reported as not found. Evaluation
 responses report the revision's persisted `promoted` state, including a revision
 that was promoted before its evidence was recorded. Concurrent lifecycle
 operations serialize on profile/workspace, membership, Skill, and source locks;

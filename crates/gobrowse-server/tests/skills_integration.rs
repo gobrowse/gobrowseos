@@ -442,28 +442,42 @@ async fn wait_for_lock_waiters(pool: &PgPool, query_prefix: &str, minimum: i64) 
     }).await.expect("lock waiter timeout");
 }
 
-async fn skill_side_effect_counts(pool: &PgPool, skill_id: Uuid) -> (i64, i64, i64) {
-    let revisions: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM skill_revisions WHERE skill_id=$1")
+async fn skill_side_effect_counts(
+    pool: &PgPool,
+    skill_id: Uuid,
+) -> (Vec<Uuid>, Vec<Uuid>, Option<i64>, Vec<i64>) {
+    let revisions: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM skill_revisions WHERE skill_id=$1 ORDER BY revision")
             .bind(skill_id)
-            .fetch_one(pool)
+            .fetch_all(pool)
             .await
-            .expect("revision count");
-    let evaluated: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM skill_revisions WHERE skill_id=$1 AND evaluation IS NOT NULL",
+            .expect("revision IDs");
+    let evaluated: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM skill_revisions WHERE skill_id=$1 AND evaluation IS NOT NULL ORDER BY revision").bind(skill_id).fetch_all(pool).await.expect("evaluated IDs");
+    let active: Option<i64> = sqlx::query_scalar("SELECT active_revision FROM skills WHERE id=$1")
+        .bind(skill_id)
+        .fetch_one(pool)
+        .await
+        .expect("active revision");
+    let promoted: Vec<i64> = sqlx::query_scalar(
+        "SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted ORDER BY revision",
     )
     .bind(skill_id)
-    .fetch_one(pool)
+    .fetch_all(pool)
     .await
-    .expect("evaluation count");
-    let audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM audit_events WHERE resource_id=$1 AND outcome='success'",
-    )
-    .bind(skill_id.to_string())
-    .fetch_one(pool)
-    .await
-    .expect("audit count");
-    (revisions, evaluated, audits)
+    .expect("promoted revisions");
+    (revisions, evaluated, active, promoted)
+}
+
+async fn audit_count(
+    pool: &PgPool,
+    actor: Uuid,
+    profile: Uuid,
+    action: &str,
+    resource_type: &str,
+    resource_id: Option<&str>,
+) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action=$3 AND resource_type=$4 AND ($5::text IS NULL OR resource_id=$5) AND outcome='success'")
+        .bind(actor).bind(profile).bind(action).bind(resource_type).bind(resource_id).fetch_one(pool).await.expect("audit count")
 }
 
 #[tokio::test]
@@ -590,6 +604,106 @@ async fn workspace_skill_roles_and_tenants_are_enforced() {
 }
 
 #[tokio::test]
+async fn workspace_skill_promotion_and_rollback_require_profile_admin() {
+    let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&url).await;
+    let pool = test_pool().await.expect("pool");
+    let profile_id = profile(&pool, "privileged-workspace").await;
+    let (owner, owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
+    let (_admin, admin_cookie) = create_session(&pool, profile_id, "ADMIN").await;
+    let (workspace_owner, workspace_owner_cookie) =
+        create_session(&pool, profile_id, "MEMBER").await;
+    let (editor, editor_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let workspace = insert_workspace(&pool, profile_id, owner).await;
+    sqlx::query("INSERT INTO workspace_memberships (workspace_id,user_id,access) VALUES ($1,$2,'OWNER'),($1,$3,'EDITOR')").bind(workspace).bind(workspace_owner).bind(editor).execute(&pool).await.expect("membership");
+    let (skill_id, _) =
+        insert_skill_fixture(&pool, profile_id, Some(workspace), "privileged", "manual").await;
+    sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason) VALUES ($1,$2,2,'v2','fixture','v2')").bind(Uuid::now_v7()).bind(skill_id).execute(&pool).await.expect("revision 2");
+    let mut tx = pool.begin().await.expect("promotion fixture");
+    sqlx::query("UPDATE skill_revisions SET promoted=true WHERE skill_id=$1 AND revision=1")
+        .bind(skill_id)
+        .execute(&mut *tx)
+        .await
+        .expect("promote 1");
+    sqlx::query("UPDATE skills SET active_revision=1 WHERE id=$1")
+        .bind(skill_id)
+        .execute(&mut *tx)
+        .await
+        .expect("active 1");
+    tx.commit().await.expect("promotion fixture commit");
+    let app = router(
+        AppState::new(pool.clone(), test_settings(&url))
+            .await
+            .expect("state"),
+    );
+    let before = skill_side_effect_counts(&pool, skill_id).await;
+    for (actor, cookie) in [
+        (workspace_owner, &workspace_owner_cookie),
+        (editor, &editor_cookie),
+    ] {
+        for (path, body) in [
+            (
+                format!("/api/v1/skills/{skill_id}/revisions/2/promote"),
+                json!({"reason":"x"}),
+            ),
+            (
+                format!("/api/v1/skills/{skill_id}/rollback"),
+                json!({"target_revision":1,"reason":"x"}),
+            ),
+        ] {
+            let (status, _) = request_json(&app, Method::POST, &path, cookie, Some(body)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
+        assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.promoted",
+                "skill_revision",
+                Some(&format!("{skill_id}:2"))
+            )
+            .await,
+            0
+        );
+        assert_eq!(
+            audit_count(
+                &pool,
+                actor,
+                profile_id,
+                "skill.rolled_back",
+                "skill",
+                Some(&skill_id.to_string())
+            )
+            .await,
+            0
+        );
+    }
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/revisions/2/promote"),
+        &owner_cookie,
+        Some(json!({"reason":"owner"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = request_json(
+        &app,
+        Method::POST,
+        &format!("/api/v1/skills/{skill_id}/rollback"),
+        &admin_cookie,
+        Some(json!({"target_revision":1,"reason":"admin"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn workspace_member_with_viewer_access_receives_forbidden_on_mutation() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL unset; skipping");
@@ -666,8 +780,8 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "workspace-nonmember-test").await;
     let (owner, _owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
-    let (_member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
-    let (_viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
+    let (member, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
+    let (viewer, viewer_cookie) = create_session(&pool, profile_id, "VIEWER").await;
     let workspace = insert_workspace(&pool, profile_id, owner).await;
     let (skill_id, _) = insert_skill_fixture(
         &pool,
@@ -688,6 +802,24 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
             .expect("state"),
     );
     let before = skill_side_effect_counts(&pool, skill_id).await;
+    let before_member_audits = audit_count(
+        &pool,
+        member,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
+    let before_viewer_audits = audit_count(
+        &pool,
+        viewer,
+        profile_id,
+        "skill.revision_created",
+        "skill_revision",
+        None,
+    )
+    .await;
     for cookie in [&member_cookie, &viewer_cookie] {
         for target in [skill_id, missing_skill, foreign_skill] {
             for (method, path, body) in [
@@ -735,6 +867,30 @@ async fn workspace_skill_nonmembers_receive_not_found_without_side_effects() {
     assert_eq!(foreign_status, StatusCode::OK);
     assert!(foreign_response.is_array());
     assert_eq!(skill_side_effect_counts(&pool, skill_id).await, before);
+    assert_eq!(
+        audit_count(
+            &pool,
+            member,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            None
+        )
+        .await,
+        before_member_audits
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            viewer,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            None
+        )
+        .await,
+        before_viewer_audits
+    );
 }
 
 #[tokio::test]
@@ -907,7 +1063,7 @@ async fn duplicate_and_inaccessible_skill_sources_return_validation() {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     }
-    assert_eq!(skill_side_effect_counts(&pool, skill_id).await.0, 1);
+    assert_eq!(skill_side_effect_counts(&pool, skill_id).await.0.len(), 1);
     let after_audits: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.revision_created' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("audit final");
     assert_eq!(after_audits, before_audits);
 }
@@ -941,6 +1097,10 @@ async fn automatic_promotion_requires_recorded_non_regression() {
     .await;
     assert_eq!(status, StatusCode::OK, "{response}");
     assert_eq!(response["promoted"], true);
+    let baseline_id = response["id"]
+        .as_str()
+        .expect("baseline revision ID")
+        .to_owned();
     let cases = [
         json!({"deterministic_checks_passed":true,"attempts":0,"successful_attempts":0,"steps":1,"retries":0,"errors":1,"duration_ms":1,"user_corrections":0}),
         json!({"deterministic_checks_passed":false,"attempts":10,"successful_attempts":10,"steps":1,"retries":0,"errors":0,"duration_ms":1,"user_corrections":0}),
@@ -963,13 +1123,48 @@ async fn automatic_promotion_requires_recorded_non_regression() {
         .await;
         assert_eq!(status, StatusCode::OK, "{response}");
         assert_eq!(response["promoted"], offset == 5);
+        let revision_id = response["id"].as_str().expect("evaluation revision ID");
+        assert_eq!(
+            audit_count(
+                &pool,
+                owner,
+                profile_id,
+                "skill.evaluated",
+                "skill_revision",
+                Some(revision_id)
+            )
+            .await,
+            1
+        );
+        let expected = if offset == 5 { 7 } else { 1 };
+        let persisted: i64 = sqlx::query_scalar("SELECT active_revision FROM skills WHERE id=$1")
+            .bind(skill_id)
+            .fetch_one(&pool)
+            .await
+            .expect("case active");
+        let persisted_promoted: i64 = sqlx::query_scalar(
+            "SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted",
+        )
+        .bind(skill_id)
+        .fetch_one(&pool)
+        .await
+        .expect("case promoted");
+        assert_eq!((persisted, persisted_promoted), (expected, expected));
     }
     let state:(i64,i64)=sqlx::query_as("SELECT active_revision,(SELECT revision FROM skill_revisions WHERE skill_id=$1 AND promoted)").bind(skill_id).fetch_one(&pool).await.expect("promotion state");
-    assert_eq!(state, (6, 6));
+    assert_eq!(state, (7, 7));
     let eval_audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.evaluated' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("evaluation audits");
     assert_eq!(eval_audits, 7);
-    let auto_audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND action='skill.automatically_promoted' AND outcome='success'").bind(owner).fetch_one(&pool).await.expect("automatic audits");
-    assert_eq!(auto_audits, 2);
+    let auto_resources:Vec<String>=sqlx::query_scalar("SELECT resource_id FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.automatically_promoted' AND resource_type='skill_revision' AND outcome='success' ORDER BY id").bind(owner).bind(profile_id).fetch_all(&pool).await.expect("automatic resources");
+    assert_eq!(auto_resources.len(), 2);
+    assert!(auto_resources.contains(&baseline_id));
+    let qualifying_id: String =
+        sqlx::query_scalar("SELECT id::text FROM skill_revisions WHERE skill_id=$1 AND revision=7")
+            .bind(skill_id)
+            .fetch_one(&pool)
+            .await
+            .expect("qualifying ID");
+    assert!(auto_resources.contains(&qualifying_id));
 }
 
 #[tokio::test]
@@ -1026,15 +1221,20 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
     .await;
     let wrong_workspace = insert_workspace(
         &pool,
-        source_profile,
-        create_session(&pool, source_profile, "OWNER").await.0,
+        profile_id,
+        sqlx::query_scalar("SELECT id FROM users WHERE primary_profile_id=$1 LIMIT 1")
+            .bind(profile_id)
+            .fetch_one(&pool)
+            .await
+            .expect("owner"),
     )
     .await;
+    let wrong_conversation = Uuid::now_v7();
     let scoped_skill =
         insert_skill_fixture(&pool, profile_id, Some(workspace), "raw-scoped", "manual")
             .await
             .0;
-    sqlx::query("INSERT INTO conversations (id,profile_id,title,status) VALUES ($1,$2,'deleted','deleted'),($3,$4,'cross','active')").bind(deleted).bind(profile_id).bind(cross).bind(source_profile).execute(&pool).await.expect("raw source rows");
+    sqlx::query("INSERT INTO conversations (id,profile_id,title,status) VALUES ($1,$2,'deleted','deleted'),($3,$4,'cross','active'),($5,$2,'wrong workspace','active')").bind(deleted).bind(profile_id).bind(cross).bind(source_profile).bind(wrong_conversation).bind(wrong_workspace).execute(&pool).await.expect("raw source rows");
     let missing = Uuid::now_v7();
     for ids in [
         vec![Uuid::nil()],
@@ -1045,8 +1245,7 @@ async fn skill_database_enforces_evaluation_source_and_promotion_invariants() {
     ] {
         assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(skill_id).bind(ids).execute(&pool).await.is_err());
     }
-    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_workspace]).execute(&pool).await.is_err());
-    let _ = wrong_workspace;
+    assert!(sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,source_conversation_ids) VALUES ($1,$2,99,'bad','x','x',$3)").bind(Uuid::now_v7()).bind(scoped_skill).bind(vec![wrong_conversation]).execute(&pool).await.is_err());
     assert!(
         sqlx::query("UPDATE skill_revisions SET source_conversation_ids=$1 WHERE id=$2")
             .bind(vec![Uuid::nil()])
@@ -1196,6 +1395,32 @@ async fn concurrent_revision_fixture() {
     .expect("race timeout");
     assert_eq!(one.0, StatusCode::CREATED);
     assert_eq!(two.0, StatusCode::CREATED);
+    let one_revision = one.1["id"].as_str().expect("first revision ID");
+    let two_revision = two.1["id"].as_str().expect("second revision ID");
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            Some(one_revision)
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            Some(two_revision)
+        )
+        .await,
+        1
+    );
     let revisions: Vec<i64> = sqlx::query_scalar(
         "SELECT revision FROM skill_revisions WHERE skill_id=$1 ORDER BY revision",
     )
@@ -1215,7 +1440,7 @@ async fn concurrent_evaluation_fixture() {
     let pool = test_pool().await.expect("pool");
     let profile_id = profile(&pool, "evaluation-race").await;
     let (owner, cookie) = create_session(&pool, profile_id, "OWNER").await;
-    let (skill_id, _) =
+    let (skill_id, revision_id) =
         insert_skill_fixture(&pool, profile_id, None, "evaluation-race", "manual").await;
     let app = router(
         AppState::new(pool.clone(), test_settings(&url))
@@ -1267,6 +1492,19 @@ async fn concurrent_evaluation_fixture() {
     let statuses = [one.0, two.0];
     assert!(statuses.contains(&StatusCode::OK));
     assert!(statuses.contains(&StatusCode::CONFLICT));
+    let revision_id_text = revision_id.to_string();
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.evaluated",
+            "skill_revision",
+            Some(&revision_id_text)
+        )
+        .await,
+        1
+    );
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM skill_revisions WHERE skill_id=$1 AND evaluation IS NOT NULL",
     )
@@ -1344,8 +1582,30 @@ async fn concurrent_promotion_fixture() {
         row.get::<i64, _>("active_revision"),
         row.get::<i64, _>("promoted_revision")
     );
-    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.promoted' AND outcome='success'").bind(owner).bind(profile_id).fetch_one(&pool).await.expect("promotion audits");
-    assert_eq!(audits, 2);
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&format!("{skill_id}:1"))
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.promoted",
+            "skill_revision",
+            Some(&format!("{skill_id}:2"))
+        )
+        .await,
+        1
+    );
 }
 async fn concurrent_source_delete_fixture() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
@@ -1403,8 +1663,18 @@ async fn concurrent_source_delete_fixture() {
             .expect("revisions"),
         1
     );
-    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.revision_created' AND outcome='success'").bind(owner).bind(profile_id).fetch_one(&pool).await.expect("source audits");
-    assert_eq!(audits, 0);
+    assert_eq!(
+        audit_count(
+            &pool,
+            owner,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            None
+        )
+        .await,
+        0
+    );
 }
 async fn concurrent_revocation_fixture() {
     let Some(url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
@@ -1473,6 +1743,16 @@ async fn concurrent_revocation_fixture() {
             .expect("revisions"),
         1
     );
-    let audits:i64=sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1 AND profile_id=$2 AND action='skill.revision_created' AND outcome='success'").bind(editor).bind(profile_id).fetch_one(&pool).await.expect("revocation audits");
-    assert_eq!(audits, 0);
+    assert_eq!(
+        audit_count(
+            &pool,
+            editor,
+            profile_id,
+            "skill.revision_created",
+            "skill_revision",
+            None
+        )
+        .await,
+        0
+    );
 }
