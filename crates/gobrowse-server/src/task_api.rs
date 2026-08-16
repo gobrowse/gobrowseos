@@ -124,8 +124,6 @@ pub async fn create_task(
     Json(input): Json<CreateTaskRequest>,
 ) -> Result<(StatusCode, Json<TaskResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
-    require_writer(&user)?;
-    validate_task_input(&input.title, &input.description, &input.dependencies)?;
     let task_state = input.state.unwrap_or(TaskState::Backlog);
     let id = Uuid::now_v7();
     let now = OffsetDateTime::now_utc();
@@ -134,6 +132,8 @@ pub async fn create_task(
     // revocation takes the membership row lock, so the decision is serialized
     // with the commit of this write transaction.
     authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
+    require_writer(&user)?;
+    validate_task_input(&input.title, &input.description, &input.dependencies)?;
     validate_task_references_in_transaction(
         &mut tx,
         workspace_id,
@@ -223,9 +223,9 @@ pub async fn update_task(
     Json(input): Json<UpdateTaskRequest>,
 ) -> Result<Json<TaskResponse>, AppError> {
     let user = require_user(&state, &headers).await?;
-    require_writer(&user)?;
     let mut tx = state.pool.begin().await?;
     let row = authorized_task_in_transaction(&mut tx, &user, id, true).await?;
+    require_writer(&user)?;
     let workspace_id: Uuid = row.get("workspace_id");
     let old_state_name: String = row.get("state");
     let old_state = parse_task_state(&old_state_name)?;
@@ -351,6 +351,8 @@ pub async fn create_activity(
     Json(input): Json<CreateActivityRequest>,
 ) -> Result<(StatusCode, Json<ActivityResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
     require_writer(&user)?;
     validate_activity(&input.kind, &input.payload)?;
     if input.agent_id.is_some() {
@@ -358,8 +360,6 @@ pub async fn create_activity(
             "human notes cannot attribute activity to an agent".into(),
         ));
     }
-    let mut tx = state.pool.begin().await?;
-    authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
     validate_task_references_in_transaction(&mut tx, workspace_id, input.task_id, None, &[])
         .await?;
     let event = append_activity(
@@ -495,22 +495,39 @@ pub(crate) async fn authorize_workspace(
     workspace_id: Uuid,
     require_write: bool,
 ) -> Result<(), AppError> {
-    let authorized: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM workspaces workspace WHERE workspace.id=$1 AND workspace.profile_id=$2 AND \
-         ($4 IN ('OWNER','ADMIN') OR EXISTS(SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=$1 AND member.user_id=$3 \
-         AND (NOT $5::boolean OR member.access IN ('OWNER','EDITOR')))))",
-    )
-    .bind(workspace_id)
-    .bind(user.profile_id)
-    .bind(user.id)
-    .bind(&user.role)
-    .bind(require_write)
-    .fetch_one(&state.pool)
-    .await?;
-    if !authorized {
+    let exists: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id=$1 AND profile_id=$2)")
+            .bind(workspace_id)
+            .bind(user.profile_id)
+            .fetch_one(&state.pool)
+            .await?;
+    if !exists {
         return Err(AppError::NotFound);
     }
-    Ok(())
+    if matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Ok(());
+    }
+    let access: Option<String> = sqlx::query_scalar(
+        "SELECT access FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2",
+    )
+    .bind(workspace_id)
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await?;
+    if access.is_none() {
+        return Err(AppError::NotFound);
+    }
+    if !require_write {
+        return Ok(());
+    }
+    if user.role == "VIEWER" || access.as_deref() == Some("VIEWER") {
+        return Err(AppError::Forbidden);
+    }
+    if matches!(access.as_deref(), Some("OWNER" | "EDITOR")) {
+        Ok(())
+    } else {
+        Err(AppError::NotFound)
+    }
 }
 
 /// Authorize a write while holding the workspace advisory lock.  The
@@ -533,7 +550,7 @@ pub(crate) async fn authorize_workspace_in_transaction(
     if workspace.is_none() {
         return Err(AppError::NotFound);
     }
-    if !require_write || matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+    if matches!(user.role.as_str(), "OWNER" | "ADMIN") {
         return Ok(());
     }
     let access: Option<String> = sqlx::query_scalar(
@@ -543,6 +560,15 @@ pub(crate) async fn authorize_workspace_in_transaction(
     .bind(user.id)
     .fetch_optional(&mut **tx)
     .await?;
+    if access.is_none() {
+        return Err(AppError::NotFound);
+    }
+    if !require_write {
+        return Ok(());
+    }
+    if user.role == "VIEWER" || access.as_deref() == Some("VIEWER") {
+        return Err(AppError::Forbidden);
+    }
     if matches!(access.as_deref(), Some("OWNER" | "EDITOR")) {
         Ok(())
     } else {

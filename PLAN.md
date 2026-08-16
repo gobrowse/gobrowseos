@@ -182,6 +182,12 @@ All reads require the existing authenticated profile/workspace-membership
 predicate. All mutations use `require_writer`. Within the transaction,
 reauthorize after acquiring the workspace guard; retain existing profile
 OWNER/ADMIN and workspace OWNER/EDITOR rules, and deny VIEWER mutation.
+Authorization must preserve tenant hiding: foreign-profile, nonexistent,
+absent-membership, and inaccessible-resource requests return `404`; only an
+authenticated principal whose profile-filtered workspace access is known and
+whose global role or explicit workspace membership is `VIEWER` returns
+`403` for a mutation. Denied mutations append no state, ledger, audit, or
+worktree side effects.
 
 Acquire locks in this order for every mutation:
 

@@ -88,11 +88,11 @@ pub async fn create_worktree(
     Json(input): Json<CreateWorktreeRequest>,
 ) -> Result<(StatusCode, Json<WorktreeResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
     require_writer(&user)?;
     validate_base_commit(&input.base_commit).map_err(validation)?;
     let root = std::path::Path::new(&input.repository_root);
-    let mut tx = state.pool.begin().await?;
-    authorize_workspace_in_transaction(&mut tx, &user, workspace_id, true).await?;
 
     let task: Option<(String, Uuid)> =
         sqlx::query_as("SELECT title,id FROM tasks WHERE workspace_id=$1 AND id=$2")
@@ -182,13 +182,13 @@ pub async fn update_worktree(
     Json(input): Json<UpdateWorktreeRequest>,
 ) -> Result<Json<WorktreeResponse>, AppError> {
     let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let row = authorized_worktree_in_transaction(&mut tx, &user, id, true).await?;
     require_writer(&user)?;
     if input.changed_files.is_empty() {
         return Err(validation("changed_files must not be empty"));
     }
     let changed_files = validate_changed_files(&input.changed_files).map_err(validation)?;
-    let mut tx = state.pool.begin().await?;
-    let row = authorized_worktree_in_transaction(&mut tx, &user, id, true).await?;
     let old_files: Vec<String> = row.get("changed_files");
     if old_files == changed_files {
         return Err(validation(
@@ -235,9 +235,9 @@ pub async fn delete_worktree(
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
-    require_writer(&user)?;
     let mut tx = state.pool.begin().await?;
     let row = authorized_worktree_in_transaction(&mut tx, &user, id, true).await?;
+    require_writer(&user)?;
     let workspace_id: Uuid = row.get("workspace_id");
     let task_id: Uuid = row.get("task_id");
     let branch: String = row.get("branch");

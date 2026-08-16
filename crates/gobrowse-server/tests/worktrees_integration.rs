@@ -355,6 +355,16 @@ async fn worktree_router_enforces_tenant_authorization_lifecycle_ledger_and_vali
     .await;
     assert_eq!(status, StatusCode::OK, "{fetched}");
     assert_eq!(fetched["id"], created["id"]);
+    let before_denied_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM worktrees WHERE workspace_id=$1), \
+         (SELECT count(*) FROM activity_events WHERE workspace_id=$1), \
+         (SELECT count(*) FROM audit_events WHERE profile_id=(SELECT profile_id FROM workspaces WHERE id=$1))",
+    )
+    .bind(fixture.workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count denied mutation side effects");
     let (status, viewer_write) = request_json(
         &app,
         Method::POST,
@@ -364,6 +374,20 @@ async fn worktree_router_enforces_tenant_authorization_lifecycle_ledger_and_vali
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{viewer_write}");
+    let after_denied_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM worktrees WHERE workspace_id=$1), \
+         (SELECT count(*) FROM activity_events WHERE workspace_id=$1), \
+         (SELECT count(*) FROM audit_events WHERE profile_id=(SELECT profile_id FROM workspaces WHERE id=$1))",
+    )
+    .bind(fixture.workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count denied mutation side effects");
+    assert_eq!(
+        after_denied_counts, before_denied_counts,
+        "viewer denial must not change worktree, ledger, or audit state"
+    );
     let (status, foreign_list) = request_json(
         &app,
         Method::GET,
@@ -382,6 +406,49 @@ async fn worktree_router_enforces_tenant_authorization_lifecycle_ledger_and_vali
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{foreign_get}");
+    let before_hidden_counts = after_denied_counts;
+    let (status, foreign_write) = request_json(
+        &app,
+        Method::PATCH,
+        &format!("/api/v1/worktrees/{worktree_id}"),
+        &fixture.foreign_cookie,
+        Some(json!({"changed_files":["must-not-commit.rs"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{foreign_write}");
+    let (status, absent_write) = request_json(
+        &app,
+        Method::POST,
+        &collection,
+        &fixture.absent_cookie,
+        Some(payload.clone()),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{absent_write}");
+    let nonexistent_id = Uuid::now_v7();
+    let (status, nonexistent_write) = request_json(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/worktrees/{nonexistent_id}"),
+        &fixture.owner_cookie,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{nonexistent_write}");
+    let after_hidden_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT \
+         (SELECT count(*) FROM worktrees WHERE workspace_id=$1), \
+         (SELECT count(*) FROM activity_events WHERE workspace_id=$1), \
+         (SELECT count(*) FROM audit_events WHERE profile_id=(SELECT profile_id FROM workspaces WHERE id=$1))",
+    )
+    .bind(fixture.workspace_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count hidden mutation side effects");
+    assert_eq!(
+        after_hidden_counts, before_hidden_counts,
+        "hidden or nonexistent writes must not change worktree, ledger, or audit state"
+    );
 
     let (status, invalid) = request_json(
         &app,
@@ -665,6 +732,12 @@ async fn revoked_editor_cannot_commit_worktree_create_update_or_delete() {
     )
     .await
     .expect("seed mutable worktree");
+    let baseline_audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1")
+            .bind(fixture.editor_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count revoked editor audit baseline");
     let app = router(
         AppState::new(pool.clone(), test_settings(&database_url))
             .await
@@ -686,10 +759,10 @@ async fn revoked_editor_cannot_commit_worktree_create_update_or_delete() {
         })),
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         status,
-        StatusCode::CREATED,
-        "revoked editor created worktree"
+        StatusCode::NOT_FOUND,
+        "revoked editor create must be hidden"
     );
     let created_rows: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM worktrees WHERE workspace_id=$1 AND branch='agent/revocation-create'",
@@ -710,7 +783,11 @@ async fn revoked_editor_cannot_commit_worktree_create_update_or_delete() {
         Some(json!({"changed_files":["must-not-commit.rs"]})),
     )
     .await;
-    assert_ne!(status, StatusCode::OK, "revoked editor updated worktree");
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "revoked editor update must be hidden"
+    );
     let changed_files: Vec<String> =
         sqlx::query_scalar("SELECT changed_files FROM worktrees WHERE id=$1")
             .bind(existing_id)
@@ -729,10 +806,10 @@ async fn revoked_editor_cannot_commit_worktree_create_update_or_delete() {
         None,
     )
     .await;
-    assert_ne!(
+    assert_eq!(
         status,
-        StatusCode::NO_CONTENT,
-        "revoked editor deleted worktree"
+        StatusCode::NOT_FOUND,
+        "revoked editor delete must be hidden"
     );
     let remaining_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
         .bind(existing_id)
@@ -747,6 +824,16 @@ async fn revoked_editor_cannot_commit_worktree_create_update_or_delete() {
     .fetch_one(&pool)
     .await
     .expect("check revoked mutation ledger");
+    let final_audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE actor_user_id=$1")
+            .bind(fixture.editor_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count revoked editor audit evidence");
+    assert_eq!(
+        final_audits, baseline_audits,
+        "revoked writes must not append audit evidence"
+    );
     assert_eq!(evidence, 0, "revoked writes must not append activity");
 }
 
@@ -864,6 +951,7 @@ struct RouterFixture {
     editor_cookie: String,
     viewer_cookie: String,
     foreign_cookie: String,
+    absent_cookie: String,
 }
 
 async fn router_fixture(pool: &PgPool) -> RouterFixture {
@@ -876,6 +964,7 @@ async fn router_fixture(pool: &PgPool) -> RouterFixture {
     let (owner_id, owner_cookie) = create_session(pool, profile_id, "OWNER").await;
     let (editor_id, editor_cookie) = create_session(pool, profile_id, "MEMBER").await;
     let (viewer_id, viewer_cookie) = create_session(pool, profile_id, "MEMBER").await;
+    let (_absent_id, absent_cookie) = create_session(pool, profile_id, "MEMBER").await;
     let (_foreign_id, foreign_cookie) = create_foreign_session(pool).await;
     let workspace_id = Uuid::now_v7();
     sqlx::query(
@@ -927,6 +1016,7 @@ async fn router_fixture(pool: &PgPool) -> RouterFixture {
         editor_cookie,
         viewer_cookie,
         foreign_cookie,
+        absent_cookie,
     }
 }
 
