@@ -3,8 +3,8 @@ use std::{path::PathBuf, process::ExitCode};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use gobrowse_server::{
-    AppState, config::Settings, db, doctor, embedding, outbound_http::WebhookDeliveryDeps,
-    router, run_api, webhook_scheduler,
+    AppState, config::Settings, db, doctor, embedding, outbound_http::WebhookDeliveryDeps, router,
+    run_api, webhook_scheduler,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;

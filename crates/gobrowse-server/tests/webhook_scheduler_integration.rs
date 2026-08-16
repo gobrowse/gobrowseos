@@ -937,12 +937,12 @@ use axum::{
 };
 
 use gobrowse_server::{
+    AppState,
     outbound_http::{
-        OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture,
-        TransportResponse, ValidatedOutboundTarget, WebhookDeliveryDeps,
+        OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture, TransportResponse,
+        ValidatedOutboundTarget, WebhookDeliveryDeps,
     },
     webhooks::{self, hex_encode},
-    AppState,
 };
 
 /// Single-use key for the inbound tests so parallel runs don't collide.
@@ -971,13 +971,9 @@ async fn call_webhook(
     headers: HeaderMap,
     body: &[u8],
 ) -> axum::http::StatusCode {
-    let result = webhooks::receive_webhook(
-        State(state),
-        Path(id),
-        headers,
-        Bytes::from(body.to_vec()),
-    )
-    .await;
+    let result =
+        webhooks::receive_webhook(State(state), Path(id), headers, Bytes::from(body.to_vec()))
+            .await;
     match result {
         Ok(r) => r.into_response().status(),
         Err(e) => e.into_response().status(),
@@ -1135,7 +1131,10 @@ async fn inbound_missing_headers_rejected() {
 
     // Missing X-Gobrowse-Signature
     let mut headers_no_sig = HeaderMap::new();
-    headers_no_sig.insert("x-gobrowse-delivery", delivery_id.to_string().parse().unwrap());
+    headers_no_sig.insert(
+        "x-gobrowse-delivery",
+        delivery_id.to_string().parse().unwrap(),
+    );
     headers_no_sig.insert("x-gobrowse-timestamp", ts.to_string().parse().unwrap());
     let status_no_sig = call_webhook(state.clone(), webhook_id, headers_no_sig, body).await;
     assert_eq!(status_no_sig, 400, "missing signature header => 400");
@@ -1150,7 +1149,10 @@ async fn inbound_missing_headers_rejected() {
     // Missing X-Gobrowse-Timestamp
     let mut headers_no_ts = HeaderMap::new();
     headers_no_ts.insert("x-gobrowse-signature", sig.parse().unwrap());
-    headers_no_ts.insert("x-gobrowse-delivery", delivery_id.to_string().parse().unwrap());
+    headers_no_ts.insert(
+        "x-gobrowse-delivery",
+        delivery_id.to_string().parse().unwrap(),
+    );
     let status_no_ts = call_webhook(state.clone(), webhook_id, headers_no_ts, body).await;
     assert_eq!(status_no_ts, 400, "missing timestamp header => 400");
 
@@ -1484,10 +1486,7 @@ async fn scheduler_restart_does_not_double_process() {
     let reclaimed = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
         .await
         .expect("recover");
-    assert!(
-        reclaimed > 0,
-        "recovery must reclaim the crashed delivery"
-    );
+    assert!(reclaimed > 0, "recovery must reclaim the crashed delivery");
 
     let status_after_recovery: (String,) = sqlx::query_as(
         "SELECT status FROM webhook_deliveries \
