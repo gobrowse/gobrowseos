@@ -133,11 +133,49 @@ expect version 17. PostgreSQL tests retain the existing
 No Rust API, frontend, vault, doctor, OAuth, JWKS, PKCE, configuration,
 dependency, or sandbox behavior changes are part of M8B.
 
+## M8C implementation — vault-backed PKCE in mcp_auth_states
+
+**M8 remains `IN_PROGRESS`.** This bounded schema-18 slice converts the
+`pkce_verifier_encrypted bytea` column on `mcp_auth_states` to a vault-backed
+same-profile `pkce_verifier_secret_ref text` that references
+`secret_references(profile_id, id)`. No Rust API, vault, doctor, OAuth, config,
+frontend, or sandbox code changes.
+
+### Migration contract
+
+- One transactional `ACCESS EXCLUSIVE` lock over `mcp_auth_states` and
+  `secret_references`.
+- Zero-row guard: `RAISE EXCEPTION` if `mcp_auth_states` has any rows (the
+  table is dead schema with zero Rust/SQL writers).
+- Add `profile_id uuid NOT NULL`, backfilled from `mcp_servers.profile_id`.
+- Add `pkce_verifier_secret_ref text` (nullable).
+- Named composite FK `mcp_auth_states_pkce_verifier_same_profile_fk` on
+  `(profile_id, pkce_verifier_secret_ref)` → `secret_references(profile_id, id)`
+  with `ON DELETE SET NULL (pkce_verifier_secret_ref)`, `NOT VALID` then
+  `VALIDATE`.
+- Named FK `mcp_auth_states_profile_id_fkey` on `profile_id` →
+  `profiles(id)` `ON DELETE CASCADE`.
+- `DROP COLUMN pkce_verifier_encrypted`.
+- Record schema version 18 last.
+
+### Integration proof
+
+Covers: same-profile secret reference succeeds; cross-profile reference is
+rejected by the composite FK; secret deletion nulls `pkce_verifier_secret_ref`;
+profile deletion cascades to the auth state row; the zero-row guard aborts if a
+legacy row with `pkce_verifier_encrypted` is present.
+
+### No quarantine table
+
+The zero-row guard is authoritative — no quarantine table is needed because
+production must be empty.
+
 ## Remaining M8 blockers
 
-M8 still requires vault-backed PKCE state remodeling, the complete OAuth
-state/issuer/resource/audience/refresh contract, and real-provider/JWKS
-rotation and interoperability proof. M7 additionally remains blocked on the
-independently pinned real MCP stdio peer above. M4 remains blocked on the
-approved rootless Podman runner and immutable image prerequisites above. The
-M8A and M8B slices do not complete M8 or retire those external blockers.
+M8 still requires the complete OAuth state/issuer/resource/audience/refresh
+contract, real-provider/JWKS rotation and interoperability proof, and vault
+write-path integration for PKCE verifier lifecycle. M7 additionally remains
+blocked on the independently pinned real MCP stdio peer above. M4 remains
+blocked on the approved rootless Podman runner and immutable image
+prerequisites above. The M8A, M8B, and M8C slices do not complete M8 or retire
+those external blockers.

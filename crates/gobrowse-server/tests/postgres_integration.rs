@@ -39,12 +39,12 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 17);
+    assert_eq!(row.get::<i64, _>("schema_version"), 18);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
 #[tokio::test]
-async fn schema_v14_to_v17_repairs_skill_worktree_and_mcp_integrity() {
+async fn schema_v14_to_v18_repairs_skill_worktree_and_mcp_integrity() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -1072,6 +1072,18 @@ async fn schema_v14_to_v17_repairs_skill_worktree_and_mcp_integrity() {
             .expect("read MCP link after secret deletion");
     assert_eq!(deleted_link, (None, false));
 
+    sqlx::raw_sql(include_str!(
+        "../migrations/0018_mcp_auth_states_vault_pkce.sql"
+    ))
+    .execute(&mut connection)
+    .await
+    .expect("upgrade schema 17 to 18");
+    let v18_version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read schema 18 version");
+    assert_eq!(v18_version, 18);
+
     connection.close().await.expect("close isolated session");
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&pool)
@@ -1457,7 +1469,7 @@ async fn doctor_reports_redacted_mcp_metadata_readiness_counts() {
 }
 
 #[tokio::test]
-async fn deployed_schema_v3_upgrades_to_v17() {
+async fn deployed_schema_v3_upgrades_to_v18() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -1963,6 +1975,10 @@ async fn deployed_schema_v3_upgrades_to_v17() {
             "0017_mcp_server_secret_profile_integrity.sql",
             include_str!("../migrations/0017_mcp_server_secret_profile_integrity.sql"),
         ),
+        (
+            "0018_mcp_auth_states_vault_pkce.sql",
+            include_str!("../migrations/0018_mcp_auth_states_vault_pkce.sql"),
+        ),
     ];
     for (migration, sql) in migrations {
         sqlx::raw_sql(sql)
@@ -1974,7 +1990,7 @@ async fn deployed_schema_v3_upgrades_to_v17() {
         .fetch_one(&mut connection)
         .await
         .expect("read final schema version");
-    assert_eq!(final_schema, 17);
+    assert_eq!(final_schema, 18);
     let safe_worktree_survives: i64 =
         sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
             .bind(legacy_safe_worktree_id)
@@ -2183,6 +2199,349 @@ async fn deployed_schema_v3_upgrades_to_v17() {
         .execute(&pool)
         .await
         .expect("drop isolated upgrade schema");
+}
+
+#[tokio::test]
+async fn mcp_auth_states_vault_pkce_migration_guards_and_enforces() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to test PostgreSQL");
+    gobrowse_server::db::migrate(&pool)
+        .await
+        .expect("install shared extensions");
+    let schema = format!("mcp_auth_v18_{}", Uuid::now_v7().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create isolated schema");
+    let mut connection = PgConnection::connect(&database_url)
+        .await
+        .expect("connect isolated session");
+    sqlx::query(&format!("SET search_path TO {schema},public"))
+        .execute(&mut connection)
+        .await
+        .expect("set isolated search path");
+    let core_migrations = [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_library_embeddings.sql"),
+        include_str!("../migrations/0003_chat_runs.sql"),
+        include_str!("../migrations/0004_login_attempts.sql"),
+        include_str!("../migrations/0005_webhooks.sql"),
+        include_str!("../migrations/0006_audit_append_only.sql"),
+        include_str!("../migrations/0007_webhook_scheduler.sql"),
+        include_str!("../migrations/0008_webhook_delivery_lease.sql"),
+        include_str!("../migrations/0009_webhook_delivery_fencing.sql"),
+        include_str!("../migrations/0010_task_integrity_activity_ledger.sql"),
+        include_str!("../migrations/0011_task_activity_hardening.sql"),
+        include_str!("../migrations/0012_webhook_lease_check.sql"),
+        include_str!("../migrations/0013_skill_integrity.sql"),
+        include_str!("../migrations/0014_skill_revision_immutability.sql"),
+        include_str!("../migrations/0015_skill_lifecycle_hardening.sql"),
+        include_str!("../migrations/0016_worktree_integrity.sql"),
+        include_str!("../migrations/0017_mcp_server_secret_profile_integrity.sql"),
+    ];
+    for sql in core_migrations {
+        sqlx::raw_sql(sql)
+            .execute(&mut connection)
+            .await
+            .expect("install core migrations");
+    }
+    let v17_version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read schema version after core migrations");
+    assert_eq!(v17_version, 17);
+
+    // Assert mcp_auth_states is empty before applying 0018.
+    let empty: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_auth_states")
+        .fetch_one(&mut connection)
+        .await
+        .expect("count auth states");
+    assert_eq!(empty, 0, "mcp_auth_states must be empty for zero-row guard");
+
+    sqlx::raw_sql(include_str!(
+        "../migrations/0018_mcp_auth_states_vault_pkce.sql"
+    ))
+    .execute(&mut connection)
+    .await
+    .expect("upgrade to schema 18");
+
+    let v18_version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read schema version after 0018");
+    assert_eq!(v18_version, 18);
+
+    // Verify column changes.
+    let has_pkce_secret_ref: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema=$1 AND table_name='mcp_auth_states' AND column_name='pkce_verifier_secret_ref')",
+    )
+    .bind(&schema)
+    .fetch_one(&mut connection)
+    .await
+    .expect("check pkce_verifier_secret_ref column exists");
+    assert!(
+        has_pkce_secret_ref,
+        "pkce_verifier_secret_ref column must exist"
+    );
+
+    let has_encrypted: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema=$1 AND table_name='mcp_auth_states' AND column_name='pkce_verifier_encrypted')",
+    )
+    .bind(&schema)
+    .fetch_one(&mut connection)
+    .await
+    .expect("check pkce_verifier_encrypted column is gone");
+    assert!(
+        !has_encrypted,
+        "pkce_verifier_encrypted column must be dropped"
+    );
+
+    let profile_id_not_null: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_schema=$1 AND table_name='mcp_auth_states' AND column_name='profile_id' \
+         AND is_nullable='NO')",
+    )
+    .bind(&schema)
+    .fetch_one(&mut connection)
+    .await
+    .expect("check profile_id NOT NULL");
+    assert!(profile_id_not_null, "profile_id must be NOT NULL");
+
+    // Seed test data: same-profile secret_reference and mcp_auth_states row.
+    let profile_id = Uuid::now_v7();
+    let server_id = Uuid::now_v7();
+    let state_id = Uuid::now_v7();
+    let secret_id = format!("pkce-verifier-{}", Uuid::now_v7().simple());
+    sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'mcp-auth-v18')")
+        .bind(profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create test profile");
+    sqlx::query(
+        "INSERT INTO secret_references (id, profile_id, backend, locator) \
+         VALUES ($1, $2, 'encrypted_database', 'pkce-verifier-locator')",
+    )
+    .bind(&secret_id)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert same-profile secret reference");
+    sqlx::query(
+        "INSERT INTO mcp_servers (id, profile_id, name, transport, configuration, enabled) \
+         VALUES ($1, $2, 'pkce-test', 'stdio', '{}', true)",
+    )
+    .bind(server_id)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert mcp server");
+    sqlx::query(
+        "INSERT INTO mcp_auth_states (id, mcp_server_id, profile_id, state_hash, \
+         pkce_verifier_secret_ref, expected_issuer, resource_uri, redirect_uri, expires_at) \
+         VALUES ($1, $2, $3, decode('abcdef', 'hex'), $4, 'https://issuer.test', \
+         'https://resource.test', 'https://redirect.test', now() + interval '1 hour')",
+    )
+    .bind(state_id)
+    .bind(server_id)
+    .bind(profile_id)
+    .bind(&secret_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert mcp_auth_states row with same-profile secret");
+
+    // Cross-profile secret reference must be rejected.
+    let other_profile_id = Uuid::now_v7();
+    let other_secret_id = format!("pkce-cross-{}", Uuid::now_v7().simple());
+    sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'mcp-auth-other')")
+        .bind(other_profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create other profile");
+    sqlx::query(
+        "INSERT INTO secret_references (id, profile_id, backend, locator) \
+         VALUES ($1, $2, 'encrypted_database', 'cross-profile-pkce')",
+    )
+    .bind(&other_secret_id)
+    .bind(other_profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert cross-profile secret");
+    let cross_profile_insert = sqlx::query(
+        "INSERT INTO mcp_auth_states (id, mcp_server_id, profile_id, state_hash, \
+         pkce_verifier_secret_ref, expected_issuer, resource_uri, redirect_uri, expires_at) \
+         VALUES ($1, $2, $3, decode('123456', 'hex'), $4, 'https://issuer.test', \
+         'https://resource.test', 'https://redirect.test', now() + interval '1 hour')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(server_id)
+    .bind(profile_id)
+    .bind(&other_secret_id)
+    .execute(&mut connection)
+    .await;
+    let cross_constraint = cross_profile_insert
+        .as_ref()
+        .err()
+        .and_then(|error| match error {
+            sqlx::Error::Database(database) => database.constraint(),
+            _ => None,
+        });
+    assert_eq!(
+        cross_constraint,
+        Some("mcp_auth_states_pkce_verifier_same_profile_fk")
+    );
+
+    // Deleting the referenced secret must null pkce_verifier_secret_ref.
+    sqlx::query("DELETE FROM secret_references WHERE id=$1")
+        .bind(&secret_id)
+        .execute(&mut connection)
+        .await
+        .expect("delete referenced secret");
+    let nulled_ref: Option<String> =
+        sqlx::query_scalar("SELECT pkce_verifier_secret_ref FROM mcp_auth_states WHERE id=$1")
+            .bind(state_id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read nulled pkce_verifier_secret_ref");
+    assert_eq!(
+        nulled_ref, None,
+        "pkce_verifier_secret_ref must be nulled after secret deletion"
+    );
+
+    // Deleting the profile must cascade to the mcp_auth_states row.
+    sqlx::query("DELETE FROM profiles WHERE id=$1")
+        .bind(profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("delete profile (cascades)");
+    let deleted: i64 = sqlx::query_scalar("SELECT count(*) FROM mcp_auth_states WHERE id=$1")
+        .bind(state_id)
+        .fetch_one(&mut connection)
+        .await
+        .expect("count remaining mcp_auth_states rows");
+    assert_eq!(
+        deleted, 0,
+        "mcp_auth_states row must cascade-delete with profile"
+    );
+
+    connection.close().await.expect("close isolated session");
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("drop isolated schema");
+}
+
+#[tokio::test]
+async fn mcp_auth_states_zero_row_guard_rejects_legacy_data() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to test PostgreSQL");
+    gobrowse_server::db::migrate(&pool)
+        .await
+        .expect("install shared extensions");
+    let schema = format!("mcp_auth_guard_{}", Uuid::now_v7().simple());
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create isolated schema");
+    let mut connection = PgConnection::connect(&database_url)
+        .await
+        .expect("connect isolated session");
+    sqlx::query(&format!("SET search_path TO {schema},public"))
+        .execute(&mut connection)
+        .await
+        .expect("set isolated search path");
+    let core_migrations = [
+        include_str!("../migrations/0001_initial.sql"),
+        include_str!("../migrations/0002_library_embeddings.sql"),
+        include_str!("../migrations/0003_chat_runs.sql"),
+        include_str!("../migrations/0004_login_attempts.sql"),
+        include_str!("../migrations/0005_webhooks.sql"),
+        include_str!("../migrations/0006_audit_append_only.sql"),
+        include_str!("../migrations/0007_webhook_scheduler.sql"),
+        include_str!("../migrations/0008_webhook_delivery_lease.sql"),
+        include_str!("../migrations/0009_webhook_delivery_fencing.sql"),
+        include_str!("../migrations/0010_task_integrity_activity_ledger.sql"),
+        include_str!("../migrations/0011_task_activity_hardening.sql"),
+        include_str!("../migrations/0012_webhook_lease_check.sql"),
+        include_str!("../migrations/0013_skill_integrity.sql"),
+        include_str!("../migrations/0014_skill_revision_immutability.sql"),
+        include_str!("../migrations/0015_skill_lifecycle_hardening.sql"),
+        include_str!("../migrations/0016_worktree_integrity.sql"),
+        include_str!("../migrations/0017_mcp_server_secret_profile_integrity.sql"),
+    ];
+    for sql in core_migrations {
+        sqlx::raw_sql(sql)
+            .execute(&mut connection)
+            .await
+            .expect("install core migrations");
+    }
+    let profile_id = Uuid::now_v7();
+    let server_id = Uuid::now_v7();
+    let state_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'mcp-auth-guard')")
+        .bind(profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create guard test profile");
+    sqlx::query(
+        "INSERT INTO mcp_servers (id, profile_id, name, transport, configuration, enabled) \
+         VALUES ($1, $2, 'guard-test', 'stdio', '{}', true)",
+    )
+    .bind(server_id)
+    .bind(profile_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert mcp server for guard test");
+    sqlx::query(
+        "INSERT INTO mcp_auth_states (id, mcp_server_id, state_hash, pkce_verifier_encrypted, \
+         expected_issuer, resource_uri, redirect_uri, expires_at) \
+         VALUES ($1, $2, decode('a1b2c3', 'hex'), decode('deadbeef', 'hex'), \
+         'https://issuer.test', 'https://resource.test', 'https://redirect.test', \
+         now() + interval '1 hour')",
+    )
+    .bind(state_id)
+    .bind(server_id)
+    .execute(&mut connection)
+    .await
+    .expect("seed legacy mcp_auth_states row");
+
+    let guard_result = sqlx::raw_sql(include_str!(
+        "../migrations/0018_mcp_auth_states_vault_pkce.sql"
+    ))
+    .execute(&mut connection)
+    .await;
+    let guard_error_message = match &guard_result {
+        Err(sqlx::Error::Database(db_err)) => Some(db_err.message()),
+        _ => None,
+    };
+    assert!(
+        guard_error_message.is_some(),
+        "0018 migration must fail when mcp_auth_states has rows"
+    );
+    let message = guard_error_message.unwrap();
+    assert!(
+        message.contains("must be empty"),
+        "guard error message must describe the zero-row requirement: {message}"
+    );
+
+    connection.close().await.expect("close isolated session");
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("drop isolated schema");
 }
 
 #[tokio::test]
