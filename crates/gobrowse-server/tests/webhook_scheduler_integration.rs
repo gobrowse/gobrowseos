@@ -1137,14 +1137,14 @@ async fn inbound_missing_headers_rejected() {
     );
     headers_no_sig.insert("x-gobrowse-timestamp", ts.to_string().parse().unwrap());
     let status_no_sig = call_webhook(state.clone(), webhook_id, headers_no_sig, body).await;
-    assert_eq!(status_no_sig, 400, "missing signature header => 400");
+    assert_eq!(status_no_sig, 422, "missing signature header => 422");
 
     // Missing X-Gobrowse-Delivery
     let mut headers_no_did = HeaderMap::new();
     headers_no_did.insert("x-gobrowse-signature", sig.parse().unwrap());
     headers_no_did.insert("x-gobrowse-timestamp", ts.to_string().parse().unwrap());
     let status_no_did = call_webhook(state.clone(), webhook_id, headers_no_did, body).await;
-    assert_eq!(status_no_did, 400, "missing delivery header => 400");
+    assert_eq!(status_no_did, 422, "missing delivery header => 422");
 
     // Missing X-Gobrowse-Timestamp
     let mut headers_no_ts = HeaderMap::new();
@@ -1154,7 +1154,7 @@ async fn inbound_missing_headers_rejected() {
         delivery_id.to_string().parse().unwrap(),
     );
     let status_no_ts = call_webhook(state.clone(), webhook_id, headers_no_ts, body).await;
-    assert_eq!(status_no_ts, 400, "missing timestamp header => 400");
+    assert_eq!(status_no_ts, 422, "missing timestamp header => 422");
 
     cleanup(&pool, webhook_id, profile_id).await;
 }
