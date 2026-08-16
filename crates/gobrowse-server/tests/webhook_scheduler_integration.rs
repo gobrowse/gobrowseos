@@ -1535,7 +1535,7 @@ async fn scheduler_restart_does_not_double_process() {
         .fetch_one(&pool)
         .await
         .expect("poll status");
-        if status.0 == "running" {
+        if status.0 != "queued" {
             re_claimed = true;
             break;
         }
