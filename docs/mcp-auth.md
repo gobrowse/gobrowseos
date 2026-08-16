@@ -4,4 +4,4 @@ HTTP authorization follows protected-resource metadata and authorization-server 
 
 Access/refresh tokens, PKCE verifiers, and client secrets are encrypted or referenced by the Credential Vault. They never enter model context, browser diagnostics, or logs.
 
-The accepted M8A offline policy narrows this boundary further: MCP OAuth vault records carry an explicit vault purpose, and raw MCP metadata is accepted only from one configured host. Vault-key readiness may be reported only in redacted form. This does not establish OAuth discovery, JWKS validation, refresh, PKCE remodeling, same-profile reference migration, or real-provider behavior.
+The accepted M8A offline policy narrows this boundary further: MCP OAuth vault records carry an explicit vault purpose, and raw MCP metadata is accepted only from one configured host. Vault-key readiness may be reported only in redacted form. Accepted M8B schema 17 database-enforces that a non-null MCP server credential reference belongs to the same profile, clearing only legacy cross-profile links. These slices do not establish OAuth discovery, JWKS validation, refresh, PKCE remodeling, or real-provider behavior.

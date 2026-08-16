@@ -71,6 +71,12 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - Acceptance is limited to the exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL proof.
 - This is not M8 closure. It does not prove OAuth, JWKS, discovery, refresh, same-profile reference migration, vault-backed PKCE remodeling, real-provider behavior, or M7 peer interoperability. M8 remains `IN_PROGRESS`; M4 and M7 remain independently `BLOCKED_EXTERNAL`.
 
+## M8B same-profile MCP credential-reference acceptance (2026-08-15)
+
+- The bounded M8B schema-integrity slice was accepted at commit `d0f6562cd807ae79e44d679a780d76e6ed1b0450` by successful CI run `31920633836`: Rust, web, supply-chain, and container all passed.
+- Schema 17 atomically clears only legacy cross-profile `mcp_servers.auth_secret_reference` links, preserves valid links, and installs the same-profile composite foreign key with delete-to-null behavior. PostgreSQL upgrade and recurrence tests prove the repair and constraint.
+- This is not M8 closure. Vault-backed PKCE state, OAuth discovery/state/issuer/resource/audience/refresh, JWKS and real-provider proof remain unimplemented. M8 remains `IN_PROGRESS`; M4 and M7 remain independently `BLOCKED_EXTERNAL`.
+
 
 ## Active Milestone
 
@@ -291,15 +297,21 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
       "REMAINING_RELEASE_BLOCKERS": 1,
       "DEPENDENCIES": null,
       "EVIDENCE": [
-        "Accepted M8A commit 5eb07151fb36c761d13b9d5943394f1b7a11e4f8 proves only exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
+        "Accepted M8A commit 5eb07151fb36c761d13b9d5943394f1b7a11e4f8 proves exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
+        "Accepted M8B commit d0f6562cd807ae79e44d679a780d76e6ed1b0450 proves schema-17 atomic repair and database enforcement of same-profile MCP server credential references.",
         "Prior credential-vault encryption/rotation coverage and pure MCP doctor audience/schema validators remain supporting evidence, not real OAuth/JWKS interoperability proof.",
-        "OAuth, JWKS, discovery, refresh, same-profile reference migration, vault-backed PKCE remodeling, real-provider proof, and M7 peer interoperability remain outside M8A acceptance."
+        "OAuth, JWKS, discovery, refresh, vault-backed PKCE remodeling, real-provider proof, and M7 peer interoperability remain outside accepted M8A/M8B scope."
       ],
       "CI_RUN": [
         {
           "RUN_ID": "31919742949",
           "COMMIT": "5eb07151fb36c761d13b9d5943394f1b7a11e4f8",
           "SCOPE": "M8A offline vault metadata/readiness: vault purpose, one-host raw metadata, redacted key readiness, count-only read-only doctor, and router/PostgreSQL proof"
+        },
+        {
+          "RUN_ID": "31920633836",
+          "COMMIT": "d0f6562cd807ae79e44d679a780d76e6ed1b0450",
+          "SCOPE": "M8B schema-17 same-profile MCP server credential-reference repair and recurrence proof"
         }
       ],
       "NEXT_ACTION": "Keep M8 IN_PROGRESS until its retained OAuth/JWKS/discovery/refresh, same-profile reference migration, vault-backed PKCE remodeling, and real-provider requirements are separately proven or its scope is formally changed; M7 peer interoperability remains independently BLOCKED_EXTERNAL."
