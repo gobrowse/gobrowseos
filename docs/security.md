@@ -11,3 +11,5 @@ See [`threat-model.md`](threat-model.md). Production requires TLS, an externally
 ## Credential Vault
 
 Configure `vault.master_key_file` with a mode-`0600` file containing standard-base64-encoded 32 random bytes. Secrets are envelope-encrypted and API responses contain metadata only. During rotation, set a new `key_version` and key file plus `previous_key_version` and `previous_master_key_file`, call `POST /api/v1/vault/rotate`, verify all rows use the new version, then remove the previous key configuration.
+
+M8A readiness diagnostics expose only redacted actual vault-key readiness, never key material. For MCP OAuth metadata, raw MCP metadata is accepted only from one configured host and credentials retain an explicit vault purpose.

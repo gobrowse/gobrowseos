@@ -65,6 +65,13 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - The live database had zero rows for version 15 under either the former or current migration checksum. For traceability, the former `0015` file SHA-256 was `b05865e0503b0d43836d622f7917f5972bba260a81e3009c50a334e13c7646b4` and SQLx SHA-384 was `bd6b27777a076a077e23763b87a1effec21c1a3a8dbadd714f958e7ef2ab8508bbb3ed6b37a92c041d4ab4aabfd89d40`; the current file SHA-256 is `be16df41b493d1a40f883d6abe5a460ffb50381bdf325fc9e60f658b5f3547dd` and SQLx SHA-384 is `f63824fd941dd823afccd7344809c4379de8085380bf58be16dbc24763b1af92c8e0ab0126e8ace9a6248fbae35e329e`. The only other connectable database, administrative `postgres`, has neither `public._sqlx_migrations` nor `public.schema_metadata`.
 - This inventory was read-only: production was not migrated, and no live container restart, data mutation, migration-ledger write, or service-state change occurred. The live deployment remains at schema 3; schema 15 is proven only by the exact-SHA CI candidate and remains for a future deployment runbook execution.
 
+## M8A offline vault-readiness acceptance (2026-08-15)
+
+- The bounded M8A slice was accepted at commit `5eb07151fb36c761d13b9d5943394f1b7a11e4f8` by successful CI run `31919742949`: Rust `95097548607`, web `95097548566`, supply-chain `95097548454`, and container `95097548439`.
+- Acceptance is limited to the exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL proof.
+- This is not M8 closure. It does not prove OAuth, JWKS, discovery, refresh, same-profile reference migration, vault-backed PKCE remodeling, real-provider behavior, or M7 peer interoperability. M8 remains `IN_PROGRESS`; M4 and M7 remain independently `BLOCKED_EXTERNAL`.
+
+
 ## Active Milestone
 
 - The honest final sweep is complete: only real-external-runtime gates remain and the user-excluded areas (browser, WebAuthn/OIDC) are out of scope. The integration suite is now DETERMINISTIC across the full workspace: all DB-touching tests serialize via a shared PostgreSQL advisory lock (`tests/common/mod.rs`), eliminating cross-process row races. 199 nextest pass, 5 skipped (opt-in docker-backed sandbox tests under `GOBROWSE_SANDBOX_DOCKER=1`). Only migrations left out of a fresh database are forward-only `0001`–`0008`. `cargo fmt`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo clippy -p gobrowse-web --target wasm32-unknown-unknown -- -D warnings`, `cargo nextest run --workspace`, `cargo deny check`, `cargo audit` (with the documented ignores), and `(cd crates/gobrowse-web && trunk build index.html --release --dist ../../dist)` are all green.
@@ -284,12 +291,18 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
       "REMAINING_RELEASE_BLOCKERS": 1,
       "DEPENDENCIES": null,
       "EVIDENCE": [
-        "docs/implementation-progress.md records accepted credential-vault encryption/rotation coverage from Milestone 2 and a pure MCP doctor audience/schema validator.",
-        "docs/implementation-progress.md § Remaining gates says the real OAuth matrix, real-server conformance, and JWKS token validation remain unproved; docs/mcp-auth.md records the required OAuth security contract.",
-        "No repository record accepts M8 as a complete milestone."
+        "Accepted M8A commit 5eb07151fb36c761d13b9d5943394f1b7a11e4f8 proves only exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
+        "Prior credential-vault encryption/rotation coverage and pure MCP doctor audience/schema validators remain supporting evidence, not real OAuth/JWKS interoperability proof.",
+        "OAuth, JWKS, discovery, refresh, same-profile reference migration, vault-backed PKCE remodeling, real-provider proof, and M7 peer interoperability remain outside M8A acceptance."
       ],
-      "CI_RUN": [],
-      "NEXT_ACTION": "Define and accept the exact M8 completion matrix without attributing M2 vault or pure-validator evidence to real OAuth/JWKS interoperability; resolve the real-provider prerequisite or formally change scope."
+      "CI_RUN": [
+        {
+          "RUN_ID": "31919742949",
+          "COMMIT": "5eb07151fb36c761d13b9d5943394f1b7a11e4f8",
+          "SCOPE": "M8A offline vault metadata/readiness: vault purpose, one-host raw metadata, redacted key readiness, count-only read-only doctor, and router/PostgreSQL proof"
+        }
+      ],
+      "NEXT_ACTION": "Keep M8 IN_PROGRESS until its retained OAuth/JWKS/discovery/refresh, same-profile reference migration, vault-backed PKCE remodeling, and real-provider requirements are separately proven or its scope is formally changed; M7 peer interoperability remains independently BLOCKED_EXTERNAL."
     },
     {
       "ID": "M9",
