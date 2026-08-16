@@ -3,7 +3,8 @@ use std::{path::PathBuf, process::ExitCode};
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use gobrowse_server::{
-    AppState, config::Settings, db, doctor, embedding, router, run_api, webhook_scheduler,
+    AppState, config::Settings, db, doctor, embedding, outbound_http::WebhookDeliveryDeps,
+    router, run_api, webhook_scheduler,
 };
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
@@ -148,6 +149,7 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         Some(tokio::spawn(webhook_scheduler::run_worker(
             state.clone(),
             cancellation.child_token(),
+            WebhookDeliveryDeps::production(),
         )))
     } else {
         None

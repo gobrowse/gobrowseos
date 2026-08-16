@@ -59,10 +59,9 @@ pub struct DeliveryOutcome {
 ///
 /// Mirrors `run_api::run_worker` structure: interval scan, `JoinSet`, graceful
 /// shutdown via `CancellationToken`, and drain-on-exit.
-pub async fn run_worker(state: AppState, shutdown: CancellationToken) {
+pub async fn run_worker(state: AppState, shutdown: CancellationToken, deps: WebhookDeliveryDeps) {
     let owner = format!("gobrowse-server:{}:{}", std::process::id(), Uuid::now_v7());
     let max_attempts = state.settings.features.webhook_scheduler_max_attempts;
-    let deps = WebhookDeliveryDeps::production();
 
     let mut tasks = JoinSet::new();
     let mut scan = tokio::time::interval(Duration::from_millis(SCAN_INTERVAL_MS));

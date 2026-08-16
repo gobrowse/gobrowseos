@@ -920,3 +920,660 @@ async fn crashed_worker_running_row_dead_letters_after_max_attempts() {
 
     cleanup(&pool, webhook_id, profile_id).await;
 }
+
+// ────────────────────────────────────────────────────────────────────
+// Inbound webhook receive_webhook integration tests
+// ────────────────────────────────────────────────────────────────────
+
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::AtomicBool;
+use tokio_util::sync::CancellationToken;
+
+use axum::{
+    body::Bytes,
+    extract::{Path, State},
+    http::HeaderMap,
+    response::IntoResponse,
+};
+
+use gobrowse_server::{
+    outbound_http::{
+        OutboundResolver, OutboundTransport, ResolverFuture, TransportFuture,
+        TransportResponse, ValidatedOutboundTarget, WebhookDeliveryDeps,
+    },
+    webhooks::{self, hex_encode},
+    AppState,
+};
+
+/// Single-use key for the inbound tests so parallel runs don't collide.
+/// We already hold the advisory lock.
+fn sign_payload(secret: &[u8], timestamp_millis: i64, body: &[u8]) -> String {
+    let payload = format!("{timestamp_millis}.{}", String::from_utf8_lossy(body));
+    let mac = hmac_sha256(secret, payload.as_bytes());
+    format!("sha256={}", hex_encode(&mac))
+}
+
+fn make_headers(delivery_id: &str, timestamp_millis: i64, signature: &str) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert("x-gobrowse-signature", signature.parse().unwrap());
+    headers.insert("x-gobrowse-delivery", delivery_id.parse().unwrap());
+    headers.insert(
+        "x-gobrowse-timestamp",
+        timestamp_millis.to_string().parse().unwrap(),
+    );
+    headers
+}
+
+/// Call receive_webhook and return only the HTTP status code for assertion.
+async fn call_webhook(
+    state: AppState,
+    id: Uuid,
+    headers: HeaderMap,
+    body: &[u8],
+) -> axum::http::StatusCode {
+    let result = webhooks::receive_webhook(
+        State(state),
+        Path(id),
+        headers,
+        Bytes::from(body.to_vec()),
+    )
+    .await;
+    match result {
+        Ok(r) => r.into_response().status(),
+        Err(e) => e.into_response().status(),
+    }
+}
+
+fn now_millis() -> i64 {
+    let now = OffsetDateTime::now_utc();
+    now.unix_timestamp() * 1000 + now.millisecond() as i64
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 9: valid signature → 200 OK
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn inbound_valid_signature_accepted() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+
+    let delivery_id = Uuid::now_v7();
+    let ts = now_millis();
+    let body = b"{\"event\":\"test\"}";
+    let sig = sign_payload(&secret, ts, body);
+    let headers = make_headers(&delivery_id.to_string(), ts, &sig);
+    let status = call_webhook(state, webhook_id, headers, body).await;
+    assert_eq!(status, 200, "valid signature => 200");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 10: invalid signature → 401
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn inbound_invalid_signature_rejected() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, _) = insert_webhook(&pool).await;
+
+    let delivery_id = Uuid::now_v7();
+    let ts = now_millis();
+    let body = b"{\"event\":\"test\"}";
+    // Sign with wrong key
+    let wrong_secret = b"wrong-key-that-does-not-match";
+    let wrong_sig = sign_payload(wrong_secret, ts, body);
+    let headers = make_headers(&delivery_id.to_string(), ts, &wrong_sig);
+    let status = call_webhook(state, webhook_id, headers, body).await;
+    assert_eq!(status, 401, "invalid signature => 401");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 11: replay (duplicate delivery_id) → 409
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn inbound_replay_delivery_idempotency() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+
+    let delivery_id = Uuid::now_v7();
+    let ts = now_millis();
+    let body = b"{\"event\":\"test\"}";
+    let sig = sign_payload(&secret, ts, body);
+    let headers1 = make_headers(&delivery_id.to_string(), ts, &sig);
+    let headers2 = make_headers(&delivery_id.to_string(), ts, &sig);
+
+    // First call → 200
+    let status1 = call_webhook(state.clone(), webhook_id, headers1, body).await;
+    assert_eq!(status1, 200, "first delivery => 200");
+
+    // Second call with same delivery_id → 409
+    let status2 = call_webhook(state, webhook_id, headers2, body).await;
+    assert_eq!(status2, 409, "replay => 409");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 12: stale timestamp → 401
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn inbound_clock_skew_rejected() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+
+    let delivery_id = Uuid::now_v7();
+    // 1000 seconds in the past — well beyond MAX_CLOCK_SKEW_SECS (300)
+    let old_ts = now_millis() - 1_000_000;
+    let body = b"{\"event\":\"test\"}";
+    let sig = sign_payload(&secret, old_ts, body);
+    let headers = make_headers(&delivery_id.to_string(), old_ts, &sig);
+    let status = call_webhook(state, webhook_id, headers, body).await;
+    assert_eq!(status, 401, "stale timestamp => 401");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 13: missing required headers → 400
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn inbound_missing_headers_rejected() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+
+    let delivery_id = Uuid::now_v7();
+    let ts = now_millis();
+    let body = b"{\"event\":\"test\"}";
+    let sig = sign_payload(&secret, ts, body);
+
+    // Missing X-Gobrowse-Signature
+    let mut headers_no_sig = HeaderMap::new();
+    headers_no_sig.insert("x-gobrowse-delivery", delivery_id.to_string().parse().unwrap());
+    headers_no_sig.insert("x-gobrowse-timestamp", ts.to_string().parse().unwrap());
+    let status_no_sig = call_webhook(state.clone(), webhook_id, headers_no_sig, body).await;
+    assert_eq!(status_no_sig, 400, "missing signature header => 400");
+
+    // Missing X-Gobrowse-Delivery
+    let mut headers_no_did = HeaderMap::new();
+    headers_no_did.insert("x-gobrowse-signature", sig.parse().unwrap());
+    headers_no_did.insert("x-gobrowse-timestamp", ts.to_string().parse().unwrap());
+    let status_no_did = call_webhook(state.clone(), webhook_id, headers_no_did, body).await;
+    assert_eq!(status_no_did, 400, "missing delivery header => 400");
+
+    // Missing X-Gobrowse-Timestamp
+    let mut headers_no_ts = HeaderMap::new();
+    headers_no_ts.insert("x-gobrowse-signature", sig.parse().unwrap());
+    headers_no_ts.insert("x-gobrowse-delivery", delivery_id.to_string().parse().unwrap());
+    let status_no_ts = call_webhook(state.clone(), webhook_id, headers_no_ts, body).await;
+    assert_eq!(status_no_ts, 400, "missing timestamp header => 400");
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 14: disabled/unknown webhook → 404
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn inbound_disabled_webhook_rejected() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+
+    // A random UUID that doesn't exist → 404
+    let unknown_id = Uuid::now_v7();
+    let delivery_id = Uuid::now_v7();
+    let ts = now_millis();
+    let body = b"{\"event\":\"test\"}";
+    let headers = make_headers(
+        &delivery_id.to_string(),
+        ts,
+        "sha256=0000000000000000000000000000000000000000000000000000000000000000",
+    );
+    let status = call_webhook(state.clone(), unknown_id, headers, body).await;
+    assert_eq!(status, 404, "unknown webhook id => 404");
+
+    // Disabled webhook → 404
+    let profile_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,$2)")
+        .bind(profile_id)
+        .bind("disabled-webhook-profile")
+        .execute(&pool)
+        .await
+        .expect("profile");
+    let disabled_id = Uuid::now_v7();
+    let secret = b"test-secret-for-disabled".to_vec();
+    sqlx::query(
+        "INSERT INTO webhooks (id,profile_id,name,secret_key,target,event_filter,enabled) \
+         VALUES ($1,$2,$3,$4,$5,$6,false)",
+    )
+    .bind(disabled_id)
+    .bind(profile_id)
+    .bind("disabled-webhook")
+    .bind(&secret)
+    .bind(serde_json::json!({"url":"https://example.com/deliver"}))
+    .bind(serde_json::json!({"events":["*"]}))
+    .execute(&pool)
+    .await
+    .expect("disabled webhook");
+
+    let delivery_id2 = Uuid::now_v7();
+    let ts2 = now_millis();
+    let sig2 = sign_payload(&secret, ts2, body);
+    let headers2 = make_headers(&delivery_id2.to_string(), ts2, &sig2);
+    let status_disabled = call_webhook(state, disabled_id, headers2, body).await;
+    assert_eq!(status_disabled, 404, "disabled webhook => 404");
+
+    sqlx::query("DELETE FROM webhooks WHERE id=$1")
+        .bind(disabled_id)
+        .execute(&pool)
+        .await
+        .ok();
+    sqlx::query("DELETE FROM profiles WHERE id=$1")
+        .bind(profile_id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Scheduler lifecycle tests
+// ────────────────────────────────────────────────────────────────────
+
+/// A resolver that resolves every hostname to a fixed IP address.
+#[derive(Clone)]
+struct FixedResolver {
+    address: IpAddr,
+}
+
+impl OutboundResolver for FixedResolver {
+    fn resolve<'a>(&'a self, _host: &'a str, port: u16) -> ResolverFuture<'a> {
+        let address = SocketAddr::new(self.address, port);
+        Box::pin(async move { Ok(vec![address]) })
+    }
+}
+
+/// A transport that returns a configured status code immediately.
+/// Tracks whether it was called via an AtomicBool.
+#[derive(Clone)]
+struct FlagTransport {
+    status: u16,
+    invoked: Arc<AtomicBool>,
+}
+
+impl FlagTransport {
+    fn new(status: u16) -> Self {
+        Self {
+            status,
+            invoked: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn was_invoked(&self) -> bool {
+        self.invoked.load(Ordering::SeqCst)
+    }
+}
+
+impl OutboundTransport for FlagTransport {
+    fn send<'a>(
+        &'a self,
+        _target: &'a ValidatedOutboundTarget,
+        _delivery_id: &'a str,
+        _body: &'a str,
+        _signature: Option<&'a str>,
+    ) -> TransportFuture<'a> {
+        self.invoked.store(true, Ordering::SeqCst);
+        let status = self.status;
+        Box::pin(async move { Ok(TransportResponse { status }) })
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 15: run_worker graceful shutdown drains in-flight deliveries
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scheduler_drains_in_flight_deliveries_on_shutdown() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+
+    let transport = FlagTransport::new(204);
+    let deps = WebhookDeliveryDeps {
+        resolver: Arc::new(FixedResolver {
+            address: "1.1.1.1".parse().expect("addr"),
+        }),
+        transport: Arc::new(transport.clone()),
+    };
+
+    let delivery_id = format!("drain-test-{}", Uuid::now_v7());
+    insert_queued_delivery(
+        &pool,
+        webhook_id,
+        &delivery_id,
+        "https://hooks.example.test/deliver",
+        &secret,
+    )
+    .await;
+
+    let shutdown = CancellationToken::new();
+    let worker_shutdown = shutdown.clone();
+    let worker_state = state.clone();
+
+    let handle = tokio::spawn(async move {
+        webhook_scheduler::run_worker(worker_state, worker_shutdown, deps).await;
+    });
+
+    // Wait for the delivery to be claimed (status transitions to 'running').
+    let mut claimed = false;
+    for _ in 0..50 {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM webhook_deliveries \
+             WHERE webhook_id=$1 AND delivery_id=$2",
+        )
+        .bind(webhook_id)
+        .bind(&delivery_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("poll row");
+        if let Some((status,)) = &row {
+            if status == "running" {
+                claimed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(claimed, "delivery was never claimed by worker");
+
+    // Cancel the worker — it should drain in-flight deliveries.
+    shutdown.cancel();
+
+    // Wait for worker to exit (drain complete).
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("worker did not drain in time")
+        .expect("worker panicked");
+
+    // Verify the delivery was actually processed (status moved from 'running').
+    let row: (String,) = sqlx::query_as(
+        "SELECT status FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("final row");
+    assert_ne!(
+        row.0, "running",
+        "delivery must not remain running after drain"
+    );
+    assert!(
+        transport.was_invoked(),
+        "transport must have been invoked during drain"
+    );
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Test 16: worker restart does not double-process recovered deliveries
+// ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn scheduler_restart_does_not_double_process() {
+    let Some(database_url) = database_url() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("pool");
+    let state = AppState::new(pool.clone(), test_settings(&database_url))
+        .await
+        .expect("AppState");
+    let (webhook_id, profile_id, secret) = insert_webhook(&pool).await;
+
+    let delivery_id = format!("restart-test-{}", Uuid::now_v7());
+    insert_queued_delivery(
+        &pool,
+        webhook_id,
+        &delivery_id,
+        "https://hooks.example.test/deliver",
+        &secret,
+    )
+    .await;
+
+    // ── Worker 1: claim and process the delivery ──
+    let transport1 = FlagTransport::new(204);
+    let deps1 = WebhookDeliveryDeps {
+        resolver: Arc::new(FixedResolver {
+            address: "1.1.1.1".parse().expect("addr"),
+        }),
+        transport: Arc::new(transport1.clone()),
+    };
+
+    let shutdown1 = CancellationToken::new();
+    let handle1 = tokio::spawn({
+        let s = state.clone();
+        let sd = shutdown1.clone();
+        async move { webhook_scheduler::run_worker(s, sd, deps1).await }
+    });
+
+    // Wait for claim.
+    let mut claimed = false;
+    for _ in 0..50 {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT status FROM webhook_deliveries \
+             WHERE webhook_id=$1 AND delivery_id=$2",
+        )
+        .bind(webhook_id)
+        .bind(&delivery_id)
+        .fetch_optional(&pool)
+        .await
+        .expect("poll row");
+        if let Some((status,)) = &row {
+            if status == "running" {
+                claimed = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(claimed, "worker 1 must claim the delivery");
+
+    // Crash worker 1.
+    shutdown1.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle1)
+        .await
+        .expect("worker 1 timeout")
+        .expect("worker 1 panicked");
+
+    // Verify transport was called once.
+    assert!(
+        transport1.was_invoked(),
+        "worker 1 must process the delivery"
+    );
+    let delivery_count_after_crash: (i64,) = sqlx::query_as(
+        "SELECT attempts FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("attempts row");
+    assert_eq!(
+        delivery_count_after_crash.0, 1,
+        "exactly 1 attempt after first worker"
+    );
+
+    // ── Simulate recovery: expire the lease and re-claim ──
+    sqlx::query(
+        "UPDATE webhook_deliveries \
+         SET lease_expires_at = now() - interval '1 hour', \
+             next_attempt_at = now() - interval '1 second' \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .execute(&pool)
+    .await
+    .expect("expire lease");
+
+    let reclaimed = webhook_scheduler::recover_stuck_deliveries(&pool, 5)
+        .await
+        .expect("recover");
+    assert!(
+        reclaimed > 0,
+        "recovery must reclaim the crashed delivery"
+    );
+
+    let status_after_recovery: (String,) = sqlx::query_as(
+        "SELECT status FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("status after recovery");
+    assert_eq!(
+        status_after_recovery.0, "queued",
+        "recovery re-queues delivery"
+    );
+
+    // ── Worker 2: claim the recovered delivery ──
+    let transport2 = FlagTransport::new(204);
+    let deps2 = WebhookDeliveryDeps {
+        resolver: Arc::new(FixedResolver {
+            address: "1.1.1.1".parse().expect("addr"),
+        }),
+        transport: Arc::new(transport2.clone()),
+    };
+    let shutdown2 = CancellationToken::new();
+    let handle2 = tokio::spawn({
+        let s = state.clone();
+        let sd = shutdown2.clone();
+        async move { webhook_scheduler::run_worker(s, sd, deps2).await }
+    });
+
+    // Wait for worker 2 to claim the recovered delivery.
+    let mut re_claimed = false;
+    for _ in 0..50 {
+        let status: (String,) = sqlx::query_as(
+            "SELECT status FROM webhook_deliveries \
+             WHERE webhook_id=$1 AND delivery_id=$2",
+        )
+        .bind(webhook_id)
+        .bind(&delivery_id)
+        .fetch_one(&pool)
+        .await
+        .expect("poll status");
+        if status.0 == "running" {
+            re_claimed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(re_claimed, "worker 2 must re-claim the recovered delivery");
+
+    // Cancel worker 2 and drain.
+    shutdown2.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(10), handle2)
+        .await
+        .expect("worker 2 timeout")
+        .expect("worker 2 panicked");
+
+    // Verify the delivery was processed again by worker 2.
+    let final_attempts: (i64,) = sqlx::query_as(
+        "SELECT attempts FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("final attempts");
+    // Worker 1: 1 attempt, recovery: no new attempt, Worker 2: 1 attempt → total 2.
+    assert_eq!(
+        final_attempts.0, 2,
+        "exactly 2 total attempts (1 per worker lifecycle)"
+    );
+
+    let final_status: (String,) = sqlx::query_as(
+        "SELECT status FROM webhook_deliveries \
+         WHERE webhook_id=$1 AND delivery_id=$2",
+    )
+    .bind(webhook_id)
+    .bind(&delivery_id)
+    .fetch_one(&pool)
+    .await
+    .expect("final status");
+    assert_ne!(
+        final_status.0, "running",
+        "final status must not be running after drain"
+    );
+
+    cleanup(&pool, webhook_id, profile_id).await;
+}
