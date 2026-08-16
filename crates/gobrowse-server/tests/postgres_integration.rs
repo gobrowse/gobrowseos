@@ -2326,8 +2326,10 @@ async fn mcp_auth_states_vault_pkce_migration_guards_and_enforces() {
         .await
         .expect("create test profile");
     sqlx::query(
-        "INSERT INTO secret_references (id, profile_id, backend, locator, encrypted_value, nonce, key_version) \
-         VALUES ($1, $2, 'encrypted_database', 'pkce-verifier-locator', decode('01','hex'), decode('02','hex'), 1)",
+        "INSERT INTO secret_references (id, profile_id, backend, locator, encrypted_value, nonce, \
+         key_version, purpose, algorithm, wrapped_data_key, wrap_nonce) \
+         VALUES ($1, $2, 'encrypted_database', 'pkce-verifier-locator', decode('01','hex'), \
+         decode('02','hex'), 1, 'mcp_oauth_pkce_verifier', 'A256GCM', decode('aa','hex'), decode('bb','hex'))",
     )
     .bind(&secret_id)
     .bind(profile_id)
@@ -2366,8 +2368,10 @@ async fn mcp_auth_states_vault_pkce_migration_guards_and_enforces() {
         .await
         .expect("create other profile");
     sqlx::query(
-        "INSERT INTO secret_references (id, profile_id, backend, locator, encrypted_value, nonce, key_version) \
-         VALUES ($1, $2, 'encrypted_database', 'cross-profile-pkce', decode('01','hex'), decode('02','hex'), 1)",
+        "INSERT INTO secret_references (id, profile_id, backend, locator, encrypted_value, nonce, \
+         key_version, purpose, algorithm, wrapped_data_key, wrap_nonce) \
+         VALUES ($1, $2, 'encrypted_database', 'cross-profile-pkce', decode('01','hex'), \
+         decode('02','hex'), 1, 'mcp_oauth_pkce_verifier', 'A256GCM', decode('aa','hex'), decode('bb','hex'))",
     )
     .bind(&other_secret_id)
     .bind(other_profile_id)
