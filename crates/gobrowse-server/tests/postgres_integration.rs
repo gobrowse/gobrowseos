@@ -2370,8 +2370,8 @@ async fn mcp_auth_states_vault_pkce_migration_guards_and_enforces() {
     sqlx::query(
         "INSERT INTO secret_references (id, profile_id, backend, locator, encrypted_value, nonce, \
          key_version, purpose, algorithm, wrapped_data_key, wrap_nonce) \
-         VALUES ($1, $2, 'encrypted_database', 'cross-profile-pkce', decode('01','hex'), \
-         decode('02','hex'), 1, 'mcp_oauth_pkce_verifier', 'A256GCM', decode('aa','hex'), decode('bb','hex'))",
+         VALUES ($1, $2, 'encrypted_database', 'cross-profile-pkce', decode('11','hex'), \
+         decode('22','hex'), 1, 'mcp_oauth_pkce_verifier', 'A256GCM', decode('aa','hex'), decode('cc','hex'))",
     )
     .bind(&other_secret_id)
     .bind(other_profile_id)
