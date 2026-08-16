@@ -1159,10 +1159,10 @@ async fn request_json(
         .await
         .expect("collect response")
         .to_bytes();
-    let value = if body.is_empty() {
-        Value::Null
+    let value = if status.is_success() && !body.is_empty() {
+        serde_json::from_slice(&body).expect("JSON success response")
     } else {
-        serde_json::from_slice(&body).expect("JSON response")
+        Value::Null
     };
     (status, value)
 }
