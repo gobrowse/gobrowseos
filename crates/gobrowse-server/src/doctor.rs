@@ -31,7 +31,7 @@ pub(crate) struct McpCredentialMetadata {
     pub purpose: String,
     pub allowed_hosts: Vec<String>,
     pub backend: String,
-    pub key_version: i32,
+    pub key_version: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,8 +53,9 @@ pub(crate) fn classify_mcp_metadata(
         invalid: 0,
     };
     for row in rows {
-        let version_ready =
-            row.key_version == current_key_version || Some(row.key_version) == previous_key_version;
+        let version_ready = row.key_version.is_some_and(|version| {
+            version == current_key_version || Some(version) == previous_key_version
+        });
         let ready = vault_available
             && row.backend == "encrypted_database"
             && version_ready
@@ -351,7 +352,7 @@ mod tests {
             purpose: purpose.into(),
             allowed_hosts: vec![host.into()],
             backend: backend.into(),
-            key_version,
+            key_version: Some(key_version),
         }
     }
 
@@ -400,6 +401,28 @@ mod tests {
                 invalid: 2,
             }
         );
+    }
+
+    #[test]
+    fn classifier_marks_null_key_version_metadata_invalid() {
+        let rows = vec![McpCredentialMetadata {
+            purpose: vault::MCP_OAUTH_ACCESS_TOKEN.into(),
+            allowed_hosts: vec!["example.com".into()],
+            backend: "encrypted_database".into(),
+            key_version: None,
+        }];
+        assert_eq!(
+            classify_mcp_metadata(&rows, true, 7, Some(6)),
+            McpMetadataCounts {
+                total: 1,
+                ready: 0,
+                invalid: 1,
+            }
+        );
+        assert!(matches!(
+            metadata_status(classify_mcp_metadata(&rows, true, 7, Some(6))),
+            Status::Fail
+        ));
     }
 
     #[test]

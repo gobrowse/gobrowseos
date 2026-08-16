@@ -1171,13 +1171,27 @@ async fn doctor_reports_redacted_mcp_metadata_readiness_counts() {
             .expect("insert legacy doctor fixture");
         }
     }
+    let null_key_version_id = format!("doctor-null-key-version-{}", Uuid::now_v7());
+    sqlx::query(
+        "INSERT INTO secret_references \
+         (id,profile_id,backend,locator,purpose,allowed_hosts) \
+         VALUES ($1,$2,'legacy_encrypted_database','legacy',$3,$4)",
+    )
+    .bind(&null_key_version_id)
+    .bind(profile_id)
+    .bind("mcp_oauth_access_token")
+    .bind(["example.com"].as_slice())
+    .execute(&pool)
+    .await
+    .expect("insert null key-version doctor fixture");
+
     let checks = doctor::run(&settings, Some(&pool)).await;
     let check = checks
         .iter()
         .find(|check| check.name == "MCP OAuth vault metadata")
         .expect("MCP doctor check");
     assert!(matches!(check.status, doctor::Status::Fail));
-    assert_eq!(check.detail, "credentials=5, ready=2, invalid=3");
+    assert_eq!(check.detail, "credentials=6, ready=2, invalid=4");
     assert!(!check.detail.contains("doctor-secret"));
     assert!(!check.detail.contains("doctor-test-secret"));
 
