@@ -44,7 +44,7 @@ Precedence: typed defaults → `config.toml` → `GOBROWSE__` env vars (e.g. `GO
 
 ## Pi Agent Resource and Plan Rules
 
-- Keep this Pi setup and any agent-added runtime within a strict 100 MB budget. Do not add local databases, Docker, browser engines, persistent daemons, or heavyweight packages. Prefer the existing tools and lazily started services.
+- Keep this Pi setup and any agent-added runtime within a strict 300 MB budget. Do not add local databases, Docker, browser engines, persistent daemons, or heavyweight packages. Prefer the existing tools and lazily started services.
 - Treat a user prompt beginning exactly with `[PLAN]` as **Read-Only Architecture Mode**.
 - In `[PLAN]` mode, do not call `bash` or `edit`, and do not call `write` except for one final write to the repository-root `PLAN.md`. Do not modify source code, tests, configuration, dependencies, or any other file.
 - In `[PLAN]` mode, inspect only with read-only tools as needed. Produce the complete architecture, dependency/impact analysis, implementation checklist, validation steps, and open questions in that one `PLAN.md` write.
