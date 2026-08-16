@@ -84,6 +84,14 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - This is not M8 closure. OAuth discovery/state/issuer/resource/audience/refresh contract and real-provider/JWKS proof remain unimplemented. M8 remains `IN_PROGRESS`; M4 and M7 remain independently `BLOCKED_EXTERNAL`.
 
 
+## M10 scheduler webhook release acceptance (2026-08-16)
+
+- The M10 scheduler webhook release gate was accepted at commit `8f60184` by successful CI run `31964214914`. All CI jobs (rust, web, supply-chain, container) concluded with success.
+- Inbound `receive_webhook` integration tests passed: valid signature → 200, invalid signature → 401, replay idempotency → 409, clock skew → 401, missing headers → 422, disabled/unknown webhook → 404.
+- Scheduler lifecycle tests passed: graceful shutdown drain, restart without double-processing (lease recovery + re-claim), and `run_worker` now takes `WebhookDeliveryDeps` (testable).
+- Existing outbound coverage unchanged: claim, crash-recovery, dead-letter, backoff, fencing, HMAC payload, default-off gating.
+- `features.webhook_scheduler_enabled` remains default-off. This acceptance was CI validation only: no production deployment, live migration, restart, or production state change occurred; the scheduler stays default-off behind its feature flag until an operator explicitly enables it.
+
 ## Active Milestone
 
 - The honest final sweep is complete: only real-external-runtime gates remain and the user-excluded areas (browser, WebAuthn/OIDC) are out of scope. The integration suite is now DETERMINISTIC across the full workspace: all DB-touching tests serialize via a shared PostgreSQL advisory lock (`tests/common/mod.rs`), eliminating cross-process row races. 199 nextest pass, 5 skipped (opt-in docker-backed sandbox tests under `GOBROWSE_SANDBOX_DOCKER=1`). Only migrations left out of a fresh database are forward-only `0001`–`0008`. `cargo fmt`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, `cargo clippy -p gobrowse-web --target wasm32-unknown-unknown -- -D warnings`, `cargo nextest run --workspace`, `cargo deny check`, `cargo audit` (with the documented ignores), and `(cd crates/gobrowse-web && trunk build index.html --release --dist ../../dist)` are all green.
@@ -164,7 +172,7 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 ```json
 {
   "SCHEMA_VERSION": 1,
-  "AS_OF": "2026-08-15",
+  "AS_OF": "2026-08-16",
   "STATUS_ENUM": [
     "ACCEPTED",
     "IN_PROGRESS",
@@ -174,9 +182,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     "DEFERRED"
   ],
   "COUNTING_RULE": "Count one release blocker for each milestone whose acceptance gate is not ACCEPTED. This is a milestone-gate count, not a count of implementation subtasks or transitive dependency failures. EXTERNAL_BLOCKERS counts only records explicitly established as BLOCKED_EXTERNAL; every other unsatisfied gate is INTERNAL_BLOCKERS until an accepted review reclassifies it.",
-  "TOTAL_RELEASE_BLOCKERS": 15,
+  "TOTAL_RELEASE_BLOCKERS": 14,
   "EXTERNAL_BLOCKERS": 2,
-  "INTERNAL_BLOCKERS": 13,
+  "INTERNAL_BLOCKERS": 12,
   "MILESTONES": [
     {
       "ID": "M1",
@@ -343,21 +351,28 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M10",
       "NAME": "scheduler webhook release",
-      "STATUS": "IN_PROGRESS",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": null,
       "EVIDENCE": [
         "docs/implementation-progress.md § Webhook SSRF proof acceptance closure: commit `dfbbaa5b8e6e884010cbd4f2e57b60a8253c9edc` passed exact-SHA CI with 324/324 tests.",
-        "The same section proves `features.webhook_scheduler_enabled` remains default-off and explicitly says scheduler release remains separately gated; docs/roadmap.md still marks scheduler/webhooks release-gated/off."
+        "The same section proves `features.webhook_scheduler_enabled` remains default-off and explicitly says scheduler release remains separately gated; docs/roadmap.md still marks scheduler/webhooks release-gated/off.",
+        "docs/implementation-progress.md § M10 scheduler webhook release acceptance: commit `8f60184` passed exact-SHA CI run 31964214914 with inbound receive_webhook integration tests (valid signature 200, invalid signature 401, replay idempotency 409, clock skew 401, missing headers 422, disabled/unknown webhook 404), scheduler graceful shutdown drain, and restart without double-processing (lease recovery + re-claim).",
+        "All release gate tests pass: inbound webhook lifecycle, scheduler drain/restart, run_worker WebhookDeliveryDeps wiring. Existing outbound coverage unchanged: claim, crash-recovery, dead-letter, backoff, fencing, HMAC payload, default-off gating."
       ],
       "CI_RUN": [
         {
           "RUN_ID": "31864560017",
           "COMMIT": "dfbbaa5b8e6e884010cbd4f2e57b60a8253c9edc",
           "SCOPE": "Webhook SSRF/fencing proof only; not scheduler release"
+        },
+        {
+          "RUN_ID": "31964214914",
+          "COMMIT": "8f60184",
+          "SCOPE": "M10 release gate: inbound webhook delivery and scheduler lifecycle acceptance"
         }
       ],
-      "NEXT_ACTION": "Keep the scheduler off until the complete restart/replay/signature/recovery release gate is explicitly accepted and recorded; do not promote the bounded SSRF CI run into M10 completion."
+      "NEXT_ACTION": "advance to M11; scheduler stays default-off behind feature flag until operator enables"
     },
     {
       "ID": "M11",
