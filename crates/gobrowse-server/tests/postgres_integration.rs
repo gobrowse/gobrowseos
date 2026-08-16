@@ -39,12 +39,12 @@ async fn migrations_enable_pgvector_and_schema_version() {
     .fetch_one(&pool)
     .await
     .expect("read schema metadata");
-    assert_eq!(row.get::<i64, _>("schema_version"), 16);
+    assert_eq!(row.get::<i64, _>("schema_version"), 17);
     assert!(row.get::<bool, _>("vector_enabled"));
 }
 
 #[tokio::test]
-async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
+async fn schema_v14_to_v17_repairs_skill_worktree_and_mcp_integrity() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -486,6 +486,63 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
         .await
         .expect("seed schema-15 worktree");
     }
+    let other_profile_id = Uuid::now_v7();
+    let valid_secret_id = format!("mcp-valid-{}", Uuid::now_v7().simple());
+    let dirty_secret_id = format!("mcp-dirty-{}", Uuid::now_v7().simple());
+    let valid_server_id = Uuid::now_v7();
+    let dirty_server_id = Uuid::now_v7();
+    let nullable_server_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id,name) VALUES ($1,'mcp-other-profile')")
+        .bind(other_profile_id)
+        .execute(&mut connection)
+        .await
+        .expect("create MCP foreign profile");
+    for (secret_id, secret_profile_id) in [
+        (&valid_secret_id, profile_id),
+        (&dirty_secret_id, other_profile_id),
+    ] {
+        sqlx::query(
+            "INSERT INTO secret_references \
+             (id,profile_id,backend,locator,purpose,allowed_hosts) \
+             VALUES ($1,$2,'legacy_encrypted_database',$3,'provider_credential','{}')",
+        )
+        .bind(secret_id)
+        .bind(secret_profile_id)
+        .bind(format!("locator-{secret_id}"))
+        .execute(&mut connection)
+        .await
+        .expect("seed MCP secret reference");
+    }
+    for (server_id, server_profile_id, secret_reference, enabled) in [
+        (
+            valid_server_id,
+            profile_id,
+            Some(valid_secret_id.as_str()),
+            true,
+        ),
+        (
+            dirty_server_id,
+            profile_id,
+            Some(dirty_secret_id.as_str()),
+            false,
+        ),
+        (nullable_server_id, profile_id, None, true),
+    ] {
+        sqlx::query(
+            "INSERT INTO mcp_servers \
+             (id,profile_id,name,transport,configuration,auth_secret_reference,enabled) \
+             VALUES ($1,$2,$3,'stdio','{}',$4,$5)",
+        )
+        .bind(server_id)
+        .bind(server_profile_id)
+        .bind(format!("mcp-{server_id}"))
+        .bind(secret_reference)
+        .bind(enabled)
+        .execute(&mut connection)
+        .await
+        .expect("seed MCP server");
+    }
+
     sqlx::raw_sql(include_str!("../migrations/0016_worktree_integrity.sql"))
         .execute(&mut connection)
         .await
@@ -843,6 +900,178 @@ async fn schema_v14_to_v16_repairs_skill_and_worktree_integrity() {
             .await
             .is_err()
     );
+    sqlx::raw_sql(include_str!(
+        "../migrations/0017_mcp_server_secret_profile_integrity.sql"
+    ))
+    .execute(&mut connection)
+    .await
+    .expect("upgrade schema 16 to 17");
+    let version: i64 = sqlx::query_scalar("SELECT schema_version FROM schema_metadata")
+        .fetch_one(&mut connection)
+        .await
+        .expect("read schema 17 version");
+    assert_eq!(version, 17);
+    let links: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT \
+            (SELECT auth_secret_reference FROM mcp_servers WHERE id=$1), \
+            (SELECT auth_secret_reference FROM mcp_servers WHERE id=$2), \
+            (SELECT auth_secret_reference FROM mcp_servers WHERE id=$3)",
+    )
+    .bind(valid_server_id)
+    .bind(dirty_server_id)
+    .bind(nullable_server_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read repaired MCP links");
+    assert_eq!(links.0.as_deref(), Some(valid_secret_id.as_str()));
+    assert_eq!(links.1, None);
+    assert_eq!(links.2, None);
+    let enabled: (bool, bool, bool) = sqlx::query_as(
+        "SELECT \
+            (SELECT enabled FROM mcp_servers WHERE id=$1), \
+            (SELECT enabled FROM mcp_servers WHERE id=$2), \
+            (SELECT enabled FROM mcp_servers WHERE id=$3)",
+    )
+    .bind(valid_server_id)
+    .bind(dirty_server_id)
+    .bind(nullable_server_id)
+    .fetch_one(&mut connection)
+    .await
+    .expect("read preserved MCP enabled state");
+    assert_eq!(enabled, (true, false, true));
+    let secret_count: i64 = sqlx::query_scalar("SELECT count(*) FROM secret_references")
+        .fetch_one(&mut connection)
+        .await
+        .expect("count preserved MCP secrets");
+    assert_eq!(secret_count, 2);
+    let constraints: (bool, bool) = sqlx::query_as(
+        "SELECT \
+            EXISTS (SELECT 1 FROM pg_constraint WHERE conname='mcp_servers_auth_secret_same_profile_fk'), \
+            EXISTS (SELECT 1 FROM pg_constraint WHERE conname='mcp_servers_auth_secret_reference_fkey')",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .expect("inspect MCP secret constraints");
+    assert_eq!(constraints, (true, false));
+
+    let cross_profile_insert = sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id,profile_id,name,transport,configuration,auth_secret_reference) \
+         VALUES ($1,$2,'cross-profile','stdio','{}',$3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(profile_id)
+    .bind(&dirty_secret_id)
+    .execute(&mut connection)
+    .await;
+    let cross_profile_constraint =
+        cross_profile_insert
+            .as_ref()
+            .err()
+            .and_then(|error| match error {
+                sqlx::Error::Database(database) => database.constraint(),
+                _ => None,
+            });
+    assert_eq!(
+        cross_profile_constraint,
+        Some("mcp_servers_auth_secret_same_profile_fk")
+    );
+    let cross_profile_update =
+        sqlx::query("UPDATE mcp_servers SET auth_secret_reference=$1 WHERE id=$2")
+            .bind(&dirty_secret_id)
+            .bind(dirty_server_id)
+            .execute(&mut connection)
+            .await;
+    let cross_profile_update_constraint =
+        cross_profile_update
+            .as_ref()
+            .err()
+            .and_then(|error| match error {
+                sqlx::Error::Database(database) => database.constraint(),
+                _ => None,
+            });
+    assert_eq!(
+        cross_profile_update_constraint,
+        Some("mcp_servers_auth_secret_same_profile_fk")
+    );
+
+    sqlx::query("UPDATE mcp_servers SET auth_secret_reference=$1 WHERE id=$2")
+        .bind(&valid_secret_id)
+        .bind(nullable_server_id)
+        .execute(&mut connection)
+        .await
+        .expect("same-profile MCP link succeeds");
+    let profile_reassignment = sqlx::query("UPDATE mcp_servers SET profile_id=$1 WHERE id=$2")
+        .bind(other_profile_id)
+        .bind(valid_server_id)
+        .execute(&mut connection)
+        .await;
+    let profile_reassignment_constraint =
+        profile_reassignment
+            .as_ref()
+            .err()
+            .and_then(|error| match error {
+                sqlx::Error::Database(database) => database.constraint(),
+                _ => None,
+            });
+    assert_eq!(
+        profile_reassignment_constraint,
+        Some("mcp_servers_auth_secret_same_profile_fk")
+    );
+    let secret_reassignment = sqlx::query("UPDATE secret_references SET profile_id=$1 WHERE id=$2")
+        .bind(other_profile_id)
+        .bind(&valid_secret_id)
+        .execute(&mut connection)
+        .await;
+    let secret_reassignment_constraint =
+        secret_reassignment
+            .as_ref()
+            .err()
+            .and_then(|error| match error {
+                sqlx::Error::Database(database) => database.constraint(),
+                _ => None,
+            });
+    assert_eq!(
+        secret_reassignment_constraint,
+        Some("mcp_servers_auth_secret_same_profile_fk")
+    );
+    let deletable_secret_id = format!("mcp-delete-{}", Uuid::now_v7().simple());
+    let deletable_server_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO secret_references \
+         (id,profile_id,backend,locator,purpose,allowed_hosts) \
+         VALUES ($1,$2,'legacy_encrypted_database',$3,'provider_credential','{}')",
+    )
+    .bind(&deletable_secret_id)
+    .bind(profile_id)
+    .bind("locator-delete")
+    .execute(&mut connection)
+    .await
+    .expect("insert deletable MCP secret");
+    sqlx::query(
+        "INSERT INTO mcp_servers \
+         (id,profile_id,name,transport,configuration,auth_secret_reference,enabled) \
+         VALUES ($1,$2,'delete-secret','stdio','{}',$3,false)",
+    )
+    .bind(deletable_server_id)
+    .bind(profile_id)
+    .bind(&deletable_secret_id)
+    .execute(&mut connection)
+    .await
+    .expect("insert deletable MCP link");
+    sqlx::query("DELETE FROM secret_references WHERE id=$1")
+        .bind(&deletable_secret_id)
+        .execute(&mut connection)
+        .await
+        .expect("delete MCP secret");
+    let deleted_link: (Option<String>, bool) =
+        sqlx::query_as("SELECT auth_secret_reference,enabled FROM mcp_servers WHERE id=$1")
+            .bind(deletable_server_id)
+            .fetch_one(&mut connection)
+            .await
+            .expect("read MCP link after secret deletion");
+    assert_eq!(deleted_link, (None, false));
+
     connection.close().await.expect("close isolated session");
     sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
         .execute(&pool)
@@ -1228,7 +1457,7 @@ async fn doctor_reports_redacted_mcp_metadata_readiness_counts() {
 }
 
 #[tokio::test]
-async fn deployed_schema_v3_upgrades_to_v16() {
+async fn deployed_schema_v3_upgrades_to_v17() {
     let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
         eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
         return;
@@ -1730,6 +1959,10 @@ async fn deployed_schema_v3_upgrades_to_v16() {
             "0016_worktree_integrity.sql",
             include_str!("../migrations/0016_worktree_integrity.sql"),
         ),
+        (
+            "0017_mcp_server_secret_profile_integrity.sql",
+            include_str!("../migrations/0017_mcp_server_secret_profile_integrity.sql"),
+        ),
     ];
     for (migration, sql) in migrations {
         sqlx::raw_sql(sql)
@@ -1741,7 +1974,7 @@ async fn deployed_schema_v3_upgrades_to_v16() {
         .fetch_one(&mut connection)
         .await
         .expect("read final schema version");
-    assert_eq!(final_schema, 16);
+    assert_eq!(final_schema, 17);
     let safe_worktree_survives: i64 =
         sqlx::query_scalar("SELECT count(*) FROM worktrees WHERE id=$1")
             .bind(legacy_safe_worktree_id)

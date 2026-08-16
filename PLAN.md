@@ -1,4 +1,4 @@
-# PLAN.md — M8A Offline MCP OAuth Vault Metadata and Doctor Readiness
+# PLAN.md — M8A/M8B MCP OAuth Vault and Secret-Reference Integrity
 
 ## Status and boundary
 
@@ -106,12 +106,38 @@ unit/router/PostgreSQL tests; PostgreSQL tests must report their existing
 ciphertext decrypts, provider interoperability, real OAuth/JWKS behavior, or
 M8 acceptance.
 
+## M8B implementation
+
+**M8 remains `IN_PROGRESS`.** This bounded schema-17 slice implements only
+same-profile integrity for `mcp_servers.auth_secret_reference`; it does not
+complete the OAuth vault, MCP transport, or provider interoperability work.
+
+Migration `0017_mcp_server_secret_profile_integrity.sql` takes one
+transactional `ACCESS EXCLUSIVE` lock over `secret_references` and
+`mcp_servers`, nulls only legacy cross-profile or otherwise dirty MCP secret
+links, preserves all server/secret rows and server enabled state, adds and
+validates `mcp_servers_auth_secret_same_profile_fk` over
+`(profile_id, auth_secret_reference)` to `(profile_id, id)` with
+`ON DELETE SET NULL (auth_secret_reference)`, drops only the former scalar
+`mcp_servers_auth_secret_reference_fkey`, and records schema version 17 last.
+It never repoints, decrypts, or changes credential material.
+
+The PostgreSQL integration proof covers schema-16 repair and recurrence:
+valid links survive, dirty links are nulled, rows/secrets/enabled values are
+preserved, same-profile links work, cross-profile insert and profile
+reassignment are rejected, and deleting a secret nulls only its reference.
+The deployed schema-v3 upgrade and current schema-version assertion now
+expect version 17. PostgreSQL tests retain the existing
+`GOBROWSE_TEST_DATABASE_URL` skip behavior when no database is available.
+
+No Rust API, frontend, vault, doctor, OAuth, JWKS, PKCE, configuration,
+dependency, or sandbox behavior changes are part of M8B.
+
 ## Remaining M8 blockers
 
-M8 still requires a separately reviewed same-profile composite integrity
-migration for MCP server credential references, vault-backed PKCE state
-remodeling, the complete OAuth state/issuer/resource/audience/refresh contract,
-and real-provider/JWKS rotation and interoperability proof. M7 additionally
-remains blocked on the independently pinned real MCP stdio peer above. M4
-remains blocked on the approved rootless Podman runner and immutable image
-prerequisites above. No item in this M8A slice retires those blockers.
+M8 still requires vault-backed PKCE state remodeling, the complete OAuth
+state/issuer/resource/audience/refresh contract, and real-provider/JWKS
+rotation and interoperability proof. M7 additionally remains blocked on the
+independently pinned real MCP stdio peer above. M4 remains blocked on the
+approved rootless Podman runner and immutable image prerequisites above. The
+M8A and M8B slices do not complete M8 or retire those external blockers.
