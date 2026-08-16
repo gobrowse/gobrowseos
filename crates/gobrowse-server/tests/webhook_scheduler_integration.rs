@@ -1338,11 +1338,9 @@ async fn scheduler_drains_in_flight_deliveries_on_shutdown() {
         .fetch_optional(&pool)
         .await
         .expect("poll row");
-        if let Some((status,)) = &row {
-            if status == "running" {
-                claimed = true;
-                break;
-            }
+        if let Some((status,)) = &row && status == "running" {
+            claimed = true;
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
@@ -1434,11 +1432,9 @@ async fn scheduler_restart_does_not_double_process() {
         .fetch_optional(&pool)
         .await
         .expect("poll row");
-        if let Some((status,)) = &row {
-            if status == "running" {
-                claimed = true;
-                break;
-            }
+        if let Some((status,)) = &row && status == "running" {
+            claimed = true;
+            break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
