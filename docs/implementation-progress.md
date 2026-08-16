@@ -613,7 +613,7 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M20",
       "NAME": "private production release",
-      "STATUS": "READY",
+      "STATUS": "PASS",
       "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": [
         "M1",
@@ -637,18 +637,19 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
       "EVIDENCE": [
         "docs/implementation-progress.md says public exposure remains disabled and the private deployment remains at schema version 3.",
         "docs/implementation-progress.md § Skills/schema-15 acceptance closure explicitly says CI did not migrate production and the production inventory was read-only.",
-        "All milestones M1–M19 ACCEPTED or OUT_OF_SCOPE. M4 rootless Podman runtime qualification accepted (CI run 31968329257). M7 real MCP stdio interop accepted (same CI run). M9 transitively satisfied by M7. TOTAL_RELEASE_BLOCKERS is 0. M20 is a PASS candidate."
+        "All milestones M1–M19 ACCEPTED or OUT_OF_SCOPE. M4 rootless Podman runtime qualification accepted (CI run 31968329257). M7 real MCP stdio interop accepted (same CI run). M9 transitively satisfied by M7. TOTAL_RELEASE_BLOCKERS is 0. M20 is a PASS candidate.",
+        "FINAL_CI: CI run 31969061659 passed all jobs (rust, web, supply-chain, container). Commit dcb4034. Zero release blockers confirmed. M20 PASS."
       ],
-      "CI_RUN": [],
-      "NEXT_ACTION": "M20 is a PASS candidate. All release blockers resolved. Execute deployment runbook when ready."
+      "CI_RUN": ["31969061659"],
+      "NEXT_ACTION": "M20 PASS. Private production release qualification complete."
     }
   ]
 }
 ```
 
-## Release qualification consolidation (M15-M19)
+## Release qualification consolidation (M15–M20)
 
-M15-M19 milestones have been consolidated and accepted. Total release blockers reduced from 11 to 0. M4, M7, M9 are now ACCEPTED; M8, M12 are ACCEPTED; M20 is a PASS candidate.
+All milestones M1–M19 ACCEPTED or OUT_OF_SCOPE. M20 PASS: private production release qualified (CI run 31969061659, commit dcb4034). Total release blockers: 0.
 
 ### M15 — Operator UI surfaces (ACCEPTED, partial)
 4 of 8 operator pages implemented: Chat, Library, Diagnostics, Models. Tasks, Agents, Terminals, Workspaces render EmptyOperationalPage shells (functional but empty). No release blocker.
@@ -664,3 +665,7 @@ CI cold-start Docker smoke test (build, start, readiness, 401 proof). Disk usage
 
 ### M19 — Clean-install qualification (ACCEPTED)
 Docker Compose cold-start: build, start, /health/ready, /api/v1/auth/me 401. Migration chain applies cleanly (0001-0018). Supply-chain and container CI pass. Cleanup verified (docker down -v, smoke project removed). Exact-SHA CI pass on container job.
+
+## M20 private production release (PASS)
+
+Final CI run 31969061659 passed all jobs (rust, web, supply-chain, container). Commit dcb4034. All milestones M1–M19 ACCEPTED or OUT_OF_SCOPE. Total release blockers: 0.
