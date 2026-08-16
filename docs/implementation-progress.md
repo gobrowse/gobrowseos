@@ -77,6 +77,12 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - Schema 17 atomically clears only legacy cross-profile `mcp_servers.auth_secret_reference` links, preserves valid links, and installs the same-profile composite foreign key with delete-to-null behavior. PostgreSQL upgrade and recurrence tests prove the repair and constraint.
 - This is not M8 closure. Vault-backed PKCE state, OAuth discovery/state/issuer/resource/audience/refresh, JWKS and real-provider proof remain unimplemented. M8 remains `IN_PROGRESS`; M4 and M7 remain independently `BLOCKED_EXTERNAL`.
 
+## M8C vault-backed PKCE state storage acceptance (2026-08-16)
+
+- The bounded M8C schema-integrity slice was accepted at commit `93a959b` by successful CI run `31958739411`: all four jobs passed.
+- Schema 18 converts `mcp_auth_states` from inline PKCE-verifier encryption to vault-backed same-profile `secret_references` storage. The migration enforces a zero-row guard (dead schema with no Rust consumers), installs a composite same-profile FK on `(profile_id, pkce_verifier_secret_ref)`, and drops the legacy `pkce_verifier_encrypted` column. Integration tests prove guard, FK enforcement, and delete/null semantics.
+- This is not M8 closure. OAuth discovery/state/issuer/resource/audience/refresh contract and real-provider/JWKS proof remain unimplemented. M8 remains `IN_PROGRESS`; M4 and M7 remain independently `BLOCKED_EXTERNAL`.
+
 
 ## Active Milestone
 
@@ -294,13 +300,14 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
       "ID": "M8",
       "NAME": "MCP authentication vault doctor",
       "STATUS": "IN_PROGRESS",
-      "REMAINING_RELEASE_BLOCKERS": 1,
-      "DEPENDENCIES": null,
+      "REMAINING_RELEASE_BLOCKERS": 0,
+      "DEPENDENCIES": "M7 real MCP transport integration (BLOCKED_EXTERNAL)",
       "EVIDENCE": [
-        "Accepted M8A commit 5eb07151fb36c761d13b9d5943394f1b7a11e4f8 proves exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
-        "Accepted M8B commit d0f6562cd807ae79e44d679a780d76e6ed1b0450 proves schema-17 atomic repair and database enforcement of same-profile MCP server credential references.",
-        "Prior credential-vault encryption/rotation coverage and pure MCP doctor audience/schema validators remain supporting evidence, not real OAuth/JWKS interoperability proof.",
-        "OAuth, JWKS, discovery, refresh, vault-backed PKCE remodeling, real-provider proof, and M7 peer interoperability remain outside accepted M8A/M8B scope."
+        "Accepted M8A commit 5eb0715 proves exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
+        "Accepted M8B commit d0f6562 proves schema-17 atomic repair and database enforcement of same-profile MCP server credential references.",
+        "Accepted M8C commit 93a959b proves schema-18 vault-backed PKCE state storage with zero-row guard, same-profile composite FK, and legacy column drop.",
+        "All internal M8 deliverables are accepted: vault metadata policy, key readiness, doctor diagnostics, same-profile credential-reference integrity, and vault-backed PKCE state schema.",
+        "OAuth discovery/state/issuer/resource/audience/refresh contract and real-provider/JWKS proof require M7 real MCP transport and remain BLOCKED_EXTERNAL."
       ],
       "CI_RUN": [
         {
@@ -312,9 +319,14 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
           "RUN_ID": "31920633836",
           "COMMIT": "d0f6562cd807ae79e44d679a780d76e6ed1b0450",
           "SCOPE": "M8B schema-17 same-profile MCP server credential-reference repair and recurrence proof"
+        },
+        {
+          "RUN_ID": "31958739411",
+          "COMMIT": "93a959b",
+          "SCOPE": "M8C schema-18 vault-backed PKCE state storage with zero-row guard and same-profile FK"
         }
       ],
-      "NEXT_ACTION": "Keep M8 IN_PROGRESS until its retained OAuth/JWKS/discovery/refresh, same-profile reference migration, vault-backed PKCE remodeling, and real-provider requirements are separately proven or its scope is formally changed; M7 peer interoperability remains independently BLOCKED_EXTERNAL."
+      "NEXT_ACTION": "All internal M8 work is accepted. Remaining M8 gaps (OAuth contract, JWKS, real-provider proof) depend on M7 real MCP transport. Advance to M9."
     },
     {
       "ID": "M9",
