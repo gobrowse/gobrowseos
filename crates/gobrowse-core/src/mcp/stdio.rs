@@ -254,8 +254,9 @@ mod tests {
     async fn m7_real_stdio_interop_with_python_mcp_server() {
         use tokio::process::Command;
 
+        let server_path = format!("{}/tests/mcp_raw_server.py", env!("CARGO_MANIFEST_DIR"));
         let mut child = Command::new("python3")
-            .arg("/tmp/mcp_raw_server.py")
+            .arg(&server_path)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
