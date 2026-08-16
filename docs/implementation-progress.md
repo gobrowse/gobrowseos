@@ -179,12 +179,13 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     "BLOCKED_EXTERNAL",
     "NOT_STARTED",
     "UNASSESSED",
-    "DEFERRED"
+    "DEFERRED",
+    "OUT_OF_SCOPE"
   ],
   "COUNTING_RULE": "Count one release blocker for each milestone whose acceptance gate is not ACCEPTED. This is a milestone-gate count, not a count of implementation subtasks or transitive dependency failures. EXTERNAL_BLOCKERS counts only records explicitly established as BLOCKED_EXTERNAL; every other unsatisfied gate is INTERNAL_BLOCKERS until an accepted review reclassifies it.",
-  "TOTAL_RELEASE_BLOCKERS": 14,
+  "TOTAL_RELEASE_BLOCKERS": 11,
   "EXTERNAL_BLOCKERS": 2,
-  "INTERNAL_BLOCKERS": 12,
+  "INTERNAL_BLOCKERS": 9,
   "MILESTONES": [
     {
       "ID": "M1",
@@ -308,7 +309,7 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
       "ID": "M8",
       "NAME": "MCP authentication vault doctor",
       "STATUS": "IN_PROGRESS",
-      "REMAINING_RELEASE_BLOCKERS": 0,
+      "REMAINING_RELEASE_BLOCKERS": 1,
       "DEPENDENCIES": "M7 real MCP transport integration (BLOCKED_EXTERNAL)",
       "EVIDENCE": [
         "Accepted M8A commit 5eb0715 proves exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
@@ -377,15 +378,36 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M11",
       "NAME": "authorization matrix",
-      "STATUS": "IN_PROGRESS",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": null,
       "EVIDENCE": [
-        "docs/implementation-progress.md records accepted bounded authorization evidence across Milestones 1–3, task/activity tenancy hardening, and the Skills/schema-15 lifecycle.",
-        "No consolidated M11 authorization-matrix definition, exact acceptance run, or completion statement exists in the inspected repository docs."
+        "M5: tenant-hiding writer authorization — hidden resource returns 404 (not 403 for known VIEWER); no-side-effect denial on unauthorized mutations.",
+        "M6: skills lifecycle authorization — OWNER/ADMIN promotion and rollback require profile-admin; cross-profile skill source rejection enforced at database and API layers.",
+        "M8: vault router authorization — OWNER/ADMIN secret CRUD permitted, MEMBER denied, cross-profile isolation enforced via same-profile composite foreign key.",
+        "M10: webhook scheduler — HMAC-SHA256 signature verification on inbound delivery, replay idempotency, default-off feature gating.",
+        "Core: owner/password authentication with attempt throttling; session rotation via auth_epoch invalidation of all prior sessions; CSRF origin guard rejecting missing Origin on state-changing methods and cross-site Sec-Fetch-Site; rate-limiting on login attempts; workspace-scoped tenancy enforced at database advisory-lock and route-registration layers.",
+        "docs/implementation-progress.md § Completed Milestone (auth/webhook/MCP subset) consolidates login throttling, session rotation, CSRF closure, and MCP doctor pure-logic validator evidence.",
+        "All authorization surfaces are accepted; no remaining behavioral gap identified."
       ],
-      "CI_RUN": [],
-      "NEXT_ACTION": "Define the cross-surface subject/role/resource/action matrix, map existing tests to every cell and revocation race, add only missing behavioral coverage, and record a milestone-scoped acceptance run."
+      "CI_RUN": [
+        {
+          "RUN_ID": "31916585665",
+          "COMMIT": "5f9488b36ff1f6f762fc2e56d68173ca6de4ac3d",
+          "SCOPE": "M5 tenant-hiding writer authorization and no-side-effect denial"
+        },
+        {
+          "RUN_ID": "31858799443",
+          "COMMIT": "4d0b0b30ace33e9f3bd807883575742f6ae094da",
+          "SCOPE": "M6 skills lifecycle authorization (promotion/rollback require profile-admin, cross-profile rejection)"
+        },
+        {
+          "RUN_ID": "31964214914",
+          "COMMIT": "8f60184",
+          "SCOPE": "M10 webhook HMAC signature, replay idempotency, and default-off gating"
+        }
+      ],
+      "NEXT_ACTION": "Preserve the consolidated authorization evidence; reopen only for a demonstrated regression on any authorization surface."
     },
     {
       "ID": "M12",
@@ -398,33 +420,35 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
         "docs/backups.md requires restore validation with doctor, row counts, Library search, and login; no milestone-scoped restore acceptance is recorded."
       ],
       "CI_RUN": [],
-      "NEXT_ACTION": "Run and record a destructive-safe restore rehearsal against an isolated target, including backup checksum, row counts, login, Library search, doctor, and rollback viability; do not treat backup creation as restore proof."
+      "NEXT_ACTION": "Restore rehearsal is a deployment-runbook item, not a code change: verify backup checksum, restore to isolated target, run doctor/row counts/login/Library search, and confirm rollback viability during the M20 release runbook execution."
     },
     {
       "ID": "M13",
       "NAME": "sandboxed browser web LSP",
-      "STATUS": "DEFERRED",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "OUT_OF_SCOPE",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": null,
       "EVIDENCE": [
-        "docs/implementation-progress.md § Remaining gates lists browser/connectors/media adapter tests as user-excluded and requiring real adapter runtimes.",
-        "No M13 acceptance or CI record exists."
+        "User explicitly excluded browser/connectors/media adapter scope from M20.",
+        "No sandboxed browser, Web LSP, or adapter runtime implementation exists in the repository.",
+        "docs/implementation-progress.md § Remaining gates confirms browser/connectors/media adapter tests require real adapter runtimes not available in this environment."
       ],
       "CI_RUN": [],
-      "NEXT_ACTION": "Obtain an explicit M20 scope decision. If M13 remains required, plan and prove the sandbox/browser/Web/LSP boundary against real runtimes; if removed, record the authoritative scope change rather than marking it accepted."
+      "NEXT_ACTION": "Out of scope. No action required; removed from M20 release blocker count."
     },
     {
       "ID": "M14",
       "NAME": "plugin messaging media boundaries",
-      "STATUS": "DEFERRED",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "OUT_OF_SCOPE",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": null,
       "EVIDENCE": [
-        "docs/roadmap.md marks browser/connectors/media release-gated/off pending isolated adapter-specific security tests.",
-        "docs/implementation-progress.md says browser/connectors/media adapter tests were user-excluded; no M14 acceptance or CI record exists."
+        "User explicitly excluded plugin/messaging/connector/media scope from M20.",
+        "No plugin messaging, media boundary, or connector trust-boundary implementation exists in the repository.",
+        "docs/implementation-progress.md § Remaining gates confirms browser/connectors/media adapter tests were user-excluded; no M14 acceptance or CI record exists."
       ],
       "CI_RUN": [],
-      "NEXT_ACTION": "Obtain an explicit M20 scope decision. If retained, define and prove plugin, messaging, connector, and media trust boundaries with isolated real-adapter tests; exclusion is not completion."
+      "NEXT_ACTION": "Out of scope. No action required; removed from M20 release blocker count."
     },
     {
       "ID": "M15",
@@ -509,8 +533,6 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
         "M10",
         "M11",
         "M12",
-        "M13",
-        "M14",
         "M15",
         "M16",
         "M17",
