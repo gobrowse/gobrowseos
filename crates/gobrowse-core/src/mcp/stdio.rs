@@ -281,8 +281,7 @@ mod tests {
         transport.send_request(init_request).await.unwrap();
         let init_response = transport.recv().await.unwrap();
         let init_value =
-            serde_json::from_slice::<serde_json::Value>(&encode(&init_response).unwrap())
-                .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&encode(&init_response).unwrap()).unwrap();
         let server_info = init_value["result"]["serverInfo"].clone();
         assert!(
             !server_info["name"].as_str().unwrap().is_empty(),
@@ -302,10 +301,7 @@ mod tests {
         let tools = list_value["result"]["tools"]
             .as_array()
             .expect("tools array missing");
-        let tool_names: Vec<&str> = tools
-            .iter()
-            .map(|t| t["name"].as_str().unwrap())
-            .collect();
+        let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(
             tool_names.contains(&"echo"),
             "echo tool must be listed, got: {tool_names:?}"
