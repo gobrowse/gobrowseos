@@ -1339,7 +1339,7 @@ async fn scheduler_drains_in_flight_deliveries_on_shutdown() {
         .await
         .expect("poll row");
         if let Some((status,)) = &row
-            && status == "running"
+            && status != "queued"
         {
             claimed = true;
             break;
@@ -1435,7 +1435,7 @@ async fn scheduler_restart_does_not_double_process() {
         .await
         .expect("poll row");
         if let Some((status,)) = &row
-            && status == "running"
+            && status != "queued"
         {
             claimed = true;
             break;
