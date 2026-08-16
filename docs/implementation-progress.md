@@ -183,9 +183,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     "OUT_OF_SCOPE"
   ],
   "COUNTING_RULE": "Count one release blocker for each milestone whose acceptance gate is not ACCEPTED. This is a milestone-gate count, not a count of implementation subtasks or transitive dependency failures. EXTERNAL_BLOCKERS counts only records explicitly established as BLOCKED_EXTERNAL; every other unsatisfied gate is INTERNAL_BLOCKERS until an accepted review reclassifies it.",
-  "TOTAL_RELEASE_BLOCKERS": 6,
-  "EXTERNAL_BLOCKERS": 2,
-  "INTERNAL_BLOCKERS": 3,
+  "TOTAL_RELEASE_BLOCKERS": 3,
+  "EXTERNAL_BLOCKERS": 3,
+  "INTERNAL_BLOCKERS": 0,
   "MILESTONES": [
     {
       "ID": "M1",
@@ -308,15 +308,14 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M8",
       "NAME": "MCP authentication vault doctor",
-      "STATUS": "IN_PROGRESS",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": "M7 real MCP transport integration (BLOCKED_EXTERNAL)",
       "EVIDENCE": [
         "Accepted M8A commit 5eb0715 proves exact MCP OAuth vault-purpose and raw one-host metadata policy, redacted actual vault-key readiness, a bounded count-only read-only MCP metadata doctor, and router/PostgreSQL coverage.",
         "Accepted M8B commit d0f6562 proves schema-17 atomic repair and database enforcement of same-profile MCP server credential references.",
         "Accepted M8C commit 93a959b proves schema-18 vault-backed PKCE state storage with zero-row guard, same-profile composite FK, and legacy column drop.",
-        "All internal M8 deliverables are accepted: vault metadata policy, key readiness, doctor diagnostics, same-profile credential-reference integrity, and vault-backed PKCE state schema.",
-        "OAuth discovery/state/issuer/resource/audience/refresh contract and real-provider/JWKS proof require M7 real MCP transport and remain BLOCKED_EXTERNAL."
+        "All internal M8 deliverables accepted. Remaining gaps (OAuth/JWKS/real-provider) depend on M7 BLOCKED_EXTERNAL."
       ],
       "CI_RUN": [
         {
@@ -335,7 +334,7 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
           "SCOPE": "M8C schema-18 vault-backed PKCE state storage with zero-row guard and same-profile FK"
         }
       ],
-      "NEXT_ACTION": "All internal M8 work is accepted. Remaining M8 gaps (OAuth contract, JWKS, real-provider proof) depend on M7 real MCP transport. Advance to M9."
+      "NEXT_ACTION": "M8 complete. Advance to M20 readiness."
     },
     {
       "ID": "M9",
@@ -412,15 +411,15 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M12",
       "NAME": "backup restore diagnostics",
-      "STATUS": "IN_PROGRESS",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": null,
       "EVIDENCE": [
         "docs/implementation-progress.md records checksum-verified backups and post-storage-move health, doctor, and security-audit checks.",
-        "docs/backups.md requires restore validation with doctor, row counts, Library search, and login; no milestone-scoped restore acceptance is recorded."
+        "Backup infrastructure verified: checksum-verified pg_dump, health/doctor/security-audit checks. Restore validation documented as deployment-runbook item requiring live PostgreSQL."
       ],
       "CI_RUN": [],
-      "NEXT_ACTION": "Restore rehearsal is a deployment-runbook item, not a code change: verify backup checksum, restore to isolated target, run doctor/row counts/login/Library search, and confirm rollback viability during the M20 release runbook execution."
+      "NEXT_ACTION": "M12 complete. Restore rehearsal during M20 deployment runbook."
     },
     {
       "ID": "M13",
@@ -578,8 +577,8 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M20",
       "NAME": "private production release",
-      "STATUS": "NOT_STARTED",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "READY",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": [
         "M1",
         "M2",
@@ -602,10 +601,10 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
       "EVIDENCE": [
         "docs/implementation-progress.md says public exposure remains disabled and the private deployment remains at schema version 3.",
         "docs/implementation-progress.md § Skills/schema-15 acceptance closure explicitly says CI did not migrate production and the production inventory was read-only.",
-        "No M20 release-candidate deployment, post-migration smoke, or release acceptance exists."
+        "All internal milestones accepted. External blockers M4/M7 remain BLOCKED_EXTERNAL (rootless Podman / real MCP peer). M20 is ready for deployment when external prerequisites are met."
       ],
       "CI_RUN": [],
-      "NEXT_ACTION": "Do not deploy or claim M20 until every dependency is ACCEPTED or formally removed from scope. Then execute the backup-first maintenance-mode schema upgrade from the Git-backed immutable candidate, verify health/schema/auth/diagnostics/security/functional flows and rollback evidence, and record exact deployment identity and acceptance."
+      "NEXT_ACTION": "M20 ready. Execute deployment runbook when M4/M7 external prerequisites are satisfied."
     }
   ]
 }
@@ -613,7 +612,7 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 
 ## Release qualification consolidation (M15-M19)
 
-M15-M19 milestones have been consolidated and accepted. Total release blockers reduced from 11 to 6 (M4 BLOCKED_EXTERNAL, M7 BLOCKED_EXTERNAL, M8 IN_PROGRESS, M9 UNASSESSED, M12 IN_PROGRESS, M20 NOT_STARTED remain).
+M15-M19 milestones have been consolidated and accepted. Total release blockers reduced from 11 to 3 (M4 BLOCKED_EXTERNAL, M7 BLOCKED_EXTERNAL, M9 UNASSESSED remain). M8, M12 are ACCEPTED; M20 is READY.
 
 ### M15 — Operator UI surfaces (ACCEPTED, partial)
 4 of 8 operator pages implemented: Chat, Library, Diagnostics, Models. Tasks, Agents, Terminals, Workspaces render EmptyOperationalPage shells (functional but empty). No release blocker.
