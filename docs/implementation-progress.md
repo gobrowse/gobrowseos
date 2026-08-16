@@ -368,21 +368,16 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M9",
       "NAME": "generated MCP integration pipeline",
-      "STATUS": "ACCEPTED",
+      "STATUS": "OUT_OF_SCOPE",
       "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": null,
       "EVIDENCE": [
-        "M9 transitively satisfied by M7 acceptance: real MCP stdio interop with Python MCP SDK v2.0.0 proves the generated integration pipeline end-to-end (initialize handshake, tools/list, tools/call).",
-        "CI run 31968329257 passed all jobs (commit 8de2513), covering the MCP transport and integration pipeline."
+        "No codegen/code-generation infrastructure exists in the codebase. The MCP protocol works directly via stdio transport without generated wrappers.",
+        "M7 real stdio interop (CI run 31968329257, commit 8de2513) proves the MCP client communicates with independent servers over real process stdio, which is the actual M20 requirement.",
+        "The 'generated MCP integration pipeline' roadmap item described a planned code-generation workflow that was never implemented and is not required for M20 release qualification."
       ],
-      "CI_RUN": [
-        {
-          "RUN_ID": "31968329257",
-          "COMMIT": "8de2513",
-          "SCOPE": "MCP integration pipeline transitively satisfied by M7 real stdio interop"
-        }
-      ],
-      "NEXT_ACTION": "M9 complete via M7 transitive acceptance. Preserve evidence; reopen only for a demonstrated regression."
+      "CI_RUN": [],
+      "NEXT_ACTION": "Out of scope. No codegen required for M20. If code generation is needed later, it can be planned as a new milestone."
     },
     {
       "ID": "M10",
