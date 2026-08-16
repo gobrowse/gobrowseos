@@ -1,16 +1,135 @@
-use std::{path::Path, sync::Arc};
+use std::{net::IpAddr, path::Path, sync::Arc};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use gobrowse_core::sandbox::is_public_destination;
 use rand::RngCore;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use thiserror::Error;
+use url::Host;
 use uuid::Uuid;
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::{config::VaultSettings, error::AppError};
 
+pub(crate) const MCP_OAUTH_ACCESS_TOKEN: &str = "mcp_oauth_access_token";
+pub(crate) const MCP_OAUTH_REFRESH_TOKEN: &str = "mcp_oauth_refresh_token";
+pub(crate) const MCP_OAUTH_CLIENT_SECRET: &str = "mcp_oauth_client_secret";
+pub(crate) const MCP_OAUTH_PKCE_VERIFIER: &str = "mcp_oauth_pkce_verifier";
+
+const MCP_PURPOSES: [&str; 4] = [
+    MCP_OAUTH_ACCESS_TOKEN,
+    MCP_OAUTH_REFRESH_TOKEN,
+    MCP_OAUTH_CLIENT_SECRET,
+    MCP_OAUTH_PKCE_VERIFIER,
+];
+
+/// Validate and canonicalize the metadata policy for a stored secret.
+///
+/// Non-MCP purposes retain the existing purpose and host-list behavior. MCP OAuth
+/// purposes are deliberately narrower: exactly one authority host is required,
+/// and it must be syntactically canonical and a public literal when it is an IP.
+pub(crate) fn validate_secret_metadata(
+    purpose: &str,
+    allowed_hosts: &[String],
+) -> Result<Vec<String>, AppError> {
+    if purpose.is_empty() || purpose.len() > 100 {
+        return Err(AppError::Validation(
+            "secret purpose must contain 1 to 100 characters".into(),
+        ));
+    }
+    if purpose.starts_with("mcp_") {
+        if !MCP_PURPOSES.contains(&purpose) {
+            return Err(AppError::Validation(
+                "unsupported MCP secret purpose".into(),
+            ));
+        }
+        if allowed_hosts.len() != 1 {
+            return Err(AppError::Validation(
+                "MCP OAuth secrets require exactly one allowed host".into(),
+            ));
+        }
+        return canonical_transmission_host(&allowed_hosts[0]).map(|host| vec![host]);
+    }
+    Ok(allowed_hosts.to_vec())
+}
+
+pub(crate) fn validate_legacy_hosts(allowed_hosts: &[String]) -> Result<Vec<String>, AppError> {
+    if allowed_hosts.iter().any(|host| {
+        host.len() > 253
+            || (!host.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
+            }) && host.parse::<IpAddr>().is_err())
+    }) {
+        return Err(AppError::Validation(
+            "allowed_hosts must contain at most 20 valid DNS names or IP addresses".into(),
+        ));
+    }
+    Ok(allowed_hosts.to_vec())
+}
+
+/// Canonicalize one authority host without resolving DNS.
+pub(crate) fn canonical_transmission_host(host: &str) -> Result<String, AppError> {
+    if host.trim() != host {
+        return Err(AppError::Validation(
+            "allowed host must be one canonical authority host".into(),
+        ));
+    }
+    if host.ends_with("..") {
+        return Err(AppError::Validation(
+            "allowed host must be one canonical authority host".into(),
+        ));
+    }
+    let host = host.strip_suffix('.').unwrap_or(host);
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '?' | '#'))
+    {
+        return Err(AppError::Validation(
+            "allowed host must be one canonical authority host".into(),
+        ));
+    }
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !is_public_destination(ip) {
+            return Err(AppError::Validation(
+                "allowed host must be a public transmission host".into(),
+            ));
+        }
+        return Ok(ip.to_string());
+    }
+
+    // Host::parse performs IDNA canonicalization for DNS names. We still apply
+    // strict authority-label checks to reject userinfo, ports, wildcards, and
+    // malformed labels before accepting the resulting ASCII form.
+    let domain = match Host::parse(host) {
+        Ok(Host::Domain(domain)) => domain,
+        _ => {
+            return Err(AppError::Validation(
+                "allowed host must be one canonical authority host".into(),
+            ));
+        }
+    };
+    let domain = domain.to_ascii_lowercase();
+    if domain.len() > 253
+        || domain.split('.').any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+                || label.starts_with('-')
+                || label.ends_with('-')
+        })
+    {
+        return Err(AppError::Validation(
+            "allowed host must be one canonical authority host".into(),
+        ));
+    }
+    Ok(domain)
+}
 const ALGORITHM: &str = "AES-256-GCM-ENVELOPE-V1";
 const NONCE_LENGTH: usize = 12;
 
@@ -538,5 +657,155 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn mcp_purposes_require_one_canonical_public_host() {
+        for purpose in MCP_PURPOSES {
+            assert_eq!(
+                validate_secret_metadata(purpose, &["EXAMPLE.COM.".into()]).unwrap(),
+                vec!["example.com"]
+            );
+        }
+        assert_eq!(
+            validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &["2001:4860:4860::8888".into()])
+                .unwrap(),
+            vec!["2001:4860:4860::8888"]
+        );
+        assert_eq!(
+            validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &["EXAMPLE.com.".into()]).unwrap(),
+            vec!["example.com"]
+        );
+        assert!(
+            validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &["example.com..".into()]).is_err()
+        );
+        assert_eq!(
+            validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &["例え.テスト".into()]).unwrap(),
+            vec!["xn--r8jz45g.xn--zckzah"]
+        );
+    }
+
+    #[test]
+    fn mcp_policy_rejects_unknown_purposes_and_unsafe_hosts() {
+        for purpose in ["mcp_oauth_token", "mcp_api_key", "mcp_"] {
+            assert!(validate_secret_metadata(purpose, &["example.com".into()]).is_err());
+        }
+        for host in [
+            "https://example.com",
+            "user@example.com",
+            "example.com:443",
+            "example.com/path",
+            "*.example.com",
+            "bad..example.com",
+            "127.0.0.1",
+            "169.254.169.254",
+            "192.168.1.1",
+            "[2001:4860:4860::8888]",
+        ] {
+            assert!(
+                validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &[host.into()]).is_err(),
+                "host should be rejected: {host}"
+            );
+        }
+        assert!(validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &[]).is_err());
+        assert!(
+            validate_secret_metadata(
+                MCP_OAUTH_ACCESS_TOKEN,
+                &["example.com".into(), "other.com".into()]
+            )
+            .is_err()
+        );
+        for hosts in [
+            vec![" example.com".into()],
+            vec!["example.com ".into()],
+            vec!["".into()],
+            vec!["example.com".into(), "example.com".into()],
+        ] {
+            assert!(
+                validate_secret_metadata(MCP_OAUTH_ACCESS_TOKEN, &hosts).is_err(),
+                "raw MCP host entries must be strictly validated: {hosts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_mcp_purpose_behavior_remains_unrestricted_by_mcp_policy() {
+        assert_eq!(
+            validate_secret_metadata(
+                "provider_credential",
+                &["internal.example".into(), "other.example".into()]
+            )
+            .unwrap(),
+            vec!["internal.example", "other.example"]
+        );
+        assert_eq!(
+            validate_secret_metadata("provider_credential", &["2001:db8::1".into()]).unwrap(),
+            vec!["2001:db8::1"]
+        );
+    }
+    #[tokio::test]
+    async fn from_settings_validates_current_and_previous_key_material() {
+        let current = STANDARD.encode([7_u8; 32]);
+        let previous = STANDARD.encode([8_u8; 32]);
+        let settings = VaultSettings {
+            master_key_base64: Some(SecretString::from(current)),
+            key_version: 7,
+            previous_master_key_base64: Some(SecretString::from(previous)),
+            previous_key_version: Some(6),
+            ..VaultSettings::default()
+        };
+        let vault = Vault::from_settings(&settings)
+            .await
+            .expect("valid current and previous keys");
+        assert!(vault.is_available());
+        assert!(vault.cipher_for(7).is_some());
+        assert!(vault.cipher_for(6).is_some());
+    }
+
+    #[tokio::test]
+    async fn from_settings_rejects_invalid_key_material_without_panicking() {
+        for value in [
+            "not-base64",
+            &STANDARD.encode([1_u8; 31]),
+            &STANDARD.encode([1_u8; 33]),
+        ] {
+            let settings = VaultSettings {
+                master_key_base64: Some(SecretString::from((*value).to_owned())),
+                ..VaultSettings::default()
+            };
+            assert!(Vault::from_settings(&settings).await.is_err());
+        }
+        let settings = VaultSettings {
+            master_key_base64: Some(SecretString::from(STANDARD.encode([1_u8; 32]))),
+            previous_key_version: Some(2),
+            ..VaultSettings::default()
+        };
+        assert!(Vault::from_settings(&settings).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn from_settings_rejects_unreadable_and_insecure_key_files() {
+        let missing = std::env::temp_dir().join(format!("gobrowse-missing-{}", Uuid::now_v7()));
+        let missing_settings = VaultSettings {
+            master_key_file: Some(missing),
+            ..VaultSettings::default()
+        };
+        assert!(Vault::from_settings(&missing_settings).await.is_err());
+
+        #[cfg(unix)]
+        {
+            use std::{fs, os::unix::fs::PermissionsExt};
+
+            let path = std::env::temp_dir().join(format!("gobrowse-insecure-{}", Uuid::now_v7()));
+            fs::write(&path, STANDARD.encode([3_u8; 32])).expect("write test key");
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o640))
+                .expect("set insecure test key permissions");
+            let settings = VaultSettings {
+                master_key_file: Some(path.clone()),
+                ..VaultSettings::default()
+            };
+            assert!(Vault::from_settings(&settings).await.is_err());
+            fs::remove_file(path).expect("remove test key");
+        }
     }
 }

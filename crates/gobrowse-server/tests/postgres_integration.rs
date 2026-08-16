@@ -1,7 +1,13 @@
 mod common;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use gobrowse_server::{config::VaultSettings, vault};
+use gobrowse_server::{
+    config::{
+        AuthSettings, DatabaseSettings, FeatureSettings, HttpSettings, ObservabilitySettings,
+        Settings, VaultSettings,
+    },
+    doctor, vault,
+};
 use secrecy::{ExposeSecret, SecretString};
 use sqlx::{Connection, PgConnection, PgPool, Row};
 use time::{Duration, OffsetDateTime};
@@ -1049,6 +1055,162 @@ async fn vault_round_trip_never_persists_plaintext() {
         .rollback()
         .await
         .expect("rollback stale writer");
+}
+
+#[tokio::test]
+async fn doctor_reports_redacted_mcp_metadata_readiness_counts() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping PostgreSQL integration test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let profile_id = Uuid::now_v7();
+    sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'doctor-mcp-test')")
+        .bind(profile_id)
+        .execute(&pool)
+        .await
+        .expect("create doctor test profile");
+    let settings = Settings {
+        http: HttpSettings::default(),
+        database: DatabaseSettings {
+            url: database_url.clone().into(),
+            max_connections: 1,
+        },
+        auth: AuthSettings::default(),
+        vault: VaultSettings {
+            master_key_base64: Some(SecretString::from(STANDARD.encode([29_u8; 32]))),
+            key_version: 7,
+            previous_master_key_base64: Some(SecretString::from(STANDARD.encode([30_u8; 32]))),
+            previous_key_version: Some(6),
+            ..VaultSettings::default()
+        },
+        features: FeatureSettings::default(),
+        observability: ObservabilitySettings::default(),
+    };
+    let configured_vault = vault::Vault::from_settings(&settings.vault)
+        .await
+        .expect("valid doctor vault");
+    let empty_checks = doctor::run(&settings, Some(&pool)).await;
+    let empty_check = empty_checks
+        .iter()
+        .find(|check| check.name == "MCP OAuth vault metadata")
+        .expect("empty MCP doctor check");
+    assert!(matches!(empty_check.status, doctor::Status::Warn));
+    assert_eq!(empty_check.detail, "credentials=0, ready=0, invalid=0");
+    let rows = [
+        (
+            "mcp_oauth_access_token",
+            vec!["example.com"],
+            "encrypted_database",
+            7,
+        ),
+        (
+            "mcp_oauth_refresh_token",
+            vec!["example.com"],
+            "encrypted_database",
+            6,
+        ),
+        ("mcp_unknown", vec!["example.com"], "encrypted_database", 7),
+        (
+            "mcp_oauth_client_secret",
+            vec!["example.com"],
+            "legacy_encrypted_database",
+            7,
+        ),
+        (
+            "mcp_oauth_pkce_verifier",
+            vec!["127.0.0.1"],
+            "encrypted_database",
+            7,
+        ),
+    ];
+    for (purpose, allowed_hosts, backend, key_version) in rows {
+        let id = format!("doctor-secret-{}", Uuid::now_v7());
+        if backend == "encrypted_database" {
+            let encrypted = configured_vault
+                .encrypt(
+                    profile_id,
+                    &id,
+                    purpose,
+                    &SecretString::from("doctor-test-secret"),
+                )
+                .expect("encrypt doctor fixture");
+            sqlx::query(
+                "INSERT INTO secret_references \
+                 (id,profile_id,backend,locator,encrypted_value,nonce,key_version,purpose,allowed_hosts,algorithm,wrapped_data_key,wrap_nonce) \
+                 VALUES ($1,$2,$3,'database',$4,$5,$6,$7,$8,$9,$10,$11)",
+            )
+            .bind(&id)
+            .bind(profile_id)
+            .bind(backend)
+            .bind(encrypted.ciphertext)
+            .bind(encrypted.nonce)
+            .bind(key_version)
+            .bind(purpose)
+            .bind(allowed_hosts.as_slice())
+            .bind(vault::algorithm())
+            .bind(encrypted.wrapped_data_key)
+            .bind(encrypted.wrap_nonce)
+            .execute(&pool)
+            .await
+            .expect("insert encrypted doctor fixture");
+        } else {
+            sqlx::query(
+                "INSERT INTO secret_references \
+                 (id,profile_id,backend,locator,purpose,allowed_hosts) \
+                 VALUES ($1,$2,$3,'legacy',$4,$5)",
+            )
+            .bind(&id)
+            .bind(profile_id)
+            .bind(backend)
+            .bind(purpose)
+            .bind(allowed_hosts.as_slice())
+            .execute(&pool)
+            .await
+            .expect("insert legacy doctor fixture");
+        }
+    }
+    let checks = doctor::run(&settings, Some(&pool)).await;
+    let check = checks
+        .iter()
+        .find(|check| check.name == "MCP OAuth vault metadata")
+        .expect("MCP doctor check");
+    assert!(matches!(check.status, doctor::Status::Fail));
+    assert_eq!(check.detail, "credentials=5, ready=2, invalid=3");
+    assert!(!check.detail.contains("doctor-secret"));
+    assert!(!check.detail.contains("doctor-test-secret"));
+
+    let overflow_prefix = format!("doctor-overflow-{}-", Uuid::now_v7());
+    sqlx::query(
+        "INSERT INTO secret_references \
+         (id,profile_id,backend,locator,encrypted_value,nonce,key_version,purpose,allowed_hosts,algorithm,wrapped_data_key,wrap_nonce) \
+         SELECT $1 || i::text,$2,'encrypted_database','database',decode('00','hex'), \
+                decode('000000000000000000000000','hex'),7,'mcp_oauth_access_token', \
+                ARRAY['example.com']::text[],$3,decode('00','hex'),decode(md5(i::text),'hex') \
+         FROM generate_series(1,1001) AS i",
+    )
+    .bind(&overflow_prefix)
+    .bind(profile_id)
+    .bind(vault::algorithm())
+    .execute(&pool)
+    .await
+    .expect("insert overflow doctor fixtures");
+    let overflow_checks = doctor::run(&settings, Some(&pool)).await;
+    let overflow_check = overflow_checks
+        .iter()
+        .find(|check| check.name == "MCP OAuth vault metadata")
+        .expect("overflow MCP doctor check");
+    assert!(matches!(overflow_check.status, doctor::Status::Fail));
+    assert_eq!(
+        overflow_check.detail,
+        "credentials>1000, ready=0, invalid>1000"
+    );
+    sqlx::query("DELETE FROM profiles WHERE id=$1")
+        .bind(profile_id)
+        .execute(&pool)
+        .await
+        .expect("cleanup doctor test profile");
 }
 
 #[tokio::test]

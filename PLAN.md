@@ -1,21 +1,11 @@
-# PLAN.md — M5 Inert Worktree Metadata CRUD
+# PLAN.md — M8A Offline MCP OAuth Vault Metadata and Doctor Readiness
 
-## Status, Decision, and Roadmap Boundary
+## Status and boundary
 
-**M5 is `ACCEPTED`.** Exact implementation candidate commit
-`5f9488b36ff1f6f762fc2e56d68173ca6de4ac3d` passed CI run `31916585665`:
-Rust `95089262788`, web `95089262756`, supply-chain `95089262752`, and
-container `95089262753`.
-
-Acceptance covers only workspace-scoped inert worktree metadata lifecycle,
-legacy migration repair/quarantine proof, tenant-hiding writer authorization
-(`404` hidden versus `403` known `VIEWER`), no-side-effect denial proof, and
-the existing task/activity route registration required by real integration
-coverage. It does not claim Git worktree execution, subagent execution,
-sandbox isolation, production deployment, or a live migration.
-
-The next M20 priority is M8's exact completion matrix. M4 and M7 remain
-independent `BLOCKED_EXTERNAL` gates recorded below.
+**M8 remains `IN_PROGRESS`.** M5/M6 are accepted. This bounded M8A slice does
+not complete M8 and does not reduce the milestone-gate blocker count. It
+implements only offline MCP OAuth credential metadata policy and redacted vault
+readiness diagnostics.
 
 ## Preserved External Records
 
@@ -65,225 +55,63 @@ change, or a locally fabricated result. Until then, M4 remains
 `BLOCKED_EXTERNAL`, the sandbox remains release-gated and off, and there is no
 M4 runtime-proof success claim.
 
-## Exact Product Boundary
+## M8A implementation
 
-Implement these five authenticated HTTP routes under the existing `/api/v1`
-router:
+### Exact policy
 
-| Route | Behavior |
-|---|---|
-| `GET /workspaces/{workspace_id}/worktrees` | List worktrees the caller may read in `last_activity_at DESC, id DESC` order; clamp `limit` to `1..=500`. |
-| `POST /workspaces/{workspace_id}/worktrees` | Create inert metadata and return `201 Created`. |
-| `GET /worktrees/{id}` | Return one authorized row. |
-| `PATCH /worktrees/{id}` | Replace only the canonical bounded `changed_files` inventory and return `200 OK`. |
-| `DELETE /worktrees/{id}` | Delete only the metadata row and return `204 No Content`. |
+- Recognize exactly `mcp_oauth_access_token`, `mcp_oauth_refresh_token`,
+  `mcp_oauth_client_secret`, and `mcp_oauth_pkce_verifier`.
+- Reject every other purpose beginning with `mcp_`; preserve non-MCP purpose
+  behavior.
+- Every recognized MCP purpose requires exactly one canonical authority host.
+  Canonicalization is shared by vault create, replace, and doctor: normalize
+  case/trailing-dot and IDNA DNS names; reject empty/malformed labels, URLs,
+  userinfo, ports, paths, queries, fragments, wildcards, and malformed
+  authorities. Literal IPs are accepted only when
+  `gobrowse_core::sandbox::is_public_destination` classifies them as public.
+  Never resolve DNS in this slice.
 
-Create accepts exactly `task_id`, `owner_agent_id`, `repository_root`, optional
-`branch`, and `base_commit`. `task_id` and `owner_agent_id` must name existing
-rows in the route workspace. `repository_root` is UTF-8 metadata that is
-absolute and lexically normalized; it is not canonicalized or inspected on the
-filesystem. `base_commit` is a full 40- or 64-character hexadecimal object ID;
-abbreviations, symbolic refs, options, whitespace, and non-hex values fail.
+### Doctor and security invariants
 
-When no branch is supplied, derive it with `task_branch(task_id, task.title)`.
-The client never supplies the final `path`: derive it with `worktree_path` as
-`repository_root/worktrees/task-<first-12-simple-UUID>`. Creation fixes status
-to `ACTIVE`. After creation, `task_id`, `owner_agent_id`, `branch`,
-`base_commit`, and `path` are immutable. PATCH accepts a non-empty bounded list
-of canonical repository-relative UTF-8 file paths only. It rejects absolute
-paths, empty names or segments, `.`, `..`, controls/NUL, and backslash aliases;
-its limits and deterministic duplicate policy are shared by core and database
-validation. Identical PATCHes are `422` and append no event.
+- Keep envelope encryption, AAD, rotation, fencing, profile scoping, and
+  OWNER/ADMIN authorization unchanged. Do not decrypt or write during doctor.
+- Construct `Vault::from_settings` exactly once per doctor run. A valid current
+  key and optional valid previous key pass; absent configuration warns; invalid
+  base64/length, unreadable or insecure files, and inconsistent sources fail
+  with one generic redacted detail. No paths, raw errors, IDs, hosts, secrets,
+  ciphertext, or envelope fields may appear in the new readiness output.
+- Use one bounded read-only PostgreSQL metadata query selecting only `purpose`,
+  `allowed_hosts`, `backend`, and `key_version` for `mcp_` rows. The fixed
+  inspection cap is 1000 rows; query 1001 rows to detect overflow
+  deterministically and fail without unbounded allocation. Fold to aggregate
+  counts only. No decrypt, lock, rotation, or write.
+- No rows warns. Valid recognized purpose/host/backend and current or valid
+  previous key version passes. Unknown/stale purpose, invalid host or host
+  cardinality, unsupported backend, stale key version, unavailable vault, or
+  query failure fails with redacted count/generic detail.
 
-Responses expose only `id`, `workspace_id`, `task_id`, `owner_agent_id`,
-`branch`, `base_commit`, `path`, `status`, `changed_files`, and
-`last_activity_at`. This is a metadata boundary: a later executor must obtain a
-trusted configured repository root and rederive/revalidate; it must never trust
-the database path or a ledger event as a host capability.
+### Files and tests
 
-Use existing authentication semantics without exceptions: unauthenticated
-requests are `401`; existing globally read-only roles are `403` under
-`require_writer`; inaccessible workspaces or worktrees are tenant-hiding `404`;
-unsafe or invalid input, empty/identical update, and same-workspace task/agent
-failure are `422`; and branch/path ownership conflicts, including races, are
-`409` without raw database error disclosure.
+Modify only `PLAN.md`, `crates/gobrowse-server/src/vault.rs`,
+`crates/gobrowse-server/src/vault_api.rs`, `crates/gobrowse-server/src/doctor.rs`,
+and focused existing/new server tests. Add pure policy, key-readiness,
+classifier, redaction, authenticated router, and real PostgreSQL tests using
+the existing shared advisory lock convention. Do not add dependencies,
+configuration, migrations, frontend changes, OAuth/JWKS/discovery/DNS
+resolution, token refresh, MCP transport/server CRUD, or sandbox behavior.
 
-## Required Implementation
+Validation is focused formatting, native warnings-denied checks, and focused
+unit/router/PostgreSQL tests; PostgreSQL tests must report their existing
+`GOBROWSE_TEST_DATABASE_URL` skip exactly when unavailable. Do not claim stored
+ciphertext decrypts, provider interoperability, real OAuth/JWKS behavior, or
+M8 acceptance.
 
-1. In `crates/gobrowse-core/src/worktrees.rs`, retain process-free validation
-   and strengthen it. `validate_branch` must reject Git-ref hazards including
-   `@`, `@{`, repeated slash, controls and forbidden characters, `refs/`,
-   trailing dot or `.lock`, and dot-leading/dot-only components. Make
-   `worktree_path` reject relative or lexically non-normal roots. Add distinct
-   pure validation for base commits and bounded changed files; represent unsafe
-   repository-root, base-commit, and changed-file outcomes distinctly. No Git
-   command, shell, filesystem lookup, or repository abstraction is permitted.
-2. In `crates/gobrowse-core/src/activity.rs`, add
-   `ActivityKind::WorktreeDeleted`; do not overload agent, merge, or commit
-   lifecycle kinds.
-3. In `crates/gobrowse-server/src/task_api.rs`, expose only the necessary
-   existing helpers as `pub(crate)`: `authorize_workspace`,
-   `authorize_workspace_in_transaction`, `append_activity`, and
-   `require_writer`. Reuse them; do not create a second authorization,
-   locking, cursor, or event-insertion convention.
-4. Add `crates/gobrowse-server/src/worktree_api.rs` with direct SQLx matching
-   `task_api`: request/query/response types, list/create/get/update/delete,
-   authorized-worktree helpers, row mapping, bounded validation, and stable
-   conflict mapping. Add `pub mod worktree_api` and wire exactly the five
-   routes in `crates/gobrowse-server/src/lib.rs`.
-5. Add `crates/gobrowse-server/migrations/0016_worktree_integrity.sql`; make
-   it set `schema_metadata.schema_version = 16`.
-6. Add real PostgreSQL/router proof in
-   `crates/gobrowse-server/tests/worktrees_integration.rs`, using
-   `tests/common::acquire_test_lock`. Update
-   `crates/gobrowse-server/tests/postgres_integration.rs` to expect fresh
-   schema 16, extend the deployed schema-3 upgrade through 0016, and add a
-   focused schema-15-to-16 integrity-repair upgrade test.
-7. After exact-SHA acceptance only, update `docs/worktrees.md` to describe
-   authorized inert metadata and the future trusted-root requirement, and
-   `docs/implementation-progress.md` only to claim metadata/database proof—
-   never worktree execution, sandbox isolation, delegation, or release-gate
-   completion.
+## Remaining M8 blockers
 
-## Schema-16 Integrity Migration
-
-Before adding new constraints, identify legacy `worktrees` whose task or owner
-agent is outside the workspace, whose branch/path/base commit is unsafe, or
-whose `changed_files` is unsafe. Preserve every rejected row, all original
-columns, and explicit reasons in `worktree_integrity_quarantine`. Protect that
-table with rejecting `UPDATE`, `DELETE`, and `TRUNCATE` triggers equivalent to
-the existing task-integrity quarantine protections; then remove the unsafe
-metadata row. Never silently repair/reassign a workspace, task, or agent.
-
-Drop `worktrees_task_id_fkey` and `worktrees_owner_agent_id_fkey`. Add:
-
-- `worktrees_task_same_workspace_fk (workspace_id, task_id)` referencing
-  `tasks(workspace_id, id) ON DELETE RESTRICT`;
-- `worktrees_owner_same_workspace_fk (workspace_id, owner_agent_id)`
-  referencing `agents(workspace_id, id) ON DELETE RESTRICT`.
-
-Reuse composite keys installed by migration 0010. Retain existing
-workspace-scoped unique branch/path ownership. Install database functions and
-checks that mirror pure validation for branch, task-derived absolute path, full
-base commit, and bounded normalized `changed_files`, so raw SQL cannot bypass
-the API. Do not modify task/agent semantics, activity cursor ordering, audit
-append-only behavior, or prior migrations.
-
-Migration risk is material: the known private deployment is schema 3 and must
-upgrade through every intermediate migration to 16. Fresh schema, schema-15
-repair, and deployed-schema-3 upgrade paths must be proven. Rust and SQL
-validators can drift and must exercise identical accepted/rejected fixtures.
-Before deployment, take and verify a backup/restore point and ensure adequate
-disk for bounded metadata/evidence. If product ownership has not explicitly
-accepted quarantine-and-remove treatment for unsafe legacy rows, stop before
-authoring or applying the migration.
-
-## Authorization, Ledger, and Concurrency
-
-All reads require the existing authenticated profile/workspace-membership
-predicate. All mutations use `require_writer`. Within the transaction,
-reauthorize after acquiring the workspace guard; retain existing profile
-OWNER/ADMIN and workspace OWNER/EDITOR rules, and deny VIEWER mutation.
-Authorization must preserve tenant hiding: foreign-profile, nonexistent,
-absent-membership, and inaccessible-resource requests return `404`; only an
-authenticated principal whose profile-filtered workspace access is known and
-whose global role or explicit workspace membership is `VIEWER` returns
-`403` for a mutation. Denied mutations append no state, ledger, audit, or
-worktree side effects.
-
-Acquire locks in this order for every mutation:
-
-1. workspace Activity Ledger advisory lock;
-2. workspace row;
-3. membership row when needed;
-4. worktree row for PATCH/DELETE.
-
-For create, authorize first under that order, then validate the task and owner
-agent in the route workspace. Never lock a worktree before the workspace guard.
-The workspace lock serializes membership revocation, uniqueness claims,
-metadata mutation/deletion, and event cursor allocation. Database unique
-constraints remain final authority. Create uses `INSERT ... ON CONFLICT DO
-NOTHING RETURNING` (or equivalent explicit constraint mapping): no returned row
-is `409`; exactly one concurrent same-branch/path claimant may append evidence.
-PATCH and DELETE lock the authorized row `FOR UPDATE`. Do not add an in-memory
-mutex or publish before commit.
-
-Each successful mutation appends its lifecycle Activity Ledger event and
-append-only audit row in the same transaction as its metadata change. HTTP
-mutations attribute `actor_user_id` to the authenticated user and set
-`agent_id = NULL`; `owner_agent_id` is payload metadata, not proof that the
-agent acted. Suggested audit actions are `worktree.created`,
-`worktree.files_changed`, and `worktree.deleted`.
-
-- `WORKTREE_CREATED`: `worktree_id`, `branch`, `base_commit`, `owner_agent_id`.
-- `FILES_CHANGED`: `worktree_id`, bounded `changed_files`.
-- `WORKTREE_DELETED`: `worktree_id`, `branch`, `owner_agent_id`.
-
-Never put an absolute host path in the ledger. `append_activity` and its
-database trigger retain commit-ordered workspace cursors. The public activity
-endpoint must reject `WORKTREE_DELETED`, as it rejects all reserved lifecycle
-kinds.
-
-## Required Proof
-
-Core unit tests must prove safe generated/explicit branch acceptance and
-rejection of traversal/ref syntax, `@`, `@{`, repeated slash, controls,
-forbidden characters, trailing dot/`.lock`, `refs/`, and dot components. They
-must prove exact path derivation from normalized absolute roots, reject relative
-or `CurDir`/`ParentDir` roots, accept exactly 40/64 hex commits, and cover
-changed-file normalization, rejection cases, bounds, aggregate size, and
-deterministic duplicates.
-
-Real PostgreSQL/router tests must cover owner/editor create; member/viewer
-reads; foreign-tenant `404`; viewer denial; full list/get/update/delete
-responses; server default branch/path derivation; prohibition on client
-path/status input; immutable identity fields; and stable `422`/`409` mapping.
-They must prove same-workspace task/agent enforcement through both API and raw
-SQL, database rejection of unsafe values, actor attribution and exactly one
-event/audit per successful mutation, metadata-only delete, reserved-event
-anti-forgery, and existing append-only event behavior.
-
-Race tests must prove two identical creates return one `201` and one `409`,
-with one row, one creation event, and one successful audit; membership
-revocation racing create/PATCH/DELETE must prevent commit, following the
-existing task-create race pattern. Migration tests must prove unsafe schema-15
-rows are fully quarantined before removal, safe rows survive, recurrence is
-blocked, fresh schema is 16, and isolated schema-3 upgrade reaches 16.
-
-After focused core, PostgreSQL/router, and migration proof, run repository
-standard formatting, native/WASM warnings-denied Clippy, full PostgreSQL
-Nextest, migrations CLI, web/Trunk, supply-chain, and container CI at the exact
-candidate SHA. Acceptance language must state only metadata CRUD and database
-isolation—not Git worktree creation, subagent execution, sandbox isolation, or
-completed M5/delegation release gates.
-
-## Non-goals and Stop Conditions
-
-This plan excludes Git commands (`worktree add/remove/prune` and
-`check-ref-format`), shells/processes, filesystem checks/canonicalization,
-checkout/diff/commit/merge/cleanup, quotas/disk reservation, sandboxd, MCP,
-Skills, UI, WebSockets, checkpoints, tools/approval policy, and all M4/M7
-changes. It creates no agent/run, starts no subagent, assigns no task,
-transitions no task state, adds no status state machine, branch rename/rebase,
-head tracking, merge lifecycle, or runtime attribution. It does not accept a
-client final path or treat metadata as a host capability.
-
-Stop and open a separate plan if correct behavior needs a trusted repository
-registry/root, filesystem inspection/canonicalization, Git/shell/process use,
-worktree cleanup, quota enforcement, agent/run creation, delegation/task-state
-operation, or agent-runtime attribution. Stop and split if status transitions,
-branch rename/rebase, head tracking, merge/checkpoint lifecycle, or WebSocket
-fanout becomes necessary. Stop rather than bypass pure validation, transaction
-reauthorization, database uniqueness, append-only triggers, or commit-before-
-publish ordering.
-
-No production deployment is part of this coding slice. Deployment requires a
-verified backup, schema-3-to-16 migration, quarantine inspection,
-health/readiness checks, and a rollback/restore procedure; do not deploy an
-old binary after schema 16 without explicit backward-compatibility proof.
-Real PostgreSQL is required for authoritative migration/integration proof, but
-no Git binary, shell, Docker, sandboxd, network, or external peer is a
-build/runtime prerequisite. Existing workspace/task/owner-agent rows are a
-precondition; because no server agent-provisioning API exists, tests may seed
-agents directly and the result must not be advertised as a complete end-user
-delegation workflow.
+M8 still requires a separately reviewed same-profile composite integrity
+migration for MCP server credential references, vault-backed PKCE state
+remodeling, the complete OAuth state/issuer/resource/audience/refresh contract,
+and real-provider/JWKS rotation and interoperability proof. M7 additionally
+remains blocked on the independently pinned real MCP stdio peer above. M4
+remains blocked on the approved rootless Podman runner and immutable image
+prerequisites above. No item in this M8A slice retires those blockers.

@@ -10,17 +10,18 @@ use axum::{
     body::Body,
     http::{Method, Request, StatusCode, header},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use gobrowse_server::{
     AppState,
     config::{
         AuthSettings, DatabaseSettings, FeatureSettings, HttpSettings, ObservabilitySettings,
         Settings, VaultSettings,
     },
-    db,
+    db, router,
 };
 use http_body_util::BodyExt;
 use secrecy::SecretString;
-use serde_json::Value;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use tokio::net::TcpListener;
@@ -96,6 +97,49 @@ async fn create_authed_session(pool: &PgPool, role: &str) -> (Uuid, Uuid, String
     .expect("create test session");
 
     (profile_id, user_id, format!("gobrowse_session={token}"))
+}
+async fn create_session_for_profile(pool: &PgPool, profile_id: Uuid, role: &str) -> (Uuid, String) {
+    let user_id = Uuid::now_v7();
+    let token = format!("security-guard-session-{}", Uuid::now_v7());
+    sqlx::query(
+        "INSERT INTO users (id, email, display_name, password_hash, role, primary_profile_id) \
+         VALUES ($1, $2, 'Security Guard Test', 'unused', $3, $4)",
+    )
+    .bind(user_id)
+    .bind(format!("{user_id}@example.test"))
+    .bind(role)
+    .bind(profile_id)
+    .execute(pool)
+    .await
+    .expect("create test user");
+
+    let now = time::OffsetDateTime::now_utc();
+    sqlx::query(
+        "INSERT INTO sessions (token_hash, user_id, auth_epoch, expires_at, absolute_expires_at) \
+         VALUES ($1, $2, 1, $3, $4)",
+    )
+    .bind(Sha256::digest(token.as_bytes()).to_vec())
+    .bind(user_id)
+    .bind(now + time::Duration::hours(1))
+    .bind(now + time::Duration::hours(2))
+    .execute(pool)
+    .await
+    .expect("create test session");
+
+    (user_id, format!("gobrowse_session={token}"))
+}
+
+async fn cleanup_user(pool: &PgPool, user_id: Uuid) {
+    sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("cleanup sessions");
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .expect("cleanup user");
 }
 
 async fn cleanup_session(pool: &PgPool, user_id: Uuid, profile_id: Uuid) {
@@ -441,4 +485,238 @@ async fn websocket_upgrade_rejects_http_scheme_against_https_public_origin() {
 
     server.abort();
     cleanup_session(&pool, user_id, profile_id).await;
+}
+
+#[tokio::test]
+async fn vault_router_enforces_auth_roles_metadata_and_profile_scope() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping vault router test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let (profile_a, owner_id, owner_cookie) = create_authed_session(&pool, "OWNER").await;
+    let (member_id, member_cookie) = create_session_for_profile(&pool, profile_a, "MEMBER").await;
+    let (admin_id, admin_cookie) = create_session_for_profile(&pool, profile_a, "ADMIN").await;
+    let (profile_b, other_owner_id, other_owner_cookie) =
+        create_authed_session(&pool, "OWNER").await;
+
+    let mut settings = settings_with_origin("http://localhost:8080", &database_url);
+    settings.vault.master_key_base64 = Some(SecretString::from(STANDARD.encode([42_u8; 32])));
+    let state = AppState::new(pool.clone(), settings)
+        .await
+        .expect("create app state");
+    let app = router(state);
+    let origin = Some("http://localhost:8080");
+    let create_body = serde_json::to_vec(&json!({
+        "purpose": "mcp_oauth_access_token",
+        "allowed_hosts": ["例え.テスト"],
+        "value": "owner-secret"
+    }))
+    .expect("serialize create request");
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/vault/secrets",
+        None,
+        origin,
+        None,
+        Some(&create_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/vault/secrets",
+        Some(&member_cookie),
+        origin,
+        None,
+        Some(&create_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, created) = send(
+        &app,
+        Method::POST,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        origin,
+        None,
+        Some(&create_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(created["allowed_hosts"], json!(["xn--r8jz45g.xn--zckzah"]));
+    let secret_id = created["id"]
+        .as_str()
+        .expect("created secret id")
+        .to_owned();
+
+    let replace_body = serde_json::to_vec(&json!({
+        "allowed_hosts": ["EXAMPLE.COM."],
+        "value": "admin-secret"
+    }))
+    .expect("serialize replace request");
+    let (status, replaced) = send(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/vault/secrets/{secret_id}"),
+        Some(&admin_cookie),
+        origin,
+        None,
+        Some(&replace_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replaced["allowed_hosts"], json!(["example.com"]));
+    let preserve_body = serde_json::to_vec(&json!({
+        "value": "preserved-host-secret"
+    }))
+    .expect("serialize preserved-host replacement");
+    let (status, preserved) = send(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/vault/secrets/{secret_id}"),
+        Some(&admin_cookie),
+        origin,
+        None,
+        Some(&preserve_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(preserved["allowed_hosts"], json!(["example.com"]));
+    for raw_hosts in [
+        json!([" example.com"]),
+        json!([""]),
+        json!(["example.com", "example.com"]),
+    ] {
+        let body = serde_json::to_vec(&json!({
+            "allowed_hosts": raw_hosts,
+            "value": "must-not-replace"
+        }))
+        .expect("serialize malformed replacement");
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            &format!("/api/v1/vault/secrets/{secret_id}"),
+            Some(&admin_cookie),
+            origin,
+            None,
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let (status, unchanged) = send(
+        &app,
+        Method::GET,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let unchanged = unchanged.as_array().expect("secret list");
+    assert_eq!(unchanged.len(), 1);
+    assert_eq!(unchanged[0]["allowed_hosts"], json!(["example.com"]));
+
+    let (status, before_invalid) = send(
+        &app,
+        Method::GET,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(before_invalid.as_array().expect("secret list").len(), 1);
+    for raw_hosts in [
+        json!([" example.com"]),
+        json!([""]),
+        json!(["example.com", "example.com"]),
+    ] {
+        let body = serde_json::to_vec(&json!({
+            "purpose": "mcp_oauth_access_token",
+            "allowed_hosts": raw_hosts,
+            "value": "must-not-write"
+        }))
+        .expect("serialize malformed create");
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            "/api/v1/vault/secrets",
+            Some(&owner_cookie),
+            origin,
+            None,
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    let invalid_body = serde_json::to_vec(&json!({
+        "purpose": "mcp_unknown",
+        "allowed_hosts": ["example.com"],
+        "value": "must-not-write"
+    }))
+    .expect("serialize invalid request");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        origin,
+        None,
+        Some(&invalid_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    let (status, after_invalid) = send(
+        &app,
+        Method::GET,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(after_invalid.as_array().expect("secret list").len(), 1);
+
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        &format!("/api/v1/vault/secrets/{secret_id}"),
+        Some(&other_owner_cookie),
+        origin,
+        None,
+        Some(&replace_body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, other_list) = send(
+        &app,
+        Method::GET,
+        "/api/v1/vault/secrets",
+        Some(&other_owner_cookie),
+        None,
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(other_list.as_array().expect("other secret list").is_empty());
+
+    cleanup_user(&pool, member_id).await;
+    cleanup_user(&pool, admin_id).await;
+    cleanup_session(&pool, owner_id, profile_a).await;
+    cleanup_session(&pool, other_owner_id, profile_b).await;
 }

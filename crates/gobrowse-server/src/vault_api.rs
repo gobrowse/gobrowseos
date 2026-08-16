@@ -53,8 +53,12 @@ pub async fn create_secret(
 ) -> Result<(StatusCode, Json<SecretMetadata>), AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
-    validate_purpose(&input.purpose)?;
-    let allowed_hosts = normalize_hosts(input.allowed_hosts)?;
+    let allowed_hosts = if input.purpose.starts_with("mcp_") {
+        vault::validate_secret_metadata(&input.purpose, &input.allowed_hosts)?
+    } else {
+        let allowed_hosts = normalize_hosts(input.allowed_hosts)?;
+        vault::validate_legacy_hosts(&allowed_hosts)?
+    };
     let id = format!("secret_{}", Uuid::now_v7());
     let mut tx = state.pool.begin().await?;
     state
@@ -117,18 +121,40 @@ pub async fn replace_secret(
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
     let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT purpose,allowed_hosts,created_at FROM secret_references \
+         WHERE id=$1 AND profile_id=$2 FOR UPDATE",
+    )
+    .bind(&id)
+    .bind(user.profile_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let purpose: String = row.get("purpose");
+    let allowed_hosts = if purpose.starts_with("mcp_") {
+        if let Some(raw_hosts) = input.allowed_hosts.as_deref() {
+            vault::validate_secret_metadata(&purpose, raw_hosts)?
+        } else {
+            let preserved_hosts: Vec<String> = row.get("allowed_hosts");
+            vault::validate_secret_metadata(&purpose, &preserved_hosts)?
+        }
+    } else {
+        let supplied_hosts = input.allowed_hosts.is_some();
+        let allowed_hosts = input
+            .allowed_hosts
+            .map(normalize_hosts)
+            .transpose()?
+            .unwrap_or_else(|| row.get("allowed_hosts"));
+        if supplied_hosts {
+            vault::validate_legacy_hosts(&allowed_hosts)?
+        } else {
+            allowed_hosts
+        }
+    };
     state
         .vault
         .fence_current_key(&mut tx, user.profile_id)
         .await?;
-    let row = sqlx::query("SELECT purpose,allowed_hosts,created_at FROM secret_references WHERE id=$1 AND profile_id=$2 FOR UPDATE")
-        .bind(&id).bind(user.profile_id).fetch_optional(&mut *tx).await?.ok_or(AppError::NotFound)?;
-    let purpose: String = row.get("purpose");
-    let allowed_hosts = input
-        .allowed_hosts
-        .map(normalize_hosts)
-        .transpose()?
-        .unwrap_or_else(|| row.get("allowed_hosts"));
     let encrypted = state
         .vault
         .encrypt(user.profile_id, &id, &purpose, &input.value)?;
@@ -260,16 +286,12 @@ fn require_vault_admin(user: &AuthenticatedUser) -> Result<(), AppError> {
     }
 }
 
-fn validate_purpose(purpose: &str) -> Result<(), AppError> {
-    if purpose.is_empty() || purpose.len() > 100 {
+fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, AppError> {
+    if hosts.iter().any(|host| host.trim().ends_with("..")) {
         return Err(AppError::Validation(
-            "secret purpose must contain 1 to 100 characters".into(),
+            "allowed_hosts must contain at most 20 valid DNS names or IP addresses".into(),
         ));
     }
-    Ok(())
-}
-
-fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, AppError> {
     let mut hosts: Vec<_> = hosts
         .into_iter()
         .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
@@ -277,14 +299,7 @@ fn normalize_hosts(hosts: Vec<String>) -> Result<Vec<String>, AppError> {
         .collect();
     hosts.sort();
     hosts.dedup();
-    if hosts.len() > 20
-        || hosts.iter().any(|host| {
-            host.len() > 253
-                || !host.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '.' | '-')
-                })
-        })
-    {
+    if hosts.len() > 20 {
         return Err(AppError::Validation(
             "allowed_hosts must contain at most 20 valid DNS names or IP addresses".into(),
         ));
@@ -308,36 +323,19 @@ mod tests {
     }
 
     #[test]
-    fn normalize_hosts_rejects_invalid_chars_excessive_count_and_length() {
-        // Host with invalid character (colon from http://)
-        let result = normalize_hosts(vec!["http://evil.com".into()]);
-        assert!(
-            result.is_err(),
-            "hosts with http:// prefix should be rejected"
-        );
+    fn normalize_hosts_leaves_authority_validation_to_shared_policy() {
+        let unicode = normalize_hosts(vec!["例え.テスト".into()])
+            .expect("Unicode IDNA input must reach shared canonical policy");
+        assert_eq!(unicode, vec!["例え.テスト"]);
 
-        // Host with invalid character (slash)
-        let result = normalize_hosts(vec!["evil.com/path".into()]);
-        assert!(
-            result.is_err(),
-            "hosts with path separators should be rejected"
-        );
+        let result = normalize_hosts(vec!["http://evil.com".into()])
+            .expect("authority syntax is checked by shared policy");
+        assert!(vault::validate_secret_metadata("mcp_oauth_access_token", &result).is_err());
 
-        // Host with space
-        let result = normalize_hosts(vec!["evil host.com".into()]);
-        assert!(result.is_err(), "hosts with spaces should be rejected");
-
-        // 21 distinct hosts (exceeds 20 limit)
         let too_many: Vec<String> = (0..21).map(|i| format!("host{i}.example.com")).collect();
-        let result = normalize_hosts(too_many);
-        assert!(result.is_err(), "more than 20 hosts should be rejected");
-
-        // Host exceeding 253 characters
-        let long_host = format!("{}.example.com", "a".repeat(250)); // ~253+ chars
-        let result = normalize_hosts(vec![long_host]);
         assert!(
-            result.is_err(),
-            "hosts longer than 253 characters should be rejected"
+            normalize_hosts(too_many).is_err(),
+            "more than 20 hosts should be rejected"
         );
     }
 }
