@@ -1456,7 +1456,7 @@ async fn scheduler_restart_does_not_double_process() {
         transport1.was_invoked(),
         "worker 1 must process the delivery"
     );
-    let delivery_count_after_crash: (i64,) = sqlx::query_as(
+    let delivery_count_after_crash: (i32,) = sqlx::query_as(
         "SELECT attempts FROM webhook_deliveries \
          WHERE webhook_id=$1 AND delivery_id=$2",
     )
@@ -1545,7 +1545,7 @@ async fn scheduler_restart_does_not_double_process() {
         .expect("worker 2 panicked");
 
     // Verify the delivery was processed again by worker 2.
-    let final_attempts: (i64,) = sqlx::query_as(
+    let final_attempts: (i32,) = sqlx::query_as(
         "SELECT attempts FROM webhook_deliveries \
          WHERE webhook_id=$1 AND delivery_id=$2",
     )
