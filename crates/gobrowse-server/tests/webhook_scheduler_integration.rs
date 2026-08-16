@@ -1470,11 +1470,17 @@ async fn scheduler_restart_does_not_double_process() {
         "exactly 1 attempt after first worker"
     );
 
-    // ── Simulate recovery: expire the lease and re-claim ──
+    // ── Simulate recovery: put the delivery back into running with expired lease ──
+    // Worker 1 may have already completed (status=succeeded) before cancellation
+    // took effect, so we must set status='running' with a valid lease that has
+    // expired to satisfy the webhook_deliveries_lease_check constraint and allow
+    // recover_stuck_deliveries to re-queue it.
     sqlx::query(
         "UPDATE webhook_deliveries \
-         SET lease_expires_at = now() - interval '1 hour', \
-             next_attempt_at = now() - interval '1 second' \
+         SET status='running', \
+             lease_token=gen_random_uuid(), \
+             lease_expires_at=now() - interval '1 hour', \
+             next_attempt_at=now() - interval '1 second' \
          WHERE webhook_id=$1 AND delivery_id=$2",
     )
     .bind(webhook_id)
