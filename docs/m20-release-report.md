@@ -58,6 +58,7 @@
 ## Deployment Notes
 
 - Private deployment only; no public DNS/firewall changes
+- **Current private deployment**: schema version 3 (Milestone 3 commit `7ee7ff6`). The M20 candidate requires schema 18. Deployment upgrade is a separate operational step — see deployment runbook.
 - Migrations: 0001-0018 forward-only
 - Feature flags: `webhook_scheduler_enabled` remains default-off
 - Database: PostgreSQL 17+ with pgvector extension
