@@ -1338,7 +1338,9 @@ async fn scheduler_drains_in_flight_deliveries_on_shutdown() {
         .fetch_optional(&pool)
         .await
         .expect("poll row");
-        if let Some((status,)) = &row && status == "running" {
+        if let Some((status,)) = &row
+            && status == "running"
+        {
             claimed = true;
             break;
         }
@@ -1432,7 +1434,9 @@ async fn scheduler_restart_does_not_double_process() {
         .fetch_optional(&pool)
         .await
         .expect("poll row");
-        if let Some((status,)) = &row && status == "running" {
+        if let Some((status,)) = &row
+            && status == "running"
+        {
             claimed = true;
             break;
         }
