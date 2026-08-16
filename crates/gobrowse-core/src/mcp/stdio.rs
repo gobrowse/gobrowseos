@@ -247,6 +247,95 @@ mod tests {
         ));
     }
 
+    /// M7: prove real stdio interoperability with an independently maintained
+    /// MCP server (Python SDK `mcp` v2.0.0). Spawns the server as a child
+    /// process and drives the full initialize → tools/list → tools/call flow.
+    #[tokio::test]
+    async fn m7_real_stdio_interop_with_python_mcp_server() {
+        use tokio::process::Command;
+
+        let mut child = Command::new("python3")
+            .arg("/tmp/mcp_raw_server.py")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("failed to spawn python MCP server");
+
+        let child_stdin = child.stdin.take().expect("no stdin");
+        let child_stdout = child.stdout.take().expect("no stdout");
+
+        let mut transport = McpStdioTransport::new(child_stdout, child_stdin);
+
+        // 1. initialize
+        let init_request = try_request(
+            RequestId::Number(1),
+            "initialize",
+            Some(serde_json::json!({
+                "protocolVersion": super::super::CURRENT_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": "gobrowse-m7-test", "version": "1.0"}
+            })),
+        )
+        .unwrap();
+        transport.send_request(init_request).await.unwrap();
+        let init_response = transport.recv().await.unwrap();
+        let init_value =
+            serde_json::from_slice::<serde_json::Value>(&encode(&init_response).unwrap())
+                .unwrap();
+        let server_info = init_value["result"]["serverInfo"].clone();
+        assert!(
+            !server_info["name"].as_str().unwrap().is_empty(),
+            "server must identify itself"
+        );
+
+        // 2. notifications/initialized
+        let initialized = try_notification("notifications/initialized", None).unwrap();
+        transport.send_notification(initialized).await.unwrap();
+
+        // 3. tools/list
+        let list_request = try_request(RequestId::Number(2), "tools/list", None).unwrap();
+        transport.send_request(list_request).await.unwrap();
+        let list_response = transport.recv().await.unwrap();
+        let list_value =
+            serde_json::from_slice::<serde_json::Value>(&encode(&list_response).unwrap()).unwrap();
+        let tools = list_value["result"]["tools"]
+            .as_array()
+            .expect("tools array missing");
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert!(
+            tool_names.contains(&"echo"),
+            "echo tool must be listed, got: {tool_names:?}"
+        );
+
+        // 4. tools/call
+        let call_request = try_request(
+            RequestId::Number(3),
+            "tools/call",
+            Some(serde_json::json!({
+                "name": "echo",
+                "arguments": {"message": "hello M7"}
+            })),
+        )
+        .unwrap();
+        transport.send_request(call_request).await.unwrap();
+        let call_response = transport.recv().await.unwrap();
+        let call_value =
+            serde_json::from_slice::<serde_json::Value>(&encode(&call_response).unwrap()).unwrap();
+        let content = &call_value["result"]["content"];
+        assert!(
+            content.is_array() && !content.as_array().unwrap().is_empty(),
+            "call must return content array"
+        );
+
+        // Clean up
+        drop(transport);
+        let _ = child.kill().await;
+    }
+
     #[tokio::test]
     async fn preserves_decoded_responses_without_correlation() {
         let payload =
