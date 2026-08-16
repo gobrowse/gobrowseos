@@ -2,18 +2,20 @@
 
 ## Status, Decision, and Roadmap Boundary
 
-**M5 is the active, implementation-ready plan.** Its sole scope is an
-workspace-scoped, PostgreSQL-backed CRUD boundary for inert worktree metadata
-associated with existing task and agent rows. It validates metadata purely,
-derives the persisted worktree path on the server, and records durable,
-actor-attributed lifecycle evidence. It does not create, inspect, check out,
-remove, or otherwise operate on a Git worktree.
+**M5 is `ACCEPTED`.** Exact implementation candidate commit
+`5f9488b36ff1f6f762fc2e56d68173ca6de4ac3d` passed CI run `31916585665`:
+Rust `95089262788`, web `95089262756`, supply-chain `95089262752`, and
+container `95089262753`.
 
-“M5” is the active worktree/task-subagent batch label requested for this plan.
-The canonical architecture documentation assigns a broader worktree/delegation
-area to another milestone number; this plan does not retag that roadmap. The
-numbering discrepancy is a documentation-governance follow-up, not a reason to
-expand or defer this bounded metadata slice.
+Acceptance covers only workspace-scoped inert worktree metadata lifecycle,
+legacy migration repair/quarantine proof, tenant-hiding writer authorization
+(`404` hidden versus `403` known `VIEWER`), no-side-effect denial proof, and
+the existing task/activity route registration required by real integration
+coverage. It does not claim Git worktree execution, subagent execution,
+sandbox isolation, production deployment, or a live migration.
+
+The next M20 priority is M8's exact completion matrix. M4 and M7 remain
+independent `BLOCKED_EXTERNAL` gates recorded below.
 
 ## Preserved External Records
 

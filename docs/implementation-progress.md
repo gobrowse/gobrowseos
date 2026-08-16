@@ -132,6 +132,12 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
 - No Docker shim, remote or rootful Podman fallback, image pull, installation, `sudo`, or host mutation is permitted. The smallest eventual scope is one deterministic test-only real-local-Podman `--userns=keep-id` UID-identity proof against the preloaded digest image and its trusted required CI invocation.
 - The sandbox remains release-gated and off. Existing fake and Docker-backed tests do not prove the rootless Podman `keep-id` user-namespace mapping.
 
+## M5 worktree metadata acceptance (2026-08-15)
+
+- **`ACCEPTED`:** Exact implementation candidate commit `5f9488b36ff1f6f762fc2e56d68173ca6de4ac3d` passed CI run `31916585665`: Rust `95089262788`, web `95089262756`, supply-chain `95089262752`, and container `95089262753`.
+- Acceptance is limited to the workspace-scoped inert worktree metadata lifecycle, legacy migration repair/quarantine proof, tenant-hiding writer authorization (`404` hidden versus `403` known `VIEWER`), no-side-effect denial proof, and existing task/activity route registration required by real integration coverage. It is not a claim of Git worktree execution, subagent execution, sandbox isolation, production deployment, or a live migration.
+- M4 and M7 remain independently `BLOCKED_EXTERNAL`; their recorded prerequisites are unchanged. The next M20 priority is M8: define and accept its exact completion matrix without treating M2 vault or pure-validator evidence as real OAuth/JWKS interoperability.
+
 ## M20 Readiness Ledger
 
 <!-- m20-readiness-ledger:v1; update this block in place; never append a second ledger -->
@@ -149,9 +155,9 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     "DEFERRED"
   ],
   "COUNTING_RULE": "Count one release blocker for each milestone whose acceptance gate is not ACCEPTED. This is a milestone-gate count, not a count of implementation subtasks or transitive dependency failures. EXTERNAL_BLOCKERS counts only records explicitly established as BLOCKED_EXTERNAL; every other unsatisfied gate is INTERNAL_BLOCKERS until an accepted review reclassifies it.",
-  "TOTAL_RELEASE_BLOCKERS": 16,
+  "TOTAL_RELEASE_BLOCKERS": 15,
   "EXTERNAL_BLOCKERS": 2,
-  "INTERNAL_BLOCKERS": 14,
+  "INTERNAL_BLOCKERS": 13,
   "MILESTONES": [
     {
       "ID": "M1",
@@ -208,19 +214,29 @@ Milestone 3 adds durable streamed chat: dynamic model routes, bounded neutral pr
     {
       "ID": "M5",
       "NAME": "worktree task-subagent workflows",
-      "STATUS": "NOT_STARTED",
-      "REMAINING_RELEASE_BLOCKERS": 1,
+      "STATUS": "ACCEPTED",
+      "REMAINING_RELEASE_BLOCKERS": 0,
       "DEPENDENCIES": [
         "M1",
         "M3",
         "M6"
       ],
       "EVIDENCE": [
-        "docs/worktrees.md records the intended isolation/replay contract only.",
-        "Current read-only M5 architecture review found existing task/agent/worktree primitives but no M5 workspace-scoped worktree metadata implementation, migration 0016, API acceptance suite, CI, or deployment evidence."
+        "docs/implementation-progress.md § M5 worktree metadata acceptance: exact implementation candidate `5f9488b36ff1f6f762fc2e56d68173ca6de4ac3d` accepts workspace-scoped inert metadata lifecycle, legacy migration repair/quarantine, tenant-hiding writer authorization, no-side-effect denial, and task/activity route registration for integration coverage.",
+        "Acceptance explicitly excludes Git worktree execution, subagent execution, sandbox isolation, production deployment, and live migration claims."
       ],
-      "CI_RUN": [],
-      "NEXT_ACTION": "Accept a bounded M5 plan, then implement the workspace-scoped worktree metadata/task-subagent metadata slice from schema 15 with same-workspace database integrity, authenticated API authorization, and real-PostgreSQL concurrency tests. Do not make it depend on M4 or M7."
+      "CI_RUN": [
+        {
+          "RUN_ID": "31916585665",
+          "COMMIT": "5f9488b36ff1f6f762fc2e56d68173ca6de4ac3d",
+          "RUST_JOB": "95089262788",
+          "WEB_JOB": "95089262756",
+          "SUPPLY_CHAIN_JOB": "95089262752",
+          "CONTAINER_JOB": "95089262753",
+          "SCOPE": "M5 worktree metadata candidate only"
+        }
+      ],
+      "NEXT_ACTION": "Preserve M5 acceptance evidence. Do not revisit M4 or M7; the next M20 priority is M8's exact completion matrix."
     },
     {
       "ID": "M6",
