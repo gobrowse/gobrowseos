@@ -87,6 +87,79 @@ struct PinnedBookSummary {
     updated_at: String,
 }
 
+#[derive(serde::Deserialize, Clone, Debug)]
+struct BookDetail {
+    id: String,
+    title: String,
+    body: String,
+    book_type: String,
+    revision: i64,
+}
+
+#[derive(serde::Serialize)]
+struct UpdateBookRequest {
+    title: String,
+    body: String,
+    tags: Vec<String>,
+    metadata: serde_json::Value,
+    expected_revision: i64,
+    reason: String,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct CatalogModel {
+    reference: String,
+    context_window: i32,
+    output_limit: i32,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+struct CatalogProvider {
+    provider_type: String,
+    display_name: String,
+    base_url: String,
+    api_format: String,
+    models: Vec<CatalogModel>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+struct ModelCostRow {
+    provider: String,
+    model: String,
+    input_tokens: i64,
+    output_tokens: i64,
+    runs: i64,
+    spend: f64,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+struct ProviderCostRow {
+    provider: String,
+    spend: f64,
+    runs: i64,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct DailyCostRow {
+    day: String,
+    spend: f64,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+struct UsageSummary {
+    total_spend: f64,
+    total_input_tokens: i64,
+    total_output_tokens: i64,
+    total_runs: i64,
+    unpriced_runs: i64,
+    per_model: Vec<ModelCostRow>,
+    per_provider: Vec<ProviderCostRow>,
+    per_day: Vec<DailyCostRow>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ConversationSummary {
     id: String,
@@ -1460,12 +1533,67 @@ fn LibraryPage() -> impl IntoView {
     let books = RwSignal::new(Vec::<BookSummary>::new());
     let query = RwSignal::new(String::new());
     let status = RwSignal::new(String::new());
+    let selected = RwSignal::new(None::<BookDetail>);
+    let edit_title = RwSignal::new(String::new());
+    let edit_body = RwSignal::new(String::new());
+    let edit_status = RwSignal::new(String::new());
     load_books(books, status, None);
     let search = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         let value = query.get_untracked();
         let query_value = (!value.trim().is_empty()).then(|| value.trim().to_owned());
         load_books(books, status, query_value);
+    };
+    let open_book = move |book_id: String| {
+        spawn_local(async move {
+            let response = Request::get(&format!("/api/v1/library/books/{book_id}"))
+                .send()
+                .await;
+            match response {
+                Ok(response) if response.ok() => {
+                    if let Ok(detail) = response.json::<BookDetail>().await {
+                        edit_title.set(detail.title.clone());
+                        edit_body.set(detail.body.clone());
+                        selected.set(Some(detail));
+                    } else {
+                        edit_status.set("Could not decode book".into());
+                    }
+                }
+                Ok(response) => edit_status.set(format!("Book rejected: HTTP {}", response.status())),
+                Err(_) => edit_status.set("Library service did not answer.".into()),
+            }
+        });
+    };
+    let save_book = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let Some(detail) = selected.get_untracked() else { return };
+        let book_id = detail.id.clone();
+        let title = edit_title.get_untracked();
+        let body = edit_body.get_untracked();
+        spawn_local(async move {
+            let request = Request::put(&format!("/api/v1/library/books/{book_id}")).json(
+                &UpdateBookRequest {
+                    title: title.trim().to_owned(),
+                    body: body.clone(),
+                    tags: Vec::new(),
+                    metadata: serde_json::Value::Object(Default::default()),
+                    expected_revision: detail.revision,
+                    reason: "Edited from the operator UI".into(),
+                },
+            );
+            match request {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => {
+                        edit_status.set("Saved".into());
+                        selected.set(None);
+                        load_books(books, status, None);
+                    }
+                    Ok(response) => edit_status.set(format!("Save rejected: HTTP {}", response.status())),
+                    Err(_) => edit_status.set("Library service did not answer.".into()),
+                },
+                Err(_) => edit_status.set("Edit request could not be encoded.".into()),
+            }
+        });
     };
     view! {
         <div class="page-heading">
@@ -1483,14 +1611,38 @@ fn LibraryPage() -> impl IntoView {
             <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"PROVENANCE"</span><span>"RETRIEVAL"</span></div>
             {move || books.get().into_iter().map(|book| {
                 let short_id = book.id.chars().take(8).collect::<String>();
+                let book_id = book.id.clone();
                 view! { <div class="index-row" role="row">
                     <span class="spine-cell">{short_id}</span>
-                    <strong>{format!("{} / {}", book.title, book.book_type)}</strong>
+                    <button class="text-button" on:click=move |_| open_book(book_id.clone())>{format!("{} / {}", book.title, book.book_type)}</button>
                     <span>{format!("{} · {}", book.provenance, book.trust)}</span>
                     <span>{book.retrieval_mode.to_uppercase()}</span>
                 </div> }
             }).collect_view()}
         </div>
+        {move || if let Some(detail) = selected.get() {
+            let revision = detail.revision;
+            let book_type = detail.book_type.clone();
+            view! {
+                <section class="model-section">
+                    <div class="section-heading"><div><p class="utility">"BOOK / DETAIL"</p><h2>{format!("{} · rev {}", detail.title, revision)}</h2></div>
+                        <span class="spine-cell">{book_type}</span></div>
+                    <form class="model-form" on:submit=save_book>
+                        <label>"Title"<input required maxlength="500" prop:value=move || edit_title.get() on:input=move |event| edit_title.set(event_target_value(&event)) /></label>
+                        <label class="fallback-field">"Body"
+                            <textarea rows="16" required maxlength="100000" prop:value=move || edit_body.get() on:input=move |event| edit_body.set(event_target_value(&event))></textarea>
+                        </label>
+                        <div>
+                            <button class="primary" type="submit">"Save changes"</button>
+                            <button class="text-button" type="button" on:click=move |_| { selected.set(None); }>"Close"</button>
+                        </div>
+                    </form>
+                    <p class="form-note">{move || edit_status.get()}</p>
+                </section>
+            }.into_any()
+        } else {
+            view! { <span class="utility"></span> }.into_any()
+        }}
     }
 }
 
@@ -1516,8 +1668,59 @@ fn ModelsPage() -> impl IntoView {
     let chat_fallbacks = RwSignal::new(String::new());
     let detected = RwSignal::new(Vec::<DetectedProviderInfo>::new());
     let detecting = RwSignal::new(false);
+    let catalog = RwSignal::new(Vec::<CatalogProvider>::new());
+    let catalog_models = RwSignal::new(Vec::<CatalogModel>::new());
+    let usage = RwSignal::new(None::<UsageSummary>);
+    let usage_window = RwSignal::new("30d".to_owned());
+    let usage_status = RwSignal::new(String::new());
+    let usage_lifecycle = Arc::clone(&lifecycle);
+    load_usage(&usage, &usage_status, &usage_window, Arc::clone(&lifecycle));
     load_configurations(configurations, status);
     load_chat_models(chat_configurations, status, Arc::clone(&lifecycle));
+    let catalog_lifecycle = Arc::clone(&lifecycle);
+    spawn_local(async move {
+        let response = Request::get("/api/v1/providers/catalog").send().await;
+        if !lifecycle_is_active(&catalog_lifecycle) {
+            return;
+        }
+        if let Ok(response) = response
+            && response.ok()
+            && let Ok(list) = response.json::<Vec<CatalogProvider>>().await
+        {
+            catalog.set(list);
+        }
+    });
+    let on_provider_select = move |event: leptos::ev::Event| {
+            let provider_type = event_target_value(&event);
+            chat_provider.set(provider_type.clone());
+            if let Some(provider) = catalog
+                .get_untracked()
+                .into_iter()
+                .find(|entry| entry.provider_type == provider_type)
+            {
+                chat_base_url.set(provider.base_url.clone());
+                catalog_models.set(provider.models.clone());
+                if let Some(first) = provider.models.first() {
+                    chat_model.set(first.reference.clone());
+                    chat_context.set(first.context_window.to_string());
+                    chat_output.set(first.output_limit.to_string());
+                }
+            } else {
+                catalog_models.set(Vec::new());
+            }
+    };
+    let on_model_select = move |event: leptos::ev::Event| {
+            let model_reference = event_target_value(&event);
+            chat_model.set(model_reference.clone());
+            if let Some(model) = catalog_models
+                .get_untracked()
+                .into_iter()
+                .find(|entry| entry.reference == model_reference)
+            {
+                chat_context.set(model.context_window.to_string());
+                chat_output.set(model.output_limit.to_string());
+            }
+    };
     let detect = move |_| {
         if !detecting.get_untracked() {
             load_auto_detect(detected, detecting, status);
@@ -1652,9 +1855,27 @@ fn ModelsPage() -> impl IntoView {
         <section class="model-section">
             <div class="section-heading"><div><p class="utility">"CHAT / STREAMING"</p><h2>"Conversation models"</h2></div><span>{move || format!("{} ROUTES", chat_configurations.get().len())}</span></div>
             <form class="model-form" on:submit=create_chat>
-                <label>"Provider type"<input required placeholder="ollama or openai_compatible" prop:value=move || chat_provider.get() on:input=move |event| chat_provider.set(event_target_value(&event)) /></label>
+                <label>"Provider type"
+                    <select required prop:value=move || chat_provider.get() on:change=on_provider_select>
+                        <option value="">"Choose provider"</option>
+                        {move || catalog.get().into_iter().map(|entry| {
+                            let provider_type = entry.provider_type.clone();
+                            let display = entry.display_name.clone();
+                            view! { <option value=provider_type>{display}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
                 <label>"Base URL"<input required prop:value=move || chat_base_url.get() on:input=move |event| chat_base_url.set(event_target_value(&event)) /></label>
-                <label>"Model reference"<input required prop:value=move || chat_model.get() on:input=move |event| chat_model.set(event_target_value(&event)) /></label>
+                <label>"Model reference"
+                    <select required prop:value=move || chat_model.get() on:change=on_model_select>
+                        <option value="">"Choose model"</option>
+                        {move || catalog_models.get().into_iter().map(|entry| {
+                            let display = entry.reference.clone();
+                            let value = display.clone();
+                            view! { <option value=value>{display}</option> }
+                        }).collect_view()}
+                    </select>
+                </label>
                 <label>"Vault secret ID"<input placeholder="Optional" prop:value=move || chat_secret.get() on:input=move |event| chat_secret.set(event_target_value(&event)) /></label>
                 <label>"Context window"<input required inputmode="numeric" prop:value=move || chat_context.get() on:input=move |event| chat_context.set(event_target_value(&event)) /></label>
                 <label>"Output limit"<input required inputmode="numeric" prop:value=move || chat_output.get() on:input=move |event| chat_output.set(event_target_value(&event)) /></label>
@@ -1695,7 +1916,127 @@ fn ModelsPage() -> impl IntoView {
             }).collect_view()}
         </div>
         </section>
+        <section class="model-section">
+            <div class="section-heading"><div><p class="utility">"USAGE / COST"</p><h2>"Model spend"</h2></div>
+                <select aria-label="Usage window" prop:value=move || usage_window.get() on:change=move |event| {
+                    let value = event_target_value(&event);
+                    usage_window.set(value.clone());
+                    let usage_lifecycle = Arc::clone(&usage_lifecycle);
+                    spawn_local(async move {
+                        let response = Request::get(&format!("/api/v1/usage/summary?window={value}"))
+                            .send()
+                            .await;
+                        if !lifecycle_is_active(&usage_lifecycle) {
+                            return;
+                        }
+                        match response {
+                            Ok(response) if response.ok() => {
+                                if let Ok(summary) = response.json::<UsageSummary>().await {
+                                    usage.set(Some(summary));
+                                }
+                            }
+                            Ok(response) => usage_status.set(format!("Usage endpoint rejected: HTTP {}", response.status())),
+                            Err(_) => usage_status.set("Usage endpoint did not answer.".into()),
+                        }
+                    });
+                }>
+                    <option value="7d">"7 days"</option>
+                    <option value="30d">"30 days"</option>
+                    <option value="all">"All time"</option>
+                </select>
+            </div>
+            <p class="form-note">{move || usage_status.get()}</p>
+            {move || if let Some(summary) = usage.get() {
+                view! {
+                    <div class="usage-stats">
+                        <div class="usage-stat"><span class="utility">"TOTAL SPEND"</span><strong>{format!("${:.2}", summary.total_spend)}</strong></div>
+                        <div class="usage-stat"><span class="utility">"RUNS"</span><strong>{summary.total_runs}</strong></div>
+                        <div class="usage-stat"><span class="utility">"INPUT"</span><strong>{format!("{}M", summary.total_input_tokens / 1_000_000)}</strong></div>
+                        <div class="usage-stat"><span class="utility">"OUTPUT"</span><strong>{format!("{}M", summary.total_output_tokens / 1_000_000)}</strong></div>
+                        <div class="usage-stat"><span class="utility">"UNPRICED"</span><strong>{summary.unpriced_runs}</strong></div>
+                    </div>
+                    <div class="usage-charts">
+                        <div class="chart-card">
+                            <p class="utility">"SPEND BY MODEL"</p>
+                            <div class="bar-chart">
+                                {summary.per_model.iter().map(|row| {
+                                    let max = summary.per_model.first().map_or(0.01, |top| top.spend.max(0.01));
+                                    let width = (row.spend / max * 100.0).max(1.0);
+                                    view! {
+                                        <div class="bar-row">
+                                            <span class="bar-label">{format!("{} / {}", row.provider, row.model)}</span>
+                                            <div class="bar-track"><div class="bar-fill" style=format!("width:{width:.0}%")></div></div>
+                                            <span class="bar-value">{format!("${:.2}", row.spend)}</span>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        </div>
+                        <div class="chart-card">
+                            <p class="utility">"SPEND BY PROVIDER"</p>
+                            <div class="bar-chart">
+                                {summary.per_provider.iter().map(|row| {
+                                    let max = summary.per_provider.first().map_or(0.01, |top| top.spend.max(0.01));
+                                    let width = (row.spend / max * 100.0).max(1.0);
+                                    view! {
+                                        <div class="bar-row">
+                                            <span class="bar-label">{row.provider.to_uppercase()}</span>
+                                            <div class="bar-track"><div class="bar-fill" style=format!("width:{width:.0}%")></div></div>
+                                            <span class="bar-value">{format!("${:.2}", row.spend)}</span>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        </div>
+                    </div>
+                    <div class="chart-card">
+                        <p class="utility">"SPEND BY DAY"</p>
+                        <div class="sparkline">
+                            {summary.per_day.iter().map(|row| {
+                                let max = summary.per_day.iter().map(|d| d.spend).fold(0.0, f64::max).max(0.01);
+                                let height = (row.spend / max * 64.0).max(2.0);
+                                view! {
+                                    <div class="day-bar" title=format!("{} ${:.2}", row.day, row.spend) style=format!("height:{height:.0}px")></div>
+                                }
+                            }).collect_view()}
+                        </div>
+                    </div>
+                }.into_any()
+            } else {
+                view! { <div class="empty-small">"No usage recorded yet. Spend appears after model runs complete."</div> }.into_any()
+            }}
+        </section>
     }
+}
+
+fn load_usage(
+    usage: &RwSignal<Option<UsageSummary>>,
+    status: &RwSignal<String>,
+    window: &RwSignal<String>,
+    lifecycle: Arc<AtomicBool>,
+) {
+    let usage = *usage;
+    let status = *status;
+    let window = *window;
+    spawn_local(async move {
+        let response = Request::get(&format!("/api/v1/usage/summary?window={}", window.get_untracked()))
+            .send()
+            .await;
+        if !lifecycle_is_active(&lifecycle) {
+            return;
+        }
+        match response {
+            Ok(response) if response.ok() => {
+                if let Ok(summary) = response.json::<UsageSummary>().await {
+                    usage.set(Some(summary));
+                } else {
+                    status.set("Could not decode usage summary".into());
+                }
+            }
+            Ok(response) => status.set(format!("Usage endpoint rejected: HTTP {}", response.status())),
+            Err(_) => status.set("Usage endpoint did not answer.".into()),
+        }
+    });
 }
 
 #[component]

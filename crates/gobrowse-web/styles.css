@@ -193,3 +193,19 @@ kbd { padding: 1px 6px; border: 1px solid var(--rule); background: #fff; }
 @media (prefers-reduced-motion: no-preference) {
   button, input { transition: color 100ms ease, background-color 100ms ease, border-color 100ms ease; }
 }
+
+/* Usage / cost charts */
+.usage-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 14px 0; }
+.usage-stat { border: 1px solid var(--rule); padding: 12px; display: flex; flex-direction: column; gap: 6px; }
+.usage-stat strong { font-size: 20px; }
+.usage-charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin: 14px 0; }
+.chart-card { border: 1px solid var(--rule); padding: 14px; }
+.chart-card .utility { margin-bottom: 10px; }
+.bar-chart { display: flex; flex-direction: column; gap: 8px; }
+.bar-row { display: grid; grid-template-columns: minmax(0, 1.4fr) 2fr 64px; gap: 8px; align-items: center; }
+.bar-label { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bar-track { height: 10px; background: color-mix(in srgb, var(--rule) 55%, transparent); border-radius: 2px; overflow: hidden; }
+.bar-fill { height: 100%; background: var(--accent); border-radius: 2px; }
+.bar-value { font-size: 12px; text-align: right; }
+.sparkline { display: flex; align-items: flex-end; gap: 2px; height: 72px; }
+.day-bar { flex: 1; min-width: 3px; background: var(--accent); opacity: 0.75; border-radius: 1px 1px 0 0; }

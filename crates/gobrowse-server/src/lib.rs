@@ -12,6 +12,7 @@ pub mod error;
 pub mod library_api;
 pub mod mcp_api;
 pub mod model_api;
+pub mod usage_api;
 pub mod outbound_http;
 pub mod realtime;
 pub mod run_api;
@@ -159,6 +160,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/models/chat/{id}/activate",
             post(model_api::activate_chat_model),
+        )
+        .route(
+            "/providers/catalog",
+            get(usage_api::list_provider_catalog),
+        )
+        .route(
+            "/usage/summary",
+            get(usage_api::usage_summary),
         )
         .route(
             "/conversations/{id}/runs",
