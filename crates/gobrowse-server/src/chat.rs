@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use gobrowse_core::model::{
-    ContentPart, MessageRole, ModelEvent, ModelIdentity, ModelProvider, ModelRequest, ModelRoute,
-    ModelStream, ProviderError,
+    ContentPart, MessageRole, ModelCapability, ModelEvent, ModelIdentity, ModelProvider,
+    ModelRequest, ModelRoute, ModelStream, ProviderError, ToolDefinition,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -37,6 +37,22 @@ struct ChatRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<OllamaOptions>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ToolDef>,
+}
+
+#[derive(Serialize)]
+struct ToolDef {
+    #[serde(rename = "type")]
+    type_: String,
+    function: ToolFunction,
+}
+
+#[derive(Serialize)]
+struct ToolFunction {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -47,7 +63,26 @@ struct OllamaOptions {
 #[derive(Serialize)]
 struct ChatMessage {
     role: &'static str,
-    content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<AssistantToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AssistantToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    type_: String,
+    function: ToolCallFunction,
+}
+
+#[derive(Serialize)]
+struct ToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 struct ProviderStreamState {
@@ -70,9 +105,65 @@ impl ModelProvider for HttpChatProvider {
         let messages: Vec<_> = request
             .messages
             .iter()
-            .map(|message| ChatMessage {
-                role: role_name(message.role),
-                content: content_text(&message.content),
+            .map(|message| -> ChatMessage {
+                let role = role_name(message.role);
+                match message.role {
+                    MessageRole::Tool => {
+                        // Tool result messages: extract call_id and output
+                        let tool_call_result = message.content.iter().find_map(|part| {
+                            if let ContentPart::ToolResult { call_id, output, .. } = part {
+                                Some((call_id.clone(), output.clone()))
+                            } else {
+                                None
+                            }
+                        });
+                        ChatMessage {
+                            role,
+                            content: tool_call_result
+                                .as_ref()
+                                .map(|(_, output)| output.to_string()),
+                            tool_calls: None,
+                            tool_call_id: tool_call_result.map(|(id, _)| id),
+                        }
+                    }
+                    MessageRole::Assistant => {
+                        // Assistant messages may contain ToolCall parts
+                        let tool_calls: Vec<_> = message
+                            .content
+                            .iter()
+                            .filter_map(|part| {
+                                if let ContentPart::ToolCall { id, name, input } = part {
+                                    Some(AssistantToolCall {
+                                        id: id.clone(),
+                                        type_: "function".into(),
+                                        function: ToolCallFunction {
+                                            name: name.clone(),
+                                            arguments: input.to_string(),
+                                        },
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        ChatMessage {
+                            role,
+                            content: Some(content_text(&message.content)),
+                            tool_calls: if tool_calls.is_empty() {
+                                None
+                            } else {
+                                Some(tool_calls)
+                            },
+                            tool_call_id: None,
+                        }
+                    }
+                    _ => ChatMessage {
+                        role,
+                        content: Some(content_text(&message.content)),
+                        tool_calls: None,
+                        tool_call_id: None,
+                    },
+                }
             })
             .collect();
         let path = if self.provider_type == "ollama" {
@@ -81,6 +172,18 @@ impl ModelProvider for HttpChatProvider {
             "chat/completions"
         };
         let endpoint = endpoint(&self.base_url, path)?;
+        let tools: Vec<ToolDef> = request
+            .tools
+            .iter()
+            .map(|def| ToolDef {
+                type_: "function".into(),
+                function: ToolFunction {
+                    name: def.id.clone(),
+                    description: def.description.clone(),
+                    parameters: def.input_schema.clone(),
+                },
+            })
+            .collect();
         let body = ChatRequest {
             model: &request.model.model,
             messages: &messages,
@@ -89,6 +192,7 @@ impl ModelProvider for HttpChatProvider {
             options: (self.provider_type == "ollama").then_some(OllamaOptions {
                 num_predict: request.max_output_tokens,
             }),
+            tools,
         };
         let mut outgoing = self.http.post(endpoint).json(&body);
         if let Some(token) = &self.token {
@@ -149,7 +253,7 @@ pub async fn load_routes(
              SELECT route.fallback_model_id,route.position+1 FROM model_fallback_routes route \
              JOIN primary_model ON primary_model.id=route.primary_model_id WHERE route.profile_id=$1 \
          ) \
-         SELECT m.id,m.model_reference,p.id AS provider_id,p.provider_type,p.base_url,p.secret_reference \
+         SELECT m.id,m.model_reference,m.capabilities,p.id AS provider_id,p.provider_type,p.base_url,p.secret_reference \
          FROM route_ids route JOIN models m ON m.id=route.model_id JOIN providers p ON p.id=m.provider_id \
          WHERE p.profile_id=$1 AND p.enabled AND m.enabled AND 'text'=ANY(m.capabilities) ORDER BY route.position",
     )
@@ -211,7 +315,10 @@ pub async fn load_routes(
         };
         let provider_id: String = row.get("provider_id");
         let model_reference: String = row.get("model_reference");
+        let capabilities: Vec<String> = row.get("capabilities");
+        let supports_tools = capabilities.iter().any(|c| c == "tool_calls");
         routes.push(ModelRoute {
+            supports_tools,
             provider: Arc::new(HttpChatProvider {
                 id: provider_id.clone(),
                 provider_type,
@@ -230,17 +337,23 @@ pub async fn load_routes(
 
 pub fn request(
     messages: Vec<gobrowse_core::model::NeutralMessage>,
+    tools: Vec<ToolDefinition>,
     max_output_tokens: u32,
 ) -> ModelRequest {
+    let required_capabilities = if tools.is_empty() {
+        BTreeSet::new()
+    } else {
+        BTreeSet::from([ModelCapability::ToolCalls])
+    };
     ModelRequest {
         model: ModelIdentity {
             provider: String::new(),
             model: String::new(),
         },
         messages,
-        tools: vec![],
+        tools,
         max_output_tokens,
-        required_capabilities: BTreeSet::new(),
+        required_capabilities,
     }
 }
 
@@ -404,6 +517,27 @@ fn parse_provider_line(
                 .unwrap_or(0),
         });
     }
+
+    // Check for tool_calls in the delta
+    if let Some(tool_calls) = value["choices"][0]["delta"]["tool_calls"].as_array() {
+        for tc in tool_calls {
+            if let (Some(id), Some(name)) = (
+                tc["id"].as_str(),
+                tc["function"]["name"].as_str(),
+            ) {
+                let input: serde_json::Value = tc["function"]["arguments"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str(s).ok())
+                    .unwrap_or(serde_json::Value::Null);
+                state.pending.push_back(ModelEvent::ToolCall {
+                    id: id.to_owned(),
+                    name: name.to_owned(),
+                    input,
+                });
+            }
+        }
+    }
+
     let text = value["choices"][0]["delta"]["content"]
         .as_str()
         .unwrap_or_default();
@@ -411,10 +545,13 @@ fn parse_provider_line(
         state.pending.push_back(ModelEvent::Completed);
         state.completed = true;
     }
-    if text.is_empty() {
+    if text.is_empty() && state.pending.is_empty() {
         Ok(None)
-    } else {
+    } else if !text.is_empty() {
         Ok(Some(ModelEvent::TextDelta { text: text.into() }))
+    } else {
+        // We enqueued tool_calls and/or usage; let the next event loop return them.
+        Ok(None)
     }
 }
 

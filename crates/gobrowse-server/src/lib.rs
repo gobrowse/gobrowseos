@@ -15,6 +15,7 @@ pub mod model_api;
 pub mod outbound_http;
 pub mod realtime;
 pub mod run_api;
+pub mod run_tools;
 pub mod skills_api;
 pub mod task_api;
 pub mod vault;
@@ -32,7 +33,7 @@ use axum::{
     http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use sqlx::PgPool;
 use tokio::sync::RwLock;
@@ -164,6 +165,14 @@ pub fn router(state: AppState) -> Router {
             get(run_api::get_active_run).post(run_api::start_run),
         )
         .route("/conversations/{id}/turns", post(run_api::start_turn))
+        .route(
+            "/conversations/{id}/pins",
+            get(conversation_api::list_pinned_books),
+        )
+        .route(
+            "/conversations/{id}/pins/{book_id}",
+            put(conversation_api::pin_book).delete(conversation_api::unpin_book),
+        )
         .route("/runs/{id}", get(run_api::get_run))
         .route("/runs/{id}/events", get(run_api::list_run_events))
         .route("/runs/{id}/cancel", post(run_api::cancel_run))

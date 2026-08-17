@@ -705,7 +705,7 @@ pub(crate) async fn replace_book_snapshot(
     Ok(revision)
 }
 
-async fn insert_revision(
+pub(crate) async fn insert_revision(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     book: &Book,
     changed_by: Option<Uuid>,

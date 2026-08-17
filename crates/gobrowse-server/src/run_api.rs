@@ -6,7 +6,8 @@ use axum::{
 use futures_util::StreamExt;
 use gobrowse_core::{
     context::{ContextCandidate, ContextSource, build_context},
-    model::{ContentPart, MessageRole, ModelEvent, NeutralMessage, open_with_fallback},
+    model::{ContentPart, MessageRole, ModelEvent, ModelRoute, NeutralMessage, open_with_fallback},
+    tools::Tool,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -600,7 +601,7 @@ async fn execute_inner(
     .await
     .map_err(database_failure)?;
     let row = sqlx::query(
-        "SELECT run.profile_id,run.conversation_id,run.input_message_id,run.requested_model_id \
+        "SELECT run.profile_id,run.conversation_id,run.input_message_id,run.requested_model_id,run.requested_by \
          FROM agent_runs run JOIN users requester ON requester.id=run.requested_by \
          JOIN conversations conversation ON conversation.id=run.conversation_id \
          WHERE run.id=$1 AND requester.disabled_at IS NULL AND requester.role<>'VIEWER' AND ( \
@@ -616,6 +617,13 @@ async fn execute_inner(
     let profile_id: Uuid = row.get("profile_id");
     let conversation_id: Uuid = row.get("conversation_id");
     let requested_model_id: Option<String> = row.get("requested_model_id");
+    let requested_by: Uuid = row.get("requested_by");
+    let workspace_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT workspace_id FROM conversations WHERE id=$1")
+            .bind(conversation_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(database_failure)?;
     let limits = model_limits(state, profile_id, requested_model_id.as_deref())
         .await
         .map_err(|_| {
@@ -678,166 +686,332 @@ async fn execute_inner(
         return Err(("model_unavailable", "no compatible chat model is available"));
     }
     check_execution_access(&state.pool, run_id).await?;
-    let request = chat::request(messages, limits.output_limit);
-    let opened = {
-        let opening = tokio::time::timeout(
-            Duration::from_secs(90),
-            open_with_fallback(&routes, &request),
-        );
-        tokio::pin!(opening);
+
+    // Feature 3: Attach tool definitions if any route supports tools.
+    let supports_tools = routes.iter().any(|r| r.supports_tools);
+    let tool_routes: Vec<ModelRoute> = if supports_tools {
+        routes.into_iter().filter(|r| r.supports_tools).collect()
+    } else {
+        routes
+    };
+    let tool_defs = if supports_tools {
+        crate::run_tools::tool_definitions()
+    } else {
+        vec![]
+    };
+    if tool_routes.is_empty() {
+        return Err(("model_unavailable", "no compatible chat model with tool support is available"));
+    }
+
+    // Re-entrant agent loop: up to 8 rounds, 16 total tool calls.
+    let max_rounds: usize = 8;
+    let max_tool_calls: usize = 16;
+    let mut total_tool_calls = 0_usize;
+    let mut output = String::new();
+    let mut usage = None;
+    let mut in_flight_messages = messages;
+    let mut request = chat::request(in_flight_messages.clone(), tool_defs.clone(), limits.output_limit);
+
+    for round in 0..max_rounds {
+        let opened = {
+            let opening = tokio::time::timeout(
+                Duration::from_secs(90),
+                open_with_fallback(&tool_routes, &request),
+            );
+            tokio::pin!(opening);
+            loop {
+                tokio::select! {
+                    () = cancellation.cancelled() => {
+                        check_canceled(state, run_id, lease, cancellation).await?;
+                        unreachable!()
+                    }
+                    result = &mut opening => break result.map_err(|_| ("timeout", "provider connection timed out"))?,
+                    _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                        check_canceled(state, run_id, lease, cancellation).await?;
+                        check_execution_access(&state.pool, run_id).await?;
+                    }
+                }
+            }
+        };
+        let (selected, mut stream) = opened.map_err(provider_failure)?;
+
+        if round == 0 {
+            // Only persist selected_model_id on first round.
+            let selected_model_id: String = sqlx::query_scalar(
+                "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id \
+                 WHERE p.profile_id=$1 AND p.id=$2 AND m.model_reference=$3",
+            )
+            .bind(profile_id)
+            .bind(&selected.provider)
+            .bind(&selected.model)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(database_failure)?;
+            let result = sqlx::query(
+                "UPDATE agent_runs SET selected_model_id=$1,updated_at=now() \
+                 WHERE id=$2 AND execution_token=$3 AND lease_expires_at>now() AND cancellation_requested_at IS NULL",
+            )
+            .bind(&selected_model_id)
+            .bind(run_id)
+            .bind(lease.token)
+            .execute(&state.pool)
+            .await
+            .map_err(database_failure)?;
+            require_lease(result.rows_affected()).map_err(database_failure)?;
+            append_event_owned(
+                &state.pool,
+                run_id,
+                lease,
+                "run.model_selected",
+                serde_json::json!({"model_id":selected_model_id}),
+            )
+            .await
+            .map_err(database_failure)?;
+        }
+
+        let mut pending_delta = String::new();
+        let mut delta_event_count = 0_usize;
+        let mut cancellation_poll = tokio::time::interval(Duration::from_secs(2));
+        cancellation_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        cancellation_poll.tick().await;
+        let mut delta_flush = tokio::time::interval(Duration::from_millis(100));
+        delta_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        delta_flush.tick().await;
+        let mut last_provider_event = tokio::time::Instant::now();
+
+        let mut tool_calls_from_round: Vec<(String, String, serde_json::Value)> = Vec::new();
+        let mut round_output = String::new();
+
         loop {
-            tokio::select! {
+            let event = tokio::select! {
                 () = cancellation.cancelled() => {
                     check_canceled(state, run_id, lease, cancellation).await?;
                     unreachable!()
                 }
-                result = &mut opening => break result.map_err(|_| ("timeout", "provider connection timed out"))?,
-                _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                _ = cancellation_poll.tick() => {
                     check_canceled(state, run_id, lease, cancellation).await?;
                     check_execution_access(&state.pool, run_id).await?;
+                    continue;
+                }
+                _ = delta_flush.tick(), if !pending_delta.is_empty() => {
+                    flush_text_events(
+                        &state.pool, run_id, lease, &mut pending_delta, &mut delta_event_count, true,
+                    ).await?;
+                    continue;
+                }
+                _ = tokio::time::sleep_until(last_provider_event + Duration::from_secs(90)) => {
+                    return Err(("timeout", "provider stream was idle for too long"));
+                }
+                event = stream.next() => event,
+            };
+            let Some(event) = event else { break };
+            last_provider_event = tokio::time::Instant::now();
+            check_canceled(state, run_id, lease, cancellation).await?;
+            match event.map_err(provider_failure)? {
+                ModelEvent::TextDelta { text } => {
+                    output.push_str(&text);
+                    round_output.push_str(&text);
+                    pending_delta.push_str(&text);
+                    flush_text_events(
+                        &state.pool,
+                        run_id,
+                        lease,
+                        &mut pending_delta,
+                        &mut delta_event_count,
+                        false,
+                    )
+                    .await?;
+                }
+                ModelEvent::Usage { input_tokens, output_tokens, cached_tokens } => {
+                    flush_text_events(
+                        &state.pool,
+                        run_id,
+                        lease,
+                        &mut pending_delta,
+                        &mut delta_event_count,
+                        true,
+                    )
+                    .await?;
+                    let value = serde_json::json!({
+                        "input_tokens":input_tokens,"output_tokens":output_tokens,"cached_tokens":cached_tokens
+                    });
+                    append_event_owned(&state.pool, run_id, lease, "model.usage", value.clone())
+                        .await
+                        .map_err(database_failure)?;
+                    usage = Some(value);
+                }
+                ModelEvent::Completed => break,
+                ModelEvent::ToolCall { id, name, input } => {
+                    total_tool_calls += 1;
+                    if total_tool_calls > max_tool_calls {
+                        return Err(("tool_limit", "too many tool calls in a single run"));
+                    }
+                    tool_calls_from_round.push((id, name, input));
                 }
             }
         }
-    };
-    let (selected, mut stream) = opened.map_err(provider_failure)?;
-    let selected_model_id: String = sqlx::query_scalar(
-        "SELECT m.id FROM models m JOIN providers p ON p.id=m.provider_id \
-         WHERE p.profile_id=$1 AND p.id=$2 AND m.model_reference=$3",
-    )
-    .bind(profile_id)
-    .bind(&selected.provider)
-    .bind(&selected.model)
-    .fetch_one(&state.pool)
-    .await
-    .map_err(database_failure)?;
-    let result = sqlx::query(
-        "UPDATE agent_runs SET selected_model_id=$1,updated_at=now() \
-         WHERE id=$2 AND execution_token=$3 AND lease_expires_at>now() AND cancellation_requested_at IS NULL",
-    )
-    .bind(&selected_model_id)
-    .bind(run_id)
-    .bind(lease.token)
-    .execute(&state.pool)
-    .await
-    .map_err(database_failure)?;
-    require_lease(result.rows_affected()).map_err(database_failure)?;
-    append_event_owned(
-        &state.pool,
-        run_id,
-        lease,
-        "run.model_selected",
-        serde_json::json!({"model_id":selected_model_id}),
-    )
-    .await
-    .map_err(database_failure)?;
-    let mut output = String::new();
-    let mut pending_delta = String::new();
-    let mut delta_event_count = 0_usize;
-    let mut usage = None;
-    let mut cancellation_poll = tokio::time::interval(Duration::from_secs(2));
-    cancellation_poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    cancellation_poll.tick().await;
-    let mut delta_flush = tokio::time::interval(Duration::from_millis(100));
-    delta_flush.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    delta_flush.tick().await;
-    let mut last_provider_event = tokio::time::Instant::now();
-    loop {
-        let event = tokio::select! {
-            () = cancellation.cancelled() => {
-                check_canceled(state, run_id, lease, cancellation).await?;
-                unreachable!()
+        flush_text_events(
+            &state.pool,
+            run_id,
+            lease,
+            &mut pending_delta,
+            &mut delta_event_count,
+            true,
+        )
+        .await?;
+
+        if tool_calls_from_round.is_empty() {
+            // Final text response — complete the run.
+            if output.trim().is_empty() {
+                return Err(("empty_response", "chat provider returned no text"));
             }
-            _ = cancellation_poll.tick() => {
-                check_canceled(state, run_id, lease, cancellation).await?;
-                check_execution_access(&state.pool, run_id).await?;
-                continue;
-            }
-            _ = delta_flush.tick(), if !pending_delta.is_empty() => {
-                flush_text_events(
-                    &state.pool, run_id, lease, &mut pending_delta, &mut delta_event_count, true,
-                ).await?;
-                continue;
-            }
-            _ = tokio::time::sleep_until(last_provider_event + Duration::from_secs(90)) => {
-                return Err(("timeout", "provider stream was idle for too long"));
-            }
-            event = stream.next() => event,
-        };
-        let Some(event) = event else { break };
-        last_provider_event = tokio::time::Instant::now();
-        check_canceled(state, run_id, lease, cancellation).await?;
-        match event.map_err(provider_failure)? {
-            ModelEvent::TextDelta { text } => {
-                output.push_str(&text);
-                pending_delta.push_str(&text);
-                flush_text_events(
-                    &state.pool,
-                    run_id,
-                    lease,
-                    &mut pending_delta,
-                    &mut delta_event_count,
-                    false,
-                )
-                .await?;
-            }
-            ModelEvent::Usage {
-                input_tokens,
-                output_tokens,
-                cached_tokens,
-            } => {
-                flush_text_events(
-                    &state.pool,
-                    run_id,
-                    lease,
-                    &mut pending_delta,
-                    &mut delta_event_count,
-                    true,
-                )
-                .await?;
-                let value = serde_json::json!({
-                    "input_tokens":input_tokens,"output_tokens":output_tokens,"cached_tokens":cached_tokens
-                });
-                append_event_owned(&state.pool, run_id, lease, "model.usage", value.clone())
-                    .await
-                    .map_err(database_failure)?;
-                usage = Some(value);
-            }
-            ModelEvent::Completed => break,
-            ModelEvent::ToolCall { .. } => {
-                return Err((
-                    "tool_call_unsupported",
-                    "tool calls are not enabled in this milestone",
-                ));
-            }
+            check_canceled(state, run_id, lease, cancellation).await?;
+            check_execution_access(&state.pool, run_id).await?;
+            complete_run(
+                state,
+                run_id,
+                lease,
+                conversation_id,
+                &selected,
+                &output,
+                usage,
+            )
+            .await
+            .map_err(database_failure)?;
+            info!(%run_id, "conversation run completed");
+            return Ok(());
         }
+
+        // Agent tool round: execute each tool call and build continuation messages.
+        let mut tool_results = Vec::new();
+        let mut assistant_tool_calls = Vec::new();
+        for (call_id, name, input) in &tool_calls_from_round {
+            let tool_event = serde_json::json!({
+                "tool_call_id": call_id,
+                "tool_name": name,
+                "tool_input": input,
+            });
+            append_event_owned(
+                &state.pool,
+                run_id,
+                lease,
+                "tool.call",
+                tool_event,
+            )
+            .await
+            .map_err(database_failure)?;
+
+            let result = match name.as_str() {
+                "library_search" => {
+                    let tool = crate::run_tools::LibrarySearchTool {
+                        state: state.clone(),
+                    };
+                    let ctx = gobrowse_core::tools::ToolContext {
+                        call_id: Uuid::now_v7(),
+                        user_id: requested_by,
+                        profile_id,
+                        workspace_id,
+                        run_id,
+                    };
+                    tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
+                        .await
+                        .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
+                }
+                "library_add" => {
+                    let tool = crate::run_tools::LibraryAddTool {
+                        state: state.clone(),
+                    };
+                    let ctx = gobrowse_core::tools::ToolContext {
+                        call_id: Uuid::now_v7(),
+                        user_id: requested_by,
+                        profile_id,
+                        workspace_id,
+                        run_id,
+                    };
+                    tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
+                        .await
+                        .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
+                }
+                _ => Err(gobrowse_core::tools::ToolError::InvalidInput),
+            };
+
+            let (output_value, is_error) = match result {
+                Ok(value) => (value, false),
+                Err(e) => (serde_json::json!({"error": e.to_string()}), true),
+            };
+            let result_json = serde_json::to_string(&output_value).unwrap_or_default();
+            if result_json.len() > 64 * 1024 {
+                // Truncate oversized tool output.
+                continue;
+            }
+
+            append_event_owned(
+                &state.pool,
+                run_id,
+                lease,
+                "tool.result",
+                serde_json::json!({
+                    "tool_call_id": call_id,
+                    "tool_name": name,
+                    "tool_output": output_value,
+                    "is_error": is_error,
+                }),
+            )
+            .await
+            .map_err(database_failure)?;
+
+            // Persist tool_calls row.
+            sqlx::query(
+                "INSERT INTO tool_calls (id, run_id, tool_name, tool_input, tool_output, is_error, idempotency_key) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (idempotency_key) DO NOTHING",
+            )
+            .bind(Uuid::now_v7())
+            .bind(run_id)
+            .bind(name)
+            .bind(input)
+            .bind(&output_value)
+            .bind(is_error)
+            .bind(format!("{run_id}-{call_id}"))
+            .execute(&state.pool)
+            .await
+            .map_err(database_failure)?;
+
+            assistant_tool_calls.push(ContentPart::ToolCall {
+                id: call_id.clone(),
+                name: name.clone(),
+                input: input.clone(),
+            });
+            tool_results.push(ContentPart::ToolResult {
+                call_id: call_id.clone(),
+                output: output_value,
+                is_error,
+            });
+        }
+
+        // Build the assistant message with tool_calls and the tool results message.
+        let mut assistant_parts = Vec::new();
+        if !round_output.is_empty() {
+            assistant_parts.push(ContentPart::Text { text: round_output });
+        }
+        assistant_parts.extend(assistant_tool_calls);
+
+        in_flight_messages.push(NeutralMessage {
+            role: MessageRole::Assistant,
+            content: assistant_parts,
+            provider_provenance: None,
+        });
+        in_flight_messages.push(NeutralMessage {
+            role: MessageRole::Tool,
+            content: tool_results,
+            provider_provenance: None,
+        });
+
+        // Rebuild request with accumulated messages and tools for next round.
+        request = chat::request(in_flight_messages.clone(), tool_defs.clone(), limits.output_limit);
     }
-    flush_text_events(
-        &state.pool,
-        run_id,
-        lease,
-        &mut pending_delta,
-        &mut delta_event_count,
-        true,
-    )
-    .await?;
-    if output.trim().is_empty() {
-        return Err(("empty_response", "chat provider returned no text"));
-    }
-    check_canceled(state, run_id, lease, cancellation).await?;
-    check_execution_access(&state.pool, run_id).await?;
-    complete_run(
-        state,
-        run_id,
-        lease,
-        conversation_id,
-        &selected,
-        &output,
-        usage,
-    )
-    .await
-    .map_err(database_failure)?;
-    info!(%run_id, "conversation run completed");
-    Ok(())
+
+    // Exceeded max rounds without a text response.
+    Err(("tool_limit", "too many tool rounds in a single run"))
 }
 
 async fn flush_text_events(
@@ -991,6 +1165,87 @@ async fn build_messages(
             required: false,
             trust_label: row.get("trust"),
         });
+    }
+
+    // Feature 1: PinnedBook candidates (priority 400)
+    {
+        let pinned_rows = sqlx::query(
+            "SELECT b.id, b.title, left(b.body, 3000) AS body, b.trust \
+             FROM conversation_pinned_books p JOIN books b ON b.id = p.book_id \
+             WHERE p.conversation_id = $1 \
+             ORDER BY p.created_at ASC LIMIT 20",
+        )
+        .bind(conversation_id)
+        .fetch_all(pool)
+        .await?;
+        for row in pinned_rows {
+            let id: Uuid = row.get("id");
+            let title: String = row.get("title");
+            let body: String = row.get("body");
+            let content = format!("Book: {title}\n{body}");
+            candidates.push(ContextCandidate {
+                source: ContextSource::PinnedBook,
+                stable_id: id.to_string(),
+                token_estimate: estimate_tokens(&content),
+                content,
+                priority: 400,
+                required: false,
+                trust_label: row.get("trust"),
+            });
+        }
+    }
+
+    // Feature 2: Worktree candidate (priority 250, aggregate)
+    if let Some(ws_id) = workspace_id {
+        let worktree_rows = sqlx::query(
+            "SELECT path, branch, base_commit, status, changed_files \
+             FROM worktrees WHERE workspace_id = $1 \
+             ORDER BY last_activity_at DESC LIMIT 10",
+        )
+        .bind(ws_id)
+        .fetch_all(pool)
+        .await?;
+        if !worktree_rows.is_empty() {
+            let mut lines = Vec::new();
+            for wt in &worktree_rows {
+                let path: String = wt.get("path");
+                let branch: Option<String> = wt.get("branch");
+                let base_commit: Option<String> = wt.get("base_commit");
+                let status: Option<String> = wt.get("status");
+                let changed_files: Vec<String> = wt.get("changed_files");
+                lines.push(format!(
+                    "  {path} | branch: {} | base: {} | status: {}",
+                    branch.as_deref().unwrap_or("unknown"),
+                    base_commit.as_deref().unwrap_or("-"),
+                    status.as_deref().unwrap_or("unknown"),
+                ));
+                let max_files = changed_files.len().min(50);
+                if max_files > 0 {
+                    lines.push(format!("    changed files ({}):", changed_files.len()));
+                    for f in changed_files.iter().take(max_files) {
+                        let truncated = if f.len() > 120 {
+                            format!("{}...", &f[..120])
+                        } else {
+                            f.clone()
+                        };
+                        lines.push(format!("      {truncated}"));
+                    }
+                    if changed_files.len() > 50 {
+                        lines.push(format!("      ... and {} more", changed_files.len() - 50));
+                    }
+                }
+            }
+            let content = format!("Workspace worktrees:\n{}", lines.join("\n"));
+            candidates.push(ContextCandidate {
+                source: ContextSource::Worktree,
+                stable_id: format!("worktree-{ws_id}"),
+                token_estimate: estimate_tokens(&content),
+                content,
+                priority: 250,
+                required: false,
+                trust_label: "workspace".into(),
+            });
+        }
     }
     let built = build_context(candidates, optional_budget);
     let retrieved_content = built

@@ -75,6 +75,18 @@ struct BookSummary {
     retrieval_mode: String,
 }
 
+#[derive(serde::Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+struct PinnedBookSummary {
+    id: String,
+    title: String,
+    book_type: String,
+    scope: String,
+    trust: String,
+    security_classification: String,
+    updated_at: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ConversationSummary {
     id: String,
@@ -507,6 +519,175 @@ fn NavGroup(
 }
 
 #[component]
+fn PinnedContext(conversation_id: String) -> impl IntoView {
+    let lifecycle = Arc::new(AtomicBool::new(true));
+    on_cleanup({
+        let lifecycle = Arc::clone(&lifecycle);
+        move || lifecycle.store(false, Ordering::Release)
+    });
+    let pins = RwSignal::new(Vec::<PinnedBookSummary>::new());
+    let library = RwSignal::new(Vec::<BookSummary>::new());
+    let open = RwSignal::new(false);
+    let status = RwSignal::new(String::new());
+
+    let toggle = {
+        let lifecycle = Arc::clone(&lifecycle);
+        let conversation_id = conversation_id.clone();
+        move |event: leptos::ev::MouseEvent| {
+            event.prevent_default();
+            let should_open = !open.get_untracked();
+            open.set(should_open);
+            let lifecycle = Arc::clone(&lifecycle);
+            let conversation_id = conversation_id.clone();
+            if should_open {
+                spawn_local(async move {
+                    let books_response = Request::get("/api/v1/library/books").send().await;
+                    if !lifecycle_is_active(&lifecycle) {
+                        return;
+                    }
+                    if let Ok(response) = books_response
+                        && response.ok()
+                        && let Ok(list) = response.json::<Vec<BookSummary>>().await
+                    {
+                        library.set(list);
+                    }
+                    refresh_pins(&conversation_id, pins, status, lifecycle);
+                });
+            }
+        }
+    };
+
+    let pin_book = {
+        let lifecycle = Arc::clone(&lifecycle);
+        let conversation_id = conversation_id.clone();
+        move |book_id: String| {
+            let lifecycle = Arc::clone(&lifecycle);
+            let conversation_id = conversation_id.clone();
+            spawn_local(async move {
+                let response = Request::put(&format!(
+                    "/api/v1/conversations/{conversation_id}/pins/{book_id}"
+                ))
+                .send()
+                .await;
+                if !lifecycle_is_active(&lifecycle) {
+                    return;
+                }
+                match response {
+                    Ok(response) if response.ok() => {}
+                    _ => status.set("Pin failed".into()),
+                }
+                refresh_pins(&conversation_id, pins, status, lifecycle);
+            });
+        }
+    };
+
+    let unpin = {
+        let lifecycle = Arc::clone(&lifecycle);
+        let conversation_id = conversation_id.clone();
+        move |book_id: String| {
+            let lifecycle = Arc::clone(&lifecycle);
+            let conversation_id = conversation_id.clone();
+            spawn_local(async move {
+                let response = Request::delete(&format!(
+                    "/api/v1/conversations/{conversation_id}/pins/{book_id}"
+                ))
+                .send()
+                .await;
+                if !lifecycle_is_active(&lifecycle) {
+                    return;
+                }
+                match response {
+                    Ok(response) if response.ok() => {}
+                    _ => status.set("Unpin failed".into()),
+                }
+                refresh_pins(&conversation_id, pins, status, lifecycle);
+            });
+        }
+    };
+
+    view! {
+        <div class="pin-context">
+            <button class="text-button" on:click=toggle>
+                {move || if open.get() { "Close pinned context" } else { "Pin Library books" }}
+            </button>
+            <p class="form-note">{move || status.get()}</p>
+            {move || if open.get() {
+                let unpin = unpin.clone();
+                let pin_book = pin_book.clone();
+                view! {
+                    <div class="pins-section">
+                        <p class="utility">"PINNED TO THIS CONVERSATION"</p>
+                        {move || if pins.get().is_empty() {
+                            view! { <div class="empty-small">"No pinned books yet. Pick from the Library below."</div> }.into_any()
+                        } else {
+                            pins.get().into_iter().map(|pin| {
+                                let id = pin.id.clone();
+                                let title = pin.title.clone();
+                                let unpin = unpin.clone();
+                                view! {
+                                    <div class="index-row">
+                                        <strong>{title}</strong>
+                                        <span class="spine-cell">{pin.security_classification.to_uppercase()}</span>
+                                        <button type="button" on:click=move |_| unpin(id.clone())>"Remove"</button>
+                                    </div>
+                                }
+                            }).collect_view().into_any()
+                        }}
+                    </div>
+                    <div class="pins-section">
+                        <p class="utility">"LIBRARY"</p>
+                        {move || library.get().into_iter().map(|book| {
+                            let id = book.id.clone();
+                            let title = book.title.clone();
+                            let pinned = pins.get().iter().any(|pin| pin.id == id);
+                            let pin_book = pin_book.clone();
+                            view! {
+                                <div class="index-row">
+                                    <strong>{title}</strong>
+                                    <span class="spine-cell">{book.book_type}</span>
+                                    {if pinned {
+                                        view! { <span class="utility">"PINNED"</span> }.into_any()
+                                    } else {
+                                        view! { <button type="button" on:click=move |_| pin_book(id.clone())>"Pin"</button> }.into_any()
+                                    }}
+                                </div>
+                            }
+                        }).collect_view()}
+                    </div>
+                }.into_any()
+            } else {
+                view! { <span class="utility"></span> }.into_any()
+            }}
+        </div>
+    }
+}
+
+fn refresh_pins(
+    conversation_id: &str,
+    pins: RwSignal<Vec<PinnedBookSummary>>,
+    status: RwSignal<String>,
+    lifecycle: Arc<AtomicBool>,
+) {
+    let conversation_id = conversation_id.to_owned();
+    spawn_local(async move {
+        let response = Request::get(&format!("/api/v1/conversations/{conversation_id}/pins"))
+            .send()
+            .await;
+        if !lifecycle_is_active(&lifecycle) {
+            return;
+        }
+        match response {
+            Ok(response) if response.ok() => {
+                if let Ok(list) = response.json::<Vec<PinnedBookSummary>>().await {
+                    pins.set(list);
+                }
+            }
+            _ => status.set("Could not load pinned context".into()),
+        }
+    });
+}
+
+#[component]
 fn ChatPage(user_id: String) -> impl IntoView {
     let lifecycle = Arc::new(AtomicBool::new(true));
     on_cleanup({
@@ -933,6 +1114,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
                         resolving_run.set(false);
                         submitting.set(false);
                     }>"← All conversations"</button>
+                    <PinnedContext conversation_id=conversation_id.clone() />
                     <span class="utility">{format!("INDEX {}", &conversation_id[..8.min(conversation_id.len())])}</span>
                 </div>
                 <div class="transcript" aria-live="polite">

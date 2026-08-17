@@ -93,6 +93,7 @@ mod tests {
         ));
         let routes = vec![
             ModelRoute {
+                supports_tools: false,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -100,6 +101,7 @@ mod tests {
                 },
             },
             ModelRoute {
+                supports_tools: false,
                 provider: second,
                 identity: ModelIdentity {
                     provider: "second".into(),
@@ -127,6 +129,7 @@ mod tests {
         ));
         let routes = vec![
             ModelRoute {
+                supports_tools: false,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -134,6 +137,7 @@ mod tests {
                 },
             },
             ModelRoute {
+                supports_tools: false,
                 provider: second.clone(),
                 identity: ModelIdentity {
                     provider: "second".into(),
@@ -168,6 +172,7 @@ mod tests {
         ));
         let routes = vec![
             ModelRoute {
+                supports_tools: false,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -175,6 +180,7 @@ mod tests {
                 },
             },
             ModelRoute {
+                supports_tools: false,
                 provider: second,
                 identity: ModelIdentity {
                     provider: "second".into(),
@@ -199,6 +205,7 @@ mod tests {
         ));
         let routes = vec![
             ModelRoute {
+                supports_tools: false,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -206,6 +213,7 @@ mod tests {
                 },
             },
             ModelRoute {
+                supports_tools: false,
                 provider: second.clone(),
                 identity: ModelIdentity {
                     provider: "second".into(),

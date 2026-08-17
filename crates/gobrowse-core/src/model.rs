@@ -183,6 +183,7 @@ pub trait SpeechProvider: Send + Sync {
 pub struct ModelRoute {
     pub provider: Arc<dyn ModelProvider>,
     pub identity: ModelIdentity,
+    pub supports_tools: bool,
 }
 
 /// Opens a model stream using the first route that accepts the request.

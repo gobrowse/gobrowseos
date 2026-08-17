@@ -610,3 +610,174 @@ fn require_writer(user: &AuthenticatedUser) -> Result<(), AppError> {
         Ok(())
     }
 }
+
+// ---------------------------------------------------------------------------
+// Conversation pinned-book API
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+pub struct PinnedBookResponse {
+    pub id: Uuid,
+    pub title: String,
+    pub book_type: String,
+    pub scope: String,
+    pub trust: String,
+    pub security_classification: String,
+    pub updated_at: OffsetDateTime,
+}
+
+/// List pinned books for a conversation.
+pub async fn list_pinned_books(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_id): Path<Uuid>,
+) -> Result<Json<Vec<PinnedBookResponse>>, AppError> {
+    let user = require_user(&state, &headers).await?;
+    authorize_conversation(&state, &user, conversation_id, false).await?;
+    let rows = sqlx::query(
+        "SELECT b.id, b.title, b.book_type, b.scope, b.trust, b.security_classification, b.updated_at \
+         FROM conversation_pinned_books p JOIN books b ON b.id = p.book_id \
+         WHERE p.conversation_id = $1 \
+           AND ($2 IN ('OWNER','ADMIN') OR b.security_classification <> 'RESTRICTED') \
+           AND ($2 IN ('OWNER','ADMIN') OR b.scope <> 'AGENT') \
+           AND ($2 IN ('OWNER','ADMIN') OR b.scope NOT IN ('USER','PRIVATE') OR b.owner_user_id=$3) \
+           AND (b.scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=b.conversation_id AND ( \
+               $2 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$3) OR EXISTS( \
+               SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3)))) \
+           AND ($2 IN ('OWNER','ADMIN') OR b.scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+               SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=b.workspace_id AND member.user_id=$3)) \
+         ORDER BY p.created_at ASC",
+    )
+    .bind(conversation_id)
+    .bind(&user.role)
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| PinnedBookResponse {
+                id: row.get("id"),
+                title: row.get("title"),
+                book_type: row.get("book_type"),
+                scope: row.get("scope"),
+                trust: row.get("trust"),
+                security_classification: row.get("security_classification"),
+                updated_at: row.get("updated_at"),
+            })
+            .collect(),
+    ))
+}
+
+/// Pin a book to a conversation (idempotent upsert).
+pub async fn pin_book(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_id, book_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    authorize_conversation(&state, &user, conversation_id, true).await?;
+    // Validate the book is accessible by this user (same predicates as get_book).
+    let authorized: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM books WHERE id=$1 AND profile_id=$2 \
+         AND ($4 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
+         AND ($4 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
+         AND ($4 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$3) \
+         AND (scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
+             $4 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$3) OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3)))) \
+         AND ($4 IN ('OWNER','ADMIN') OR scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$3)))",
+    )
+    .bind(book_id)
+    .bind(user.profile_id)
+    .bind(user.id)
+    .bind(&user.role)
+    .fetch_one(&state.pool)
+    .await?;
+    if !authorized {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query(
+        "INSERT INTO conversation_pinned_books (conversation_id, book_id, pinned_by) \
+         VALUES ($1, $2, $3) ON CONFLICT (conversation_id, book_id) DO NOTHING",
+    )
+    .bind(conversation_id)
+    .bind(book_id)
+    .bind(user.id)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Unpin a book from a conversation (idempotent delete).
+pub async fn unpin_book(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_id, book_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    authorize_conversation(&state, &user, conversation_id, true).await?;
+    sqlx::query(
+        "DELETE FROM conversation_pinned_books WHERE conversation_id=$1 AND book_id=$2",
+    )
+    .bind(conversation_id)
+    .bind(book_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Authorize a user's access to a conversation (read or write).
+async fn authorize_conversation(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    conversation_id: Uuid,
+    require_write: bool,
+) -> Result<(), AppError> {
+    let access = if user.role == "VIEWER" {
+        return Err(AppError::Forbidden);
+    } else if matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        AccessLevel::Owner
+    } else {
+        let row: Option<(Option<Uuid>, Uuid)> = sqlx::query_as(
+            "SELECT workspace_id, created_by_user_id FROM conversations WHERE id=$1 AND profile_id=$2 AND status<>'deleted'",
+        )
+        .bind(conversation_id)
+        .bind(user.profile_id)
+        .fetch_optional(&state.pool)
+        .await?;
+        match row {
+            None => return Err(AppError::NotFound),
+            Some((workspace_id, creator)) => {
+                if let Some(ws_id) = workspace_id {
+                    let member_access: Option<String> = sqlx::query_scalar(
+                        "SELECT access FROM workspace_memberships WHERE workspace_id=$1 AND user_id=$2",
+                    )
+                    .bind(ws_id)
+                    .bind(user.id)
+                    .fetch_optional(&state.pool)
+                    .await?;
+                    match member_access.as_deref() {
+                        Some("OWNER" | "EDITOR") => AccessLevel::Editor,
+                        Some("VIEWER") => AccessLevel::Viewer,
+                        _ => return Err(AppError::NotFound),
+                    }
+                } else if creator == user.id {
+                    AccessLevel::Owner
+                } else {
+                    return Err(AppError::NotFound);
+                }
+            }
+        }
+    };
+    if require_write && !matches!(access, AccessLevel::Owner | AccessLevel::Editor) {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
+enum AccessLevel {
+    Viewer,
+    Editor,
+    Owner,
+}
