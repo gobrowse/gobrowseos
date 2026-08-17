@@ -195,6 +195,7 @@ struct CreateChatModelConfiguration<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct SkillResponse {
     id: String,
     profile_id: String,
@@ -208,6 +209,7 @@ struct SkillResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct SkillRevisionResponse {
     id: String,
     skill_id: String,
@@ -222,6 +224,7 @@ struct SkillRevisionResponse {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct AutobiographyResponse {
     id: String,
     body: String,
@@ -452,6 +455,8 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                     Page::Library => view! { <LibraryPage /> }.into_any(),
                     Page::Skills => view! { <SkillsPage /> }.into_any(),
                     Page::Autobiography => view! { <AutobiographyPage /> }.into_any(),
+                    Page::Workspaces => view! { <WorkspacesPage /> }.into_any(),
+                    Page::Mcp => view! { <McpPage /> }.into_any(),
                     Page::Models => view! { <ModelsPage /> }.into_any(),
                     Page::Diagnostics => view! { <DiagnosticsPage /> }.into_any(),
                     current => view! { <EmptyOperationalPage page=current /> }.into_any(),
@@ -1007,6 +1012,267 @@ fn ChatPage(user_id: String) -> impl IntoView {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Workspace + MCP page types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct WorkspaceSummary {
+    id: String,
+    title: String,
+    description: String,
+    network_policy: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateWorkspaceBody {
+    title: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct McpServerSummary {
+    id: String,
+    name: String,
+    transport: String,
+    configuration: serde_json::Value,
+    enabled: bool,
+    auth_secret_reference: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreateMcpServerBody {
+    name: String,
+    transport: String,
+    configuration: serde_json::Value,
+    enabled: bool,
+}
+
+#[component]
+fn WorkspacesPage() -> impl IntoView {
+    let workspaces = RwSignal::new(Vec::<WorkspaceSummary>::new());
+    let status = RwSignal::new(String::new());
+    let title = RwSignal::new(String::new());
+    let description = RwSignal::new(String::new());
+
+    let load = move || {
+        status.set("Loading workspaces...".into());
+        spawn_local(async move {
+            match Request::get("/api/v1/workspaces").send().await {
+                Ok(response) if response.ok() => {
+                    match response.json::<Vec<WorkspaceSummary>>().await {
+                        Ok(list) => {
+                            workspaces.set(list);
+                            status.set(String::new());
+                        }
+                        Err(_) => status.set("Workspace response was not valid.".into()),
+                    }
+                }
+                Ok(response) => status.set(format!(
+                    "Workspace request failed: HTTP {}",
+                    response.status()
+                )),
+                Err(_) => status.set("Workspace service did not answer.".into()),
+            }
+        });
+    };
+
+    load();
+
+    let create = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let title_val = title.get_untracked().trim().to_owned();
+        if title_val.is_empty() {
+            status.set("Title is required.".into());
+            return;
+        }
+        let desc_val = description.get_untracked().trim().to_owned();
+        status.set("Creating workspace...".into());
+        spawn_local(async move {
+            let body = CreateWorkspaceBody {
+                title: title_val,
+                description: desc_val,
+            };
+            match Request::post("/api/v1/workspaces").json(&body) {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => {
+                        title.set(String::new());
+                        description.set(String::new());
+                        load();
+                    }
+                    Ok(response) => {
+                        status.set(format!("Create failed: HTTP {}", response.status()))
+                    }
+                    Err(_) => status.set("Workspace service did not answer.".into()),
+                },
+                Err(_) => status.set("Create request could not be encoded.".into()),
+            }
+        });
+    };
+
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"GLOBAL CONTEXT / WORKSPACES"</p><h1>"Workspaces"</h1></div>
+            <span class="utility">{move || format!("{} WORKSPACES", workspaces.get().len())}</span>
+        </div>
+        <form class="filter-row" on:submit=create>
+            <input placeholder="Title" prop:value=move || title.get()
+                on:input=move |event| title.set(event_target_value(&event)) />
+            <input placeholder="Description (optional)" prop:value=move || description.get()
+                on:input=move |event| description.set(event_target_value(&event)) />
+            <button type="submit">"Create"</button>
+        </form>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="index-table" role="table">
+            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"DESCRIPTION"</span><span>"NETWORK POLICY"</span></div>
+            {move || workspaces.get().into_iter().map(|ws| {
+                let short_id = ws.id.chars().take(8).collect::<String>();
+                view! { <div class="index-row" role="row">
+                    <span class="spine-cell">{short_id}</span>
+                    <strong>{ws.title}</strong>
+                    <span>{ws.description}</span>
+                    <span>{ws.network_policy.to_uppercase()}</span>
+                </div> }
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[component]
+fn McpPage() -> impl IntoView {
+    let servers = RwSignal::new(Vec::<McpServerSummary>::new());
+    let status = RwSignal::new(String::new());
+    let name = RwSignal::new(String::new());
+    let transport = RwSignal::new("stdio".to_owned());
+    let configuration = RwSignal::new(String::new());
+
+    let load = move || {
+        status.set("Loading MCP servers...".into());
+        spawn_local(async move {
+            match Request::get("/api/v1/mcp/servers").send().await {
+                Ok(response) if response.ok() => {
+                    match response.json::<Vec<McpServerSummary>>().await {
+                        Ok(list) => {
+                            servers.set(list);
+                            status.set(String::new());
+                        }
+                        Err(_) => status.set("MCP server response was not valid.".into()),
+                    }
+                }
+                Ok(response) => status.set(format!(
+                    "MCP server request failed: HTTP {}",
+                    response.status()
+                )),
+                Err(_) => status.set("MCP server service did not answer.".into()),
+            }
+        });
+    };
+
+    load();
+
+    let create = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let name_val = name.get_untracked().trim().to_owned();
+        if name_val.is_empty() {
+            status.set("Name is required.".into());
+            return;
+        }
+        let transport_val = transport.get_untracked();
+        let config_text = configuration.get_untracked().trim().to_owned();
+        let config_value = if config_text.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            match serde_json::from_str(&config_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    status.set(format!("Invalid configuration JSON: {e}"));
+                    return;
+                }
+            }
+        };
+        status.set("Creating MCP server...".into());
+        spawn_local(async move {
+            let body = CreateMcpServerBody {
+                name: name_val,
+                transport: transport_val,
+                configuration: config_value,
+                enabled: true,
+            };
+            match Request::post("/api/v1/mcp/servers").json(&body) {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => {
+                        name.set(String::new());
+                        configuration.set(String::new());
+                        load();
+                    }
+                    Ok(response) => {
+                        status.set(format!("Create failed: HTTP {}", response.status()))
+                    }
+                    Err(_) => status.set("MCP server service did not answer.".into()),
+                },
+                Err(_) => status.set("Create request could not be encoded.".into()),
+            }
+        });
+    };
+
+    let delete_server = move |server_id: String| {
+        spawn_local({
+            let status = status;
+            let load = load;
+            async move {
+                match Request::delete(&format!("/api/v1/mcp/servers/{server_id}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.ok() => load(),
+                    Ok(response) => {
+                        status.set(format!("Delete failed: HTTP {}", response.status()))
+                    }
+                    Err(_) => status.set("MCP server service did not answer.".into()),
+                }
+            }
+        });
+    };
+
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"CONNECT / MCP"</p><h1>"MCP Servers"</h1></div>
+            <span class="utility">{move || format!("{} SERVERS", servers.get().len())}</span>
+        </div>
+        <form class="filter-row" on:submit=create>
+            <input placeholder="Server name" prop:value=move || name.get()
+                on:input=move |event| name.set(event_target_value(&event)) />
+            <select prop:value=move || transport.get()
+                on:change=move |event| transport.set(event_target_value(&event))>
+                <option value="stdio">"stdio"</option>
+                <option value="streamable_http">"streamable_http"</option>
+            </select>
+            <textarea placeholder="Configuration (JSON)" prop:value=move || configuration.get()
+                on:input=move |event| configuration.set(event_target_value(&event))></textarea>
+            <button type="submit">"Add"</button>
+        </form>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="index-table" role="table">
+            <div class="index-row header" role="row"><span>"NAME"</span><span>"TRANSPORT"</span><span>"STATE"</span><span>"ACTIONS"</span></div>
+            {move || servers.get().into_iter().map(|server| {
+                let sid = server.id.clone();
+                view! { <div class="index-row" role="row">
+                    <strong>{server.name}</strong>
+                    <span>{server.transport.to_uppercase()}</span>
+                    <span class="spine-cell">{if server.enabled { "ENABLED" } else { "DISABLED" }}</span>
+                    <button class="text-button" on:click=move |_| delete_server(sid.clone())>"Delete"</button>
+                </div> }
+            }).collect_view()}
+        </div>
+    }
+}
+
 #[component]
 fn LibraryPage() -> impl IntoView {
     let books = RwSignal::new(Vec::<BookSummary>::new());
@@ -1304,8 +1570,15 @@ fn SkillsPage() -> impl IntoView {
             <div class="index-row header" role="row"><span>"ID"</span><span>"NAME"</span><span>"DESCRIPTION"</span><span>"REVISION"</span><span>"POLICY"</span></div>
             {move || skills.get().into_iter().map(|skill| {
                 let skill_id = skill.id.clone();
-                let is_expanded = move || expanded_skill.get().as_deref() == Some(&skill_id);
                 let short_id = skill_id.chars().take(8).collect::<String>();
+                let is_expanded = {
+                    let skill_id = skill_id.clone();
+                    move || expanded_skill.get().as_deref() == Some(&skill_id)
+                };
+                let is_expanded_again = {
+                    let skill_id = skill_id.clone();
+                    move || expanded_skill.get().as_deref() == Some(&skill_id)
+                };
                 view! {
                     <>
                     <button class="index-row index-action" type="button" role="row"
@@ -1317,7 +1590,7 @@ fn SkillsPage() -> impl IntoView {
                         <span>{skill.active_revision.map_or("—".into(), |r| format!("v{r}"))}</span>
                         <span>{skill.promotion_policy.to_uppercase()}</span>
                     </button>
-                    {move || is_expanded().then(|| {
+                    {move || is_expanded_again().then(|| {
                         let current_revisions = revisions.get();
                         view! {
                             <div class="index-table">
@@ -1326,8 +1599,8 @@ fn SkillsPage() -> impl IntoView {
                                     view! { <div class="index-row" role="row">
                                         <span class="spine-cell">{format!("v{}", rev.revision)}</span>
                                         <span>{if rev.promoted { "PROMOTED" } else { "DRAFT" }}</span>
-                                        <pre>{&rev.content}</pre>
-                                        <span>{&rev.reason}</span>
+                                        <pre>{rev.content.clone()}</pre>
+                                        <span>{rev.reason.clone()}</span>
                                     </div> }
                                 }).collect_view()}
                             </div>
@@ -1366,11 +1639,6 @@ fn AutobiographyPage() -> impl IntoView {
 #[component]
 fn EmptyOperationalPage(page: Page) -> impl IntoView {
     let (label, description, action) = match page {
-        Page::Workspaces => (
-            "Workspaces",
-            "Repositories, Books, tasks, agents, and persistent environments share one workspace boundary.",
-            "Create workspace",
-        ),
         Page::Tasks => (
             "Tasks",
             "Durable work moves through explicit states and remains visible when agents run in the background.",
@@ -1391,12 +1659,13 @@ fn EmptyOperationalPage(page: Page) -> impl IntoView {
             "Procedures are versioned, evaluated, and promoted with evidence rather than silent rewrites.",
             "Import Skill",
         ),
-        Page::Mcp => (
-            "MCP",
-            "Connect tools, resources, and prompts through versioned transports and credential references.",
-            "Add MCP server",
-        ),
-        Page::Chat | Page::Library | Page::Skills | Page::Autobiography | Page::Models | Page::Diagnostics => unreachable!(),
+        Page::Chat
+        | Page::Library
+        | Page::Autobiography
+        | Page::Models
+        | Page::Diagnostics
+        | Page::Workspaces
+        | Page::Mcp => unreachable!(),
     };
     view! {
         <div class="page-heading"><div><p class="utility">"OPERATOR INDEX"</p><h1>{label}</h1></div></div>
@@ -2289,9 +2558,10 @@ fn load_skill_revisions(
                     Err(_) => status.set("Revision response was not valid.".into()),
                 }
             }
-            Ok(response) => {
-                status.set(format!("Revisions request failed: HTTP {}", response.status()))
-            }
+            Ok(response) => status.set(format!(
+                "Revisions request failed: HTTP {}",
+                response.status()
+            )),
             Err(_) => status.set("Revisions service did not answer.".into()),
         }
     });
@@ -2307,24 +2577,20 @@ fn load_autobiography(
     status.set("Reading Autobiography...".into());
     spawn_local(async move {
         match Request::get("/api/v1/autobiography").send().await {
-            Ok(response) if response.ok() => {
-                match response.json::<AutobiographyResponse>().await {
-                    Ok(found) => {
-                        body.set(found.body);
-                        revision.set(found.revision);
-                        policy.set(found.policy);
-                        updated_at.set(found.updated_at);
-                        status.set("Autobiography loaded.".into());
-                    }
-                    Err(_) => status.set("Autobiography response was not valid.".into()),
+            Ok(response) if response.ok() => match response.json::<AutobiographyResponse>().await {
+                Ok(found) => {
+                    body.set(found.body);
+                    revision.set(found.revision);
+                    policy.set(found.policy);
+                    updated_at.set(found.updated_at);
+                    status.set("Autobiography loaded.".into());
                 }
-            }
-            Ok(response) => {
-                status.set(format!(
-                    "Autobiography request failed: HTTP {}",
-                    response.status()
-                ))
-            }
+                Err(_) => status.set("Autobiography response was not valid.".into()),
+            },
+            Ok(response) => status.set(format!(
+                "Autobiography request failed: HTTP {}",
+                response.status()
+            )),
             Err(_) => status.set("Autobiography service did not answer.".into()),
         }
     });
@@ -2339,19 +2605,17 @@ fn load_auto_detect(
     status.set("Scanning for available providers...".into());
     spawn_local(async move {
         match Request::get("/api/v1/models/auto-detect").send().await {
-            Ok(response) if response.ok() => {
-                match response.json::<AutoDetectResponse>().await {
-                    Ok(found) => {
-                        detected.set(found.detected);
-                        detecting.set(false);
-                        status.set("Provider scan complete.".into());
-                    }
-                    Err(_) => {
-                        detecting.set(false);
-                        status.set("Auto-detect response was not valid.".into());
-                    }
+            Ok(response) if response.ok() => match response.json::<AutoDetectResponse>().await {
+                Ok(found) => {
+                    detected.set(found.detected);
+                    detecting.set(false);
+                    status.set("Provider scan complete.".into());
                 }
-            }
+                Err(_) => {
+                    detecting.set(false);
+                    status.set("Auto-detect response was not valid.".into());
+                }
+            },
             Ok(response) => {
                 detecting.set(false);
                 status.set(format!(
