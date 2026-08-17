@@ -233,10 +233,25 @@ pub async fn activate_chat_model(
 }
 
 fn validate(input: &CreateChatModelRequest) -> Result<(), AppError> {
-    if !matches!(input.provider_type.as_str(), "openai_compatible" | "ollama") {
-        return Err(AppError::Validation(
-            "provider_type must be openai_compatible or ollama".into(),
-        ));
+    // Catalog providers all speak OpenAI-compatible chat completions except
+    // ollama, which uses the local /api/chat wire format. Accept the catalog
+    // provider types; the request builder (chat.rs) switches on ollama only.
+    if !matches!(
+        input.provider_type.as_str(),
+        "openai_compatible"
+            | "ollama"
+            | "opencode-go"
+            | "openai-codex"
+            | "openrouter"
+            | "openai"
+            | "deepseek"
+            | "mistral"
+            | "xai"
+    ) {
+        return Err(AppError::Validation(format!(
+            "provider_type {} is not supported",
+            input.provider_type
+        )));
     }
     let unique: std::collections::BTreeSet<_> = input.fallback_model_ids.iter().collect();
     if input.fallback_model_ids.len() > 5 || unique.len() != input.fallback_model_ids.len() {

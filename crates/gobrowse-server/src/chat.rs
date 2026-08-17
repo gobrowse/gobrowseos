@@ -265,7 +265,22 @@ pub async fn load_routes(
     for row in rows {
         let model_id: String = row.get("id");
         let provider_type: String = row.get("provider_type");
-        if !matches!(provider_type.as_str(), "openai_compatible" | "ollama") {
+        // Catalog providers (opencode-go, openai-codex, openrouter, openai,
+        // deepseek, mistral, xai, openai_compatible) all use the OpenAI chat
+        // completions wire format; ollama uses its local /api/chat format.
+        if provider_type != "ollama"
+            && !matches!(
+                provider_type.as_str(),
+                "openai_compatible"
+                    | "opencode-go"
+                    | "openai-codex"
+                    | "openrouter"
+                    | "openai"
+                    | "deepseek"
+                    | "mistral"
+                    | "xai"
+            )
+        {
             continue;
         }
         let base_url_value: Option<String> = row.try_get("base_url")?;
