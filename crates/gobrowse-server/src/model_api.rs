@@ -278,6 +278,109 @@ fn require_admin(user: &AuthenticatedUser) -> Result<(), AppError> {
     }
 }
 
+#[derive(Debug, Serialize)]
+pub struct DetectedProvider {
+    pub provider_type: String,
+    pub available: bool,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AutoDetectResponse {
+    pub detected: Vec<DetectedProvider>,
+}
+
+/// Detect providers from environment variables only (sync, no network).
+/// Suitable for unit tests.
+pub fn detect_providers_from_env(env: &std::collections::HashMap<String, String>) -> Vec<DetectedProvider> {
+    let mut detected = Vec::new();
+
+    // Known API-key env vars — presence means "available".
+    let key_vars: &[(&str, &str)] = &[
+        ("openai", "OPENAI_API_KEY"),
+        ("openrouter", "OPENROUTER_API_KEY"),
+        ("anthropic", "ANTHROPIC_API_KEY"),
+        ("google", "GOOGLE_API_KEY"),
+        ("deepseek", "DEEPSEEK_API_KEY"),
+    ];
+    for &(provider_type, var) in key_vars {
+        detected.push(DetectedProvider {
+            provider_type: provider_type.to_string(),
+            available: env.contains_key(var),
+            models: Vec::new(),
+        });
+    }
+
+    // GOBROWSE__PROVIDER__* prefixed env vars.
+    let has_gobrowse_provider = env.keys().any(|k| k.starts_with("GOBROWSE__PROVIDER__"));
+    detected.push(DetectedProvider {
+        provider_type: "gobrowse_provider_override".into(),
+        available: has_gobrowse_provider,
+        models: Vec::new(),
+    });
+
+    detected
+}
+
+/// Probe a local Ollama instance. Returns a DetectedProvider with
+/// available and any discovered models.
+async fn probe_ollama(client: &reqwest::Client) -> DetectedProvider {
+    let version_ok = client
+        .get("http://127.0.0.1:11434/api/version")
+        .timeout(std::time::Duration::from_millis(500))
+        .send()
+        .await
+        .is_ok_and(|r| r.status().is_success());
+
+    let mut models = Vec::new();
+    if version_ok {
+        // Default recommended models.
+        models.push("llama3.2".into());
+        models.push("nomic-embed-text".into());
+
+        // Cheap probe for installed models.
+        if let Ok(response) = client
+            .get("http://127.0.0.1:11434/api/tags")
+            .timeout(std::time::Duration::from_millis(1000))
+            .send()
+            .await
+            && response.status().is_success()
+            && let Ok(body) = response.json::<serde_json::Value>().await
+            && let Some(model_list) = body["models"].as_array()
+        {
+            for entry in model_list {
+                if let Some(name) = entry["name"].as_str() {
+                    let trimmed = name.trim_end_matches(":latest");
+                    if !models.contains(&trimmed.to_owned()) {
+                        models.push(trimmed.to_owned());
+                    }
+                }
+            }
+        }
+    }
+
+    DetectedProvider {
+        provider_type: "ollama".into(),
+        available: version_ok,
+        models,
+    }
+}
+
+pub async fn auto_detect_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AutoDetectResponse>, AppError> {
+    let _user = require_user(&state, &headers).await?;
+    let env: std::collections::HashMap<String, String> = std::env::vars().collect();
+    let mut detected = detect_providers_from_env(&env);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("failed to build HTTP client")))?;
+    detected.push(probe_ollama(&client).await);
+    Ok(Json(AutoDetectResponse { detected }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +503,54 @@ mod tests {
             validate(&req).is_ok(),
             "exactly 5 unique fallbacks should pass"
         );
+    }
+
+    #[test]
+    fn detect_providers_from_env_detects_nothing_when_empty() {
+        let env = std::collections::HashMap::new();
+        let result = detect_providers_from_env(&env);
+        assert_eq!(result.len(), 6, "six provider types expected");
+        for provider in &result {
+            assert!(!provider.available, "no keys should mean unavailable");
+            assert!(provider.models.is_empty(), "no models without probe");
+        }
+    }
+
+    #[test]
+    fn detect_providers_from_env_detects_openai_key() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("OPENAI_API_KEY".into(), "sk-test123".into());
+        let result = detect_providers_from_env(&env);
+        let openai = result.iter().find(|p| p.provider_type == "openai").expect("openai entry");
+        assert!(openai.available, "OPENAI_API_KEY present");
+        let openrouter = result.iter().find(|p| p.provider_type == "openrouter").expect("openrouter entry");
+        assert!(!openrouter.available, "OPENROUTER_API_KEY absent");
+    }
+
+    #[test]
+    fn detect_providers_from_env_detects_gobrowse_provider() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("GOBROWSE__PROVIDER__CHAT_BASE_URL".into(), "http://localhost:8080".into());
+        let result = detect_providers_from_env(&env);
+        let override_provider = result.iter().find(|p| p.provider_type == "gobrowse_provider_override").expect("gobrowse override entry");
+        assert!(override_provider.available, "GOBROWSE__PROVIDER__ prefixed env var present");
+    }
+
+    #[test]
+    fn detect_providers_from_env_detects_all_keys() {
+        let mut env = std::collections::HashMap::new();
+        env.insert("OPENAI_API_KEY".into(), "sk-1".into());
+        env.insert("OPENROUTER_API_KEY".into(), "sk-2".into());
+        env.insert("ANTHROPIC_API_KEY".into(), "sk-3".into());
+        env.insert("GOOGLE_API_KEY".into(), "sk-4".into());
+        env.insert("DEEPSEEK_API_KEY".into(), "sk-5".into());
+        let result = detect_providers_from_env(&env);
+        for provider in &result {
+            if provider.provider_type == "gobrowse_provider_override" {
+                assert!(!provider.available, "prefix var absent");
+            } else {
+                assert!(provider.available, "{} should be available", provider.provider_type);
+            }
+        }
     }
 }

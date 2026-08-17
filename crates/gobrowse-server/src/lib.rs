@@ -10,6 +10,7 @@ pub mod embedding;
 pub mod embedding_api;
 pub mod error;
 pub mod library_api;
+pub mod mcp_api;
 pub mod model_api;
 pub mod outbound_http;
 pub mod realtime;
@@ -31,7 +32,7 @@ use axum::{
     http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use sqlx::PgPool;
 use tokio::sync::RwLock;
@@ -147,6 +148,10 @@ pub fn router(state: AppState) -> Router {
             post(embedding_api::retry_job),
         )
         .route(
+            "/models/auto-detect",
+            get(model_api::auto_detect_providers),
+        )
+        .route(
             "/models/chat",
             get(model_api::list_chat_models).post(model_api::create_chat_model),
         )
@@ -210,6 +215,14 @@ pub fn router(state: AppState) -> Router {
             post(skills_api::promote_skill),
         )
         .route("/skills/{skill_id}/rollback", post(skills_api::rollback))
+        .route(
+            "/mcp/servers",
+            get(mcp_api::list).post(mcp_api::create),
+        )
+        .route(
+            "/mcp/servers/{id}",
+            patch(mcp_api::update).delete(mcp_api::delete),
+        )
         .route("/autobiography", get(autobiography_api::get_autobiography))
         .route(
             "/autobiography/policy",

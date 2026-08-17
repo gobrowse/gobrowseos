@@ -28,6 +28,7 @@ enum Page {
     Agents,
     Terminals,
     Skills,
+    Autobiography,
     Mcp,
     Models,
     Diagnostics,
@@ -191,6 +192,54 @@ struct CreateChatModelConfiguration<'a> {
     priority: i32,
     activate: bool,
     fallback_model_ids: Vec<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SkillResponse {
+    id: String,
+    profile_id: String,
+    workspace_id: Option<String>,
+    name: String,
+    description: String,
+    active_revision: Option<i64>,
+    promotion_policy: String,
+    created_at: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SkillRevisionResponse {
+    id: String,
+    skill_id: String,
+    revision: i64,
+    content: String,
+    author: String,
+    reason: String,
+    source_conversation_ids: Vec<String>,
+    created_at: String,
+    evaluation: Option<serde_json::Value>,
+    promoted: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AutobiographyResponse {
+    id: String,
+    body: String,
+    revision: i64,
+    policy: String,
+    updated_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DetectedProviderInfo {
+    provider_type: String,
+    available: bool,
+    models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct AutoDetectResponse {
+    detected: Vec<DetectedProviderInfo>,
 }
 
 #[derive(Clone, Copy)]
@@ -393,7 +442,7 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
             </header>
             <nav class="side-nav" aria-label="Primary">
                 <NavGroup title="OPERATE" items=vec![("Chat", Page::Chat), ("Tasks", Page::Tasks), ("Agents", Page::Agents), ("Terminals", Page::Terminals)] page />
-                <NavGroup title="ORGANIZE" items=vec![("Library", Page::Library), ("Workspaces", Page::Workspaces), ("Skills", Page::Skills)] page />
+                <NavGroup title="ORGANIZE" items=vec![("Library", Page::Library), ("Workspaces", Page::Workspaces), ("Skills", Page::Skills), ("Autobiography", Page::Autobiography)] page />
                 <NavGroup title="CONNECT" items=if is_admin { vec![("MCP", Page::Mcp), ("Models", Page::Models)] } else { vec![("MCP", Page::Mcp)] } page />
                 {is_admin.then(|| view! { <NavGroup title="INSPECT" items=vec![("Diagnostics", Page::Diagnostics)] page /> })}
             </nav>
@@ -401,6 +450,8 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                 {move || match page.get() {
                     Page::Chat => view! { <ChatPage user_id=user_id.clone() /> }.into_any(),
                     Page::Library => view! { <LibraryPage /> }.into_any(),
+                    Page::Skills => view! { <SkillsPage /> }.into_any(),
+                    Page::Autobiography => view! { <AutobiographyPage /> }.into_any(),
                     Page::Models => view! { <ModelsPage /> }.into_any(),
                     Page::Diagnostics => view! { <DiagnosticsPage /> }.into_any(),
                     current => view! { <EmptyOperationalPage page=current /> }.into_any(),
@@ -1015,8 +1066,15 @@ fn ModelsPage() -> impl IntoView {
     let chat_context = RwSignal::new("8192".to_owned());
     let chat_output = RwSignal::new("1024".to_owned());
     let chat_fallbacks = RwSignal::new(String::new());
+    let detected = RwSignal::new(Vec::<DetectedProviderInfo>::new());
+    let detecting = RwSignal::new(false);
     load_configurations(configurations, status);
     load_chat_models(chat_configurations, status, Arc::clone(&lifecycle));
+    let detect = move |_| {
+        if !detecting.get_untracked() {
+            load_auto_detect(detected, detecting, status);
+        }
+    };
     let create = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         let endpoint = base_url.get_untracked();
@@ -1124,7 +1182,25 @@ fn ModelsPage() -> impl IntoView {
         });
     };
     view! {
-        <div class="page-heading"><div><p class="utility">"MODELS / ROUTES"</p><h1>"Provider registry"</h1></div></div>
+        <div class="page-heading"><div><p class="utility">"MODELS / ROUTES"</p><h1>"Provider registry"</h1></div>
+            <button class="secondary" disabled=move || detecting.get() on:click=detect>
+                {move || if detecting.get() { "Scanning..." } else { "Detect providers" }}
+            </button>
+        </div>
+        <section class="model-section">
+            <div class="section-heading"><div><p class="utility">"DETECTED / AUTO"</p><h2>"Available providers"</h2></div></div>
+            <p class="form-note">{move || status.get()}</p>
+            <div class="index-table">
+                <div class="index-row header"><span>"PROVIDER"</span><span>"AVAILABLE"</span><span>"MODELS"</span></div>
+                {move || detected.get().into_iter().map(|provider| view! {
+                    <div class="index-row">
+                        <span class="spine-cell">{provider.provider_type.to_uppercase()}</span>
+                        <span>{if provider.available { "YES" } else { "NO" }}</span>
+                        <span>{if provider.models.is_empty() { "—".into() } else { provider.models.join(", ") }}</span>
+                    </div>
+                }).collect_view()}
+            </div>
+        </section>
         <section class="model-section">
             <div class="section-heading"><div><p class="utility">"CHAT / STREAMING"</p><h2>"Conversation models"</h2></div><span>{move || format!("{} ROUTES", chat_configurations.get().len())}</span></div>
             <form class="model-form" on:submit=create_chat>
@@ -1202,6 +1278,92 @@ fn DiagnosticsPage() -> impl IntoView {
 }
 
 #[component]
+fn SkillsPage() -> impl IntoView {
+    let skills = RwSignal::new(Vec::<SkillResponse>::new());
+    let status = RwSignal::new(String::new());
+    let expanded_skill = RwSignal::new(None::<String>);
+    let revisions = RwSignal::new(Vec::<SkillRevisionResponse>::new());
+    load_skills(skills, status);
+    let toggle = move |skill_id: String| {
+        let current = expanded_skill.get_untracked();
+        if current.as_deref() == Some(&skill_id) {
+            expanded_skill.set(None);
+            revisions.set(Vec::new());
+        } else {
+            expanded_skill.set(Some(skill_id.clone()));
+            load_skill_revisions(skill_id, revisions, status);
+        }
+    };
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"PROCEDURES / SKILLS"</p><h1>"Skills"</h1></div>
+            <span class="utility">{move || format!("{} SKILLS", skills.get().len())}</span>
+        </div>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="index-table" role="table">
+            <div class="index-row header" role="row"><span>"ID"</span><span>"NAME"</span><span>"DESCRIPTION"</span><span>"REVISION"</span><span>"POLICY"</span></div>
+            {move || skills.get().into_iter().map(|skill| {
+                let skill_id = skill.id.clone();
+                let is_expanded = move || expanded_skill.get().as_deref() == Some(&skill_id);
+                let short_id = skill_id.chars().take(8).collect::<String>();
+                view! {
+                    <>
+                    <button class="index-row index-action" type="button" role="row"
+                        class:active=is_expanded
+                        on:click=move |_| toggle(skill_id.clone())>
+                        <span class="spine-cell">{short_id}</span>
+                        <strong>{skill.name}</strong>
+                        <span class="utility">{skill.description}</span>
+                        <span>{skill.active_revision.map_or("—".into(), |r| format!("v{r}"))}</span>
+                        <span>{skill.promotion_policy.to_uppercase()}</span>
+                    </button>
+                    {move || is_expanded().then(|| {
+                        let current_revisions = revisions.get();
+                        view! {
+                            <div class="index-table">
+                                <div class="index-row header" role="row"><span>"REV"</span><span>"STATUS"</span><span>"CONTENT"</span><span>"REASON"</span></div>
+                                {current_revisions.iter().map(|rev| {
+                                    view! { <div class="index-row" role="row">
+                                        <span class="spine-cell">{format!("v{}", rev.revision)}</span>
+                                        <span>{if rev.promoted { "PROMOTED" } else { "DRAFT" }}</span>
+                                        <pre>{&rev.content}</pre>
+                                        <span>{&rev.reason}</span>
+                                    </div> }
+                                }).collect_view()}
+                            </div>
+                        }
+                    })}
+                    </>
+                }
+            }).collect_view()}
+        </div>
+    }
+}
+
+#[component]
+fn AutobiographyPage() -> impl IntoView {
+    let body = RwSignal::new(String::new());
+    let revision = RwSignal::new(0_i64);
+    let policy = RwSignal::new(String::new());
+    let updated_at = RwSignal::new(String::new());
+    let status = RwSignal::new(String::new());
+    load_autobiography(body, revision, policy, updated_at, status);
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"PROFILE / AUTOBIOGRAPHY"</p><h1>"Autobiography"</h1></div>
+            <span class="utility">{move || format!("REV {}", revision.get())}</span>
+        </div>
+        <p class="form-note">{move || status.get()}</p>
+        <div class="index-table">
+            <div class="index-row"><span class="spine-cell">"REVISION"</span><span>{move || format!("v{}", revision.get())}</span></div>
+            <div class="index-row"><span class="spine-cell">"POLICY"</span><span>{move || policy.get().to_uppercase()}</span></div>
+            <div class="index-row"><span class="spine-cell">"UPDATED"</span><span>{move || updated_at.get()}</span></div>
+        </div>
+        <pre>{move || body.get()}</pre>
+    }
+}
+
+#[component]
 fn EmptyOperationalPage(page: Page) -> impl IntoView {
     let (label, description, action) = match page {
         Page::Workspaces => (
@@ -1234,7 +1396,7 @@ fn EmptyOperationalPage(page: Page) -> impl IntoView {
             "Connect tools, resources, and prompts through versioned transports and credential references.",
             "Add MCP server",
         ),
-        Page::Chat | Page::Library | Page::Models | Page::Diagnostics => unreachable!(),
+        Page::Chat | Page::Library | Page::Skills | Page::Autobiography | Page::Models | Page::Diagnostics => unreachable!(),
     };
     view! {
         <div class="page-heading"><div><p class="utility">"OPERATOR INDEX"</p><h1>{label}</h1></div></div>
@@ -2084,6 +2246,123 @@ fn load_jobs(jobs: RwSignal<Vec<EmbeddingJob>>, status: RwSignal<String>) {
             },
             Ok(response) => status.set(format!("Queue request failed: HTTP {}", response.status())),
             Err(_) => status.set("Queue service did not answer.".into()),
+        }
+    });
+}
+
+fn load_skills(skills: RwSignal<Vec<SkillResponse>>, status: RwSignal<String>) {
+    status.set("Reading Skills index...".into());
+    spawn_local(async move {
+        match Request::get("/api/v1/skills").send().await {
+            Ok(response) if response.ok() => match response.json::<Vec<SkillResponse>>().await {
+                Ok(found) => {
+                    let count = found.len();
+                    skills.set(found);
+                    status.set(format!("{count} Skills loaded."));
+                }
+                Err(_) => status.set("Skills response was not valid.".into()),
+            },
+            Ok(response) => {
+                status.set(format!("Skills request failed: HTTP {}", response.status()))
+            }
+            Err(_) => status.set("Skills service did not answer.".into()),
+        }
+    });
+}
+
+fn load_skill_revisions(
+    skill_id: String,
+    revisions: RwSignal<Vec<SkillRevisionResponse>>,
+    status: RwSignal<String>,
+) {
+    status.set("Reading revision history...".into());
+    spawn_local(async move {
+        let endpoint = format!("/api/v1/skills/{skill_id}/revisions");
+        match Request::get(&endpoint).send().await {
+            Ok(response) if response.ok() => {
+                match response.json::<Vec<SkillRevisionResponse>>().await {
+                    Ok(found) => {
+                        let count = found.len();
+                        revisions.set(found);
+                        status.set(format!("{count} revisions loaded."));
+                    }
+                    Err(_) => status.set("Revision response was not valid.".into()),
+                }
+            }
+            Ok(response) => {
+                status.set(format!("Revisions request failed: HTTP {}", response.status()))
+            }
+            Err(_) => status.set("Revisions service did not answer.".into()),
+        }
+    });
+}
+
+fn load_autobiography(
+    body: RwSignal<String>,
+    revision: RwSignal<i64>,
+    policy: RwSignal<String>,
+    updated_at: RwSignal<String>,
+    status: RwSignal<String>,
+) {
+    status.set("Reading Autobiography...".into());
+    spawn_local(async move {
+        match Request::get("/api/v1/autobiography").send().await {
+            Ok(response) if response.ok() => {
+                match response.json::<AutobiographyResponse>().await {
+                    Ok(found) => {
+                        body.set(found.body);
+                        revision.set(found.revision);
+                        policy.set(found.policy);
+                        updated_at.set(found.updated_at);
+                        status.set("Autobiography loaded.".into());
+                    }
+                    Err(_) => status.set("Autobiography response was not valid.".into()),
+                }
+            }
+            Ok(response) => {
+                status.set(format!(
+                    "Autobiography request failed: HTTP {}",
+                    response.status()
+                ))
+            }
+            Err(_) => status.set("Autobiography service did not answer.".into()),
+        }
+    });
+}
+
+fn load_auto_detect(
+    detected: RwSignal<Vec<DetectedProviderInfo>>,
+    detecting: RwSignal<bool>,
+    status: RwSignal<String>,
+) {
+    detecting.set(true);
+    status.set("Scanning for available providers...".into());
+    spawn_local(async move {
+        match Request::get("/api/v1/models/auto-detect").send().await {
+            Ok(response) if response.ok() => {
+                match response.json::<AutoDetectResponse>().await {
+                    Ok(found) => {
+                        detected.set(found.detected);
+                        detecting.set(false);
+                        status.set("Provider scan complete.".into());
+                    }
+                    Err(_) => {
+                        detecting.set(false);
+                        status.set("Auto-detect response was not valid.".into());
+                    }
+                }
+            }
+            Ok(response) => {
+                detecting.set(false);
+                status.set(format!(
+                    "Auto-detect request failed: HTTP {}",
+                    response.status()
+                ))
+            }
+            Err(_) => {
+                detecting.set(false);
+                status.set("Auto-detect service did not answer.".into());
+            }
         }
     });
 }
