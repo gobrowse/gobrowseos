@@ -77,6 +77,16 @@ cargo audit
 
 See [`AGENTS.md`](AGENTS.md) for the full CI matrix and conventions.
 
+## Recent Features
+
+- **Provider catalog dropdown** — pick from OpenCode Go, OpenAI Codex, OpenRouter, OpenAI, Anthropic, Google, DeepSeek, Mistral, xAI, or Ollama; base URL, model, context window, and output limit auto-fill from the catalog.
+- **Model cost & usage charts** — spend by model/provider/day, token totals, unpriced-run counts (`/api/v1/usage/summary`).
+- **Library editing** — open any Book from the list, view its body, edit and save with revision checks.
+- **Library → chat pinning** — pin Books to a conversation; the agent receives them as pinned context on every run.
+- **Workspace context** — a selected workspace's worktrees/files are included in context assembly.
+- **Model library tools** — agents can search and add Library context during a run via `library_search` / `library_add` tools.
+- **Operator pages** — Skills, Autobiography, Workspaces, and MCP server management now have functional UI (list, create, delete).
+
 ## Built With
 
 Gobrowse OS was built by [Oh My Pi](https://github.com/ohmyzsh/ohmyzsh) using multiple AI models across a 4-day autonomous development sprint. The entire M1→M20 milestone progression — from foundational infrastructure through security-critical migrations, sandbox isolation, MCP interoperability, and release qualification — was planned, implemented, reviewed, and verified by AI agents operating within the Pi coding harness.

@@ -67,3 +67,11 @@
 ## Post-Release
 
 See `docs/post-release-backlog.md` for non-blocking improvements.
+
+## Post-Release Addendum (2026-08-17)
+
+- **Schema 19** — `0019_conversation_pinned_books` adds per-conversation Library book pinning with FK cascade.
+- **UI stabilization** — fixed the "Add + activate" model form where the required model select had no option on initial load (silent native-validation block); provider/model/context/output now auto-fill from the provider catalog.
+- **New endpoints** — `GET /api/v1/providers/catalog` (provider dropdown reference) and `GET /api/v1/usage/summary?window=7d|30d|all` (model cost aggregation), both auth-gated.
+- **New UI** — cost/usage charts (spend by model/provider/day), Library book detail/edit, Workspaces + MCP server management pages.
+- Commits: `451c21d`, `49d58f8`, `383c5a1`, `c3f185f`, `8c86352`.

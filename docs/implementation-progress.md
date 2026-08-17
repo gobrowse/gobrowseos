@@ -664,3 +664,11 @@ Docker Compose cold-start: build, start, /health/ready, /api/v1/auth/me 401. Mig
 ## M20 private production release (PASS)
 
 Final CI run 31969061659 passed all jobs (rust, web, supply-chain, container). Commit dcb4034. All milestones M1–M19 ACCEPTED or OUT_OF_SCOPE. Total release blockers: 0.
+
+## Post-M20 UI stabilization (2026-08-17)
+
+- `451c21d` — Skills/Autobiography pages, provider auto-detect, MCP CRUD API.
+- `49d58f8` — Workspaces and MCP server pages with working forms.
+- `383c5a1` — Library→chat pinning, workspace folder context, model library search/add tools. Schema 19 (`conversation_pinned_books`).
+- `c3f185f` — Provider catalog dropdown, cost/usage charts, Library book editing. Endpoints `/api/v1/providers/catalog` and `/api/v1/usage/summary` (auth-gated).
+- `8c86352` — Fix "Add + activate" model form: populate model select from default provider on load so the required select has a valid option and submission is not silently blocked by native validation.
