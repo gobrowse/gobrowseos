@@ -1687,7 +1687,20 @@ fn ModelsPage() -> impl IntoView {
             && response.ok()
             && let Ok(list) = response.json::<Vec<CatalogProvider>>().await
         {
-            catalog.set(list);
+            catalog.set(list.clone());
+            // Populate the model select for the initial provider so the required
+            // select has a matching option and the form can submit.
+            if let Some(provider) = list
+                .into_iter()
+                .find(|entry| entry.provider_type == chat_provider.get_untracked())
+            {
+                catalog_models.set(provider.models.clone());
+                if let Some(first) = provider.models.first() {
+                    chat_model.set(first.reference.clone());
+                    chat_context.set(first.context_window.to_string());
+                    chat_output.set(first.output_limit.to_string());
+                }
+            }
         }
     });
     let on_provider_select = move |event: leptos::ev::Event| {
