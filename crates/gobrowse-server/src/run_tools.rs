@@ -429,7 +429,6 @@ pub(crate) async fn create_library_note(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::PgPool;
 
     #[test]
     fn tool_definitions_have_correct_ids() {

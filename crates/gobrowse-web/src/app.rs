@@ -498,7 +498,6 @@ fn AuthPanel(
 #[component]
 fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> impl IntoView {
     let page = RwSignal::new(Page::Chat);
-    let search_open = RwSignal::new(false);
     let user_id = user
         .get_untracked()
         .map(|current| current.id)
@@ -520,8 +519,8 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
         <div class="os-shell">
             <header class="command-bar">
                 <div class="brand-mark compact">"G/OS"</div>
-                <button class="library-search" on:click=move |_| search_open.set(true)>
-                    <span>"Search the Library"</span><kbd>"/"</kbd>
+                <button class="library-search" on:click=move |_| page.set(Page::Library)>
+                    <span>"Search the Library"</span>
                 </button>
                 <div class="runtime-status"><i></i><span>"SERVER READY"</span></div>
                 <button class="user-control" on:click=logout>
@@ -563,15 +562,6 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                 <button on:click=move |_| page.set(if is_admin { Page::Diagnostics } else { Page::Workspaces })>"More"</button>
             </nav>
         </div>
-        {move || search_open.get().then(|| view! {
-            <dialog class="search-dialog" open>
-                <form method="dialog" on:submit=move |_| search_open.set(false)>
-                    <div class="search-header"><span>"LIBRARY INDEX"</span><button>"Close"</button></div>
-                    <input autofocus placeholder="Search Books, conversations, messages, and Skills" />
-                    <p>"Type a query to retrieve scoped lexical and semantic matches. Full content loads only when selected."</p>
-                </form>
-            </dialog>
-        })}
     }
 }
 
@@ -1656,6 +1646,7 @@ fn ModelsPage() -> impl IntoView {
     let configurations = RwSignal::new(Vec::<EmbeddingConfiguration>::new());
     let chat_configurations = RwSignal::new(Vec::<ChatModelConfiguration>::new());
     let status = RwSignal::new(String::new());
+    let chat_status = RwSignal::new(String::new());
     let base_url = RwSignal::new("http://127.0.0.1:11434".to_owned());
     let model = RwSignal::new("nomic-embed-text".to_owned());
     let dimensions = RwSignal::new("768".to_owned());
@@ -1676,7 +1667,7 @@ fn ModelsPage() -> impl IntoView {
     let usage_lifecycle = Arc::clone(&lifecycle);
     load_usage(&usage, &usage_status, &usage_window, Arc::clone(&lifecycle));
     load_configurations(configurations, status);
-    load_chat_models(chat_configurations, status, Arc::clone(&lifecycle));
+    load_chat_models(chat_configurations, chat_status, Arc::clone(&lifecycle));
     let catalog_lifecycle = Arc::clone(&lifecycle);
     spawn_local(async move {
         let response = Request::get("/api/v1/providers/catalog").send().await;
@@ -1713,6 +1704,7 @@ fn ModelsPage() -> impl IntoView {
             {
                 chat_base_url.set(provider.base_url.clone());
                 catalog_models.set(provider.models.clone());
+                chat_status.set(String::new());
                 if let Some(first) = provider.models.first() {
                     chat_model.set(first.reference.clone());
                     chat_context.set(first.context_window.to_string());
@@ -1720,6 +1712,7 @@ fn ModelsPage() -> impl IntoView {
                 }
             } else {
                 catalog_models.set(Vec::new());
+                chat_status.set("Choose a provider and model from the catalog".into());
             }
     };
     let on_model_select = move |event: leptos::ev::Event| {
@@ -1775,9 +1768,17 @@ fn ModelsPage() -> impl IntoView {
     let create_chat_lifecycle = Arc::clone(&lifecycle);
     let create_chat = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
+        if catalog_models.get_untracked().is_empty() {
+            chat_status.set("Choose a provider and model from the catalog".into());
+            return;
+        }
         let provider = chat_provider.get_untracked();
         let endpoint = chat_base_url.get_untracked();
         let model_reference = chat_model.get_untracked();
+        if model_reference.trim().is_empty() {
+            chat_status.set("Choose a model from the catalog".into());
+            return;
+        }
         let secret = chat_secret.get_untracked();
         let fallback_values = chat_fallbacks
             .get_untracked()
@@ -1790,10 +1791,10 @@ fn ModelsPage() -> impl IntoView {
             chat_context.get_untracked().parse::<i32>(),
             chat_output.get_untracked().parse::<i32>(),
         ) else {
-            status.set("Context and output limits must be numbers.".into());
+            chat_status.set("Context and output limits must be numbers.".into());
             return;
         };
-        status.set("Validating and activating chat provider...".into());
+        chat_status.set("Validating and activating chat provider...".into());
         let lifecycle = Arc::clone(&create_chat_lifecycle);
         spawn_local(async move {
             if !lifecycle_is_active(&lifecycle) {
@@ -1819,13 +1820,13 @@ fn ModelsPage() -> impl IntoView {
                         if !lifecycle_is_active(&lifecycle) {
                             return;
                         }
-                        load_chat_models(chat_configurations, status, Arc::clone(&lifecycle));
+                        load_chat_models(chat_configurations, chat_status, Arc::clone(&lifecycle));
                     }
                     Ok(response) => {
                         if !lifecycle_is_active(&lifecycle) {
                             return;
                         }
-                        status.set(format!(
+                        chat_status.set(format!(
                             "Chat provider rejected: HTTP {}",
                             response.status()
                         ));
@@ -1834,12 +1835,12 @@ fn ModelsPage() -> impl IntoView {
                         if !lifecycle_is_active(&lifecycle) {
                             return;
                         }
-                        status.set("Chat provider service did not answer.".into());
+                        chat_status.set("Chat provider service did not answer.".into());
                     }
                 },
                 Err(_) => {
                     if lifecycle_is_active(&lifecycle) {
-                        status.set("Chat provider request could not be encoded.".into());
+                        chat_status.set("Chat provider request could not be encoded.".into());
                     }
                 }
             }
@@ -1869,7 +1870,7 @@ fn ModelsPage() -> impl IntoView {
             <div class="section-heading"><div><p class="utility">"CHAT / STREAMING"</p><h2>"Conversation models"</h2></div><span>{move || format!("{} ROUTES", chat_configurations.get().len())}</span></div>
             <form class="model-form" on:submit=create_chat>
                 <label>"Provider type"
-                    <select required prop:value=move || chat_provider.get() on:change=on_provider_select>
+                    <select prop:value=move || chat_provider.get() on:change=on_provider_select>
                         <option value="">"Choose provider"</option>
                         {move || catalog.get().into_iter().map(|entry| {
                             let provider_type = entry.provider_type.clone();
@@ -1880,7 +1881,7 @@ fn ModelsPage() -> impl IntoView {
                 </label>
                 <label>"Base URL"<input required prop:value=move || chat_base_url.get() on:input=move |event| chat_base_url.set(event_target_value(&event)) /></label>
                 <label>"Model reference"
-                    <select required prop:value=move || chat_model.get() on:change=on_model_select>
+                    <select prop:value=move || chat_model.get() on:change=on_model_select>
                         <option value="">"Choose model"</option>
                         {move || catalog_models.get().into_iter().map(|entry| {
                             let display = entry.reference.clone();
@@ -1895,6 +1896,7 @@ fn ModelsPage() -> impl IntoView {
                 <label class="fallback-field">"Fallback model IDs"<input placeholder="Comma-separated, in failover order" prop:value=move || chat_fallbacks.get() on:input=move |event| chat_fallbacks.set(event_target_value(&event)) /></label>
                 <button class="primary" type="submit">"Add + activate"</button>
             </form>
+            <p class="form-note">{move || chat_status.get()}</p>
             <div class="index-table model-index">
                 <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"LIMITS"</span><span>"FALLBACKS"</span></div>
                 {move || chat_configurations.get().into_iter().map(|configuration| {
@@ -1903,7 +1905,7 @@ fn ModelsPage() -> impl IntoView {
                     view! { <div class="index-row"><span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
                         <strong>{format!("{} / {}", configuration.display_name, configuration.model_reference)}</strong>
                         <span>{format!("{} · {}K / {}", configuration.provider_type, configuration.context_window / 1000, configuration.output_limit)}</span>
-                        <button class="text-button" disabled=configuration.active on:click=move |_| activate_chat_model(model_id.clone(), chat_configurations, status, Arc::clone(&activate_lifecycle))>
+                        <button class="text-button" disabled=configuration.active on:click=move |_| activate_chat_model(model_id.clone(), chat_configurations, chat_status, Arc::clone(&activate_lifecycle))>
                             {if configuration.active { format!("{} FALLBACKS", configuration.fallback_model_ids.len()) } else { "Activate".into() }}
                         </button>
                     </div> }
@@ -2174,26 +2176,22 @@ fn AutobiographyPage() -> impl IntoView {
 
 #[component]
 fn EmptyOperationalPage(page: Page) -> impl IntoView {
-    let (label, description, action) = match page {
+    let (label, description) = match page {
         Page::Tasks => (
             "Tasks",
             "Durable work moves through explicit states and remains visible when agents run in the background.",
-            "Create task",
         ),
         Page::Agents => (
             "Agents",
             "Inspect every active agent, delegated scope, model, permission set, and run timeline.",
-            "Create agent",
         ),
         Page::Terminals => (
             "Terminals",
             "Interactive shells open only inside configured sandbox environments and can reconnect by session ID.",
-            "Enable sandbox",
         ),
         Page::Skills => (
             "Skills",
             "Procedures are versioned, evaluated, and promoted with evidence rather than silent rewrites.",
-            "Import Skill",
         ),
         Page::Chat
         | Page::Library
@@ -2205,7 +2203,7 @@ fn EmptyOperationalPage(page: Page) -> impl IntoView {
     };
     view! {
         <div class="page-heading"><div><p class="utility">"OPERATOR INDEX"</p><h1>{label}</h1></div></div>
-        <div class="operational-empty"><span class="index-spine">"0"</span><h2>"Nothing indexed yet"</h2><p>{description}</p><button class="primary">{action}</button></div>
+        <div class="operational-empty"><span class="index-spine">"0"</span><h2>"Nothing indexed yet"</h2><p>{description}</p></div>
     }
 }
 
