@@ -1649,7 +1649,6 @@ struct TerminalReadResponse {
     data_base64: String,
     next_cursor: u64,
     state: String,
-    output_complete: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -3606,7 +3605,10 @@ fn TerminalsPage() -> impl IntoView {
                     }
                     cursor.set(read.next_cursor);
                     term_state.set(read.state.clone());
-                    if terminal_ended(&read.state) || read.output_complete {
+                    // `output_complete` means all buffered output was returned,
+                    // NOT that the terminal ended — only a terminal state stops
+                    // the poll loop (the daemon keeps the session running).
+                    if terminal_ended(&read.state) {
                         status.set(format!("Terminal {}", read.state.to_uppercase()));
                         break;
                     }

@@ -38,6 +38,8 @@ struct Args {
     restricted_network: Option<String>,
     #[arg(long, default_value_t = false)]
     allow_full_network: bool,
+    #[arg(long, default_value_t = 1_000)]
+    container_uid: u32,
     #[arg(long, default_value_t = 2_000)]
     max_cpu_millis: u32,
     #[arg(long, default_value_t = 2_147_483_648)]
@@ -76,20 +78,20 @@ struct Args {
     quota_managed_workspaces: bool,
 }
 
-/// Resolves the daemon user's home directory from /etc/passwd (the daemon
-/// must run with a sanitized env where $HOME may be bogus — rootless podman
-/// resolves its storage from the real home).
-fn user_home(uid: u32) -> Option<String> {
+/// Resolves the daemon user's home directory + primary gid from /etc/passwd
+/// (the daemon must run with a sanitized env where $HOME may be bogus —
+/// rootless podman resolves its storage from the real home).
+fn user_home_and_gid(uid: u32) -> Option<(String, u32)> {
     let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
     passwd.lines().find_map(|line| {
         let mut fields = line.split(':');
         let _name = fields.next()?;
         let _password = fields.next()?;
         let parsed_uid = fields.next()?.parse::<u32>().ok()?;
-        let _gid = fields.next()?;
+        let gid = fields.next()?.parse::<u32>().ok()?;
         let _gecos = fields.next()?;
         let home = fields.next()?;
-        (parsed_uid == uid).then(|| home.to_owned())
+        (parsed_uid == uid).then(|| (home.to_owned(), gid))
     })
 }
 
@@ -105,9 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("gobrowse-sandboxd refuses to run as root".into());
     }
 
-    let home = user_home(effective_uid)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(CONTAINER_HOME_FALLBACK));
+    let (home, daemon_gid) = user_home_and_gid(effective_uid)
+        .map(|(home, gid)| (PathBuf::from(home), gid))
+        .unwrap_or_else(|| (PathBuf::from(CONTAINER_HOME_FALLBACK), effective_uid));
     let runtime_dir = std::path::Path::new("/run/user")
         .join(effective_uid.to_string())
         .is_dir()
@@ -127,6 +129,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         executable: args.podman,
         home,
         runtime_dir,
+        container_uid: args.container_uid,
+        daemon_gid,
         image: args.image,
         readiness_timeout: Duration::from_secs(args.podman_readiness_seconds),
         control_timeout: Duration::from_secs(args.podman_control_seconds),

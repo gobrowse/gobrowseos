@@ -68,6 +68,13 @@ pub struct PodmanConfig {
     /// XDG_RUNTIME_DIR for the daemon user (rootless podman uses it for
     /// sockets/locks); `/run/user/<uid>` when present, else unset.
     pub runtime_dir: Option<PathBuf>,
+    /// UID the sandbox container's configured user maps to on the host
+    /// (rootless keep-id maps it 1:1); workspace volumes are chowned to
+    /// `container_uid:daemon_gid` so both the container and the daemon's
+    /// filesystem layer can operate on them.
+    pub container_uid: u32,
+    /// Primary gid of the daemon user (the filesystem layer's group).
+    pub daemon_gid: u32,
     pub image: String,
     pub readiness_timeout: Duration,
     pub control_timeout: Duration,
@@ -730,6 +737,30 @@ impl PodmanRuntime {
                 "volume".into(),
                 "create".into(),
                 workspace_volume_name(workspace_id),
+            ],
+        }
+    }
+
+    fn unshare_chown_spec(&self, mountpoint: &str) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "unshare".into(),
+                "chown".into(),
+                format!("{}:{}", self.config.container_uid, self.config.daemon_gid),
+                mountpoint.into(),
+            ],
+        }
+    }
+
+    fn unshare_chmod_spec(&self, mountpoint: &str) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "unshare".into(),
+                "chmod".into(),
+                "2775".into(),
+                mountpoint.into(),
             ],
         }
     }
@@ -1865,26 +1896,36 @@ impl SandboxRuntime for PodmanRuntime {
     }
 
     async fn provision_workspace(&self, workspace_id: Uuid) -> Result<(), RuntimeError> {
-        let (status, _) = self
+        let (status, output) = self
             .run_output_bounded(self.volume_inspect_spec(workspace_id), 16 * 1024)
             .await?;
-        if status.success() {
-            return Ok(());
+        if !status.success() {
+            // Register the named volume; the daemon's `_data` directory already exists
+            // under the trusted root (created by Filesystem::ensure_workspace), so podman
+            // adopts it as the volume mountpoint. Ignore the benign "already exists" case.
+            let (status, create_output) = self
+                .run_output_bounded(self.volume_create_spec(workspace_id), 16 * 1024)
+                .await?;
+            if !status.success() {
+                let message = String::from_utf8_lossy(&create_output).to_string();
+                if message.contains("already exists") || message.contains("already in use") {
+                    return Ok(());
+                }
+                return Err(RuntimeError::PodmanFailed);
+            }
         }
-        // Register the named volume; the daemon's `_data` directory already exists
-        // under the trusted root (created by Filesystem::ensure_workspace), so podman
-        // adopts it as the volume mountpoint. Ignore the benign "already exists" case.
-        let (status, output) = self
-            .run_output_bounded(self.volume_create_spec(workspace_id), 16 * 1024)
+        // The container's configured user maps 1:1 to `container_uid` on the host
+        // (rootless keep-id), while the daemon's filesystem layer runs as the daemon
+        // user. Chown the volume mountpoint to `container_uid:daemon_gid` (via
+        // `podman unshare`, which can reach subuid-owned files) + setgid 775 so both
+        // sides can read/write the shared workspace.
+        let mountpoint =
+            workspace_volume_mountpoint(&output).ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+        self.run_checked(self.unshare_chown_spec(&mountpoint))
             .await?;
-        if status.success() {
-            return Ok(());
-        }
-        let message = String::from_utf8_lossy(&output).to_string();
-        if message.contains("already exists") || message.contains("already in use") {
-            return Ok(());
-        }
-        Err(RuntimeError::PodmanFailed)
+        self.run_checked(self.unshare_chmod_spec(&mountpoint))
+            .await?;
+        Ok(())
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {
@@ -1946,6 +1987,17 @@ fn configure_raw_pty(pty: &pty_process::Pty) -> Result<(), RuntimeError> {
     attributes.make_raw();
     rustix::termios::tcsetattr(pty, rustix::termios::OptionalActions::Now, &attributes)
         .map_err(|_| RuntimeError::Pty)
+}
+
+fn workspace_volume_mountpoint(output: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(output);
+    let line = text.strip_suffix('\n')?;
+    let mut fields = line.splitn(4, '|');
+    let _name = fields.next()?;
+    let _driver = fields.next()?;
+    let _options = fields.next()?;
+    let mountpoint = fields.next()?;
+    (!mountpoint.is_empty()).then(|| mountpoint.to_owned())
 }
 
 fn start_fingerprint(start: &ValidatedStart) -> Result<[u8; 32], RuntimeError> {
