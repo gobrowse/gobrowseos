@@ -118,7 +118,7 @@ pub fn provider_catalog() -> Vec<ProviderCatalogEntry> {
         ProviderCatalogEntry {
             provider_type: "mistral".into(),
             display_name: "Mistral".into(),
-            base_url: "https://api.mistral.ai".into(),
+            base_url: "https://api.mistral.ai/v1".into(),
             api_format: "openai-compatible".into(),
             models: vec![
                 m("mistral-medium-3-5", 128_000, 8_192),
