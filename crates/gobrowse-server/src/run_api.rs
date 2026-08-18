@@ -1247,6 +1247,7 @@ async fn build_messages(
                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=b.workspace_id AND member.user_id=$4)) \
            AND ($3::uuid IS NULL OR b.scope IN ('GLOBAL','PROFILE') OR b.workspace_id=$3) \
            AND (b.kind IS NULL OR b.kind IN ('SOURCE','SKILL','MCP','PLUGIN')) \
+           AND b.book_type <> 'AUTOBIOGRAPHY' \
            AND b.search_document @@ websearch_to_tsquery('english', $1) \
          ORDER BY ts_rank_cd(b.search_document, websearch_to_tsquery('english', $1)) DESC, b.updated_at DESC \
          LIMIT 12",
