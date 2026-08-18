@@ -104,13 +104,21 @@ impl ProcessSpec {
         command
     }
 
-    fn pty_command(&self) -> pty_process::Command {
-        pty_process::Command::new(&self.program)
+    fn pty_command(
+        &self,
+        home: &std::path::Path,
+        runtime_dir: Option<&std::path::Path>,
+    ) -> pty_process::Command {
+        let mut command = pty_process::Command::new(&self.program)
             .args(&self.args)
             .env_clear()
             .env("PATH", MINIMAL_PATH)
-            .env("HOME", CONTAINER_HOME)
-            .kill_on_drop(false)
+            .env("HOME", home)
+            .kill_on_drop(false);
+        if let Some(runtime_dir) = runtime_dir {
+            command = command.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
+        command
     }
 }
 
@@ -1402,7 +1410,9 @@ impl SandboxRuntime for PodmanRuntime {
             );
             return Err(RuntimeError::Pty);
         }
-        let spawned = spec.pty_command().spawn(pts);
+        let spawned = spec
+            .pty_command(&self.config.home, self.config.runtime_dir.as_deref())
+            .spawn(pts);
         let mut child = match spawned {
             Ok(child) => child,
             Err(_) => {
