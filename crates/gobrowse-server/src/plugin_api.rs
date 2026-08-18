@@ -732,6 +732,10 @@ pub async fn upgrade(
             "plugin name cannot change between versions".into(),
         ));
     }
+    // The installation row is keyed by the CANONICAL manifest version (e.g.
+    // "1.1.0"), not the raw source tag (e.g. "v1.1.0"), so plugins.version and
+    // plugin_installations.version always agree.
+    let canonical_version = manifest.version.clone();
     let permissions = Vec::<PluginPermission>::from(&manifest);
     validate_permissions(&permissions)?;
     validate_components(&manifest.components)?;
@@ -755,7 +759,7 @@ pub async fn upgrade(
         "SELECT status FROM plugin_installations WHERE plugin_id = $1 AND version = $2",
     )
     .bind(id)
-    .bind(&version)
+    .bind(&canonical_version)
     .fetch_optional(&mut *tx)
     .await?;
     let installation_id = match status.as_deref() {
@@ -774,7 +778,7 @@ pub async fn upgrade(
                 "SELECT id FROM plugin_installations WHERE plugin_id = $1 AND version = $2",
             )
             .bind(id)
-            .bind(&version)
+            .bind(&canonical_version)
             .fetch_one(&mut *tx)
             .await?;
             sqlx::query(
@@ -782,7 +786,7 @@ pub async fn upgrade(
                  WHERE plugin_id = $1 AND version = $2",
             )
             .bind(id)
-            .bind(&version)
+            .bind(&canonical_version)
             .bind(&resolved.artifact_digest)
             .execute(&mut *tx)
             .await?;
@@ -796,7 +800,7 @@ pub async fn upgrade(
             )
             .bind(installation_id)
             .bind(id)
-            .bind(&version)
+            .bind(&canonical_version)
             .bind(&resolved.artifact_digest)
             .execute(&mut *tx)
             .await?;
@@ -822,7 +826,7 @@ pub async fn upgrade(
     Ok(Json(UpgradeDiffResponse {
         installation_id,
         current_version: row.version.clone(),
-        new_version: version,
+        new_version: canonical_version,
         artifact_digest: resolved.artifact_digest,
         commit_sha: resolved.identity.commit_sha,
         permissions: PermissionDiff {
