@@ -332,6 +332,18 @@ struct CreateChatModelConfiguration<'a> {
     fallback_model_ids: Vec<&'a str>,
 }
 
+#[derive(Debug, Serialize)]
+struct StoreSecretPayload<'a> {
+    purpose: &'a str,
+    allowed_hosts: Vec<String>,
+    value: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SecretMeta {
+    id: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct AutobiographyResponse {
@@ -4424,17 +4436,74 @@ fn ModelsPage() -> impl IntoView {
         };
         chat_status.set("Validating and activating chat provider...".into());
         let lifecycle = Arc::clone(&create_chat_lifecycle);
+        let base_url = endpoint.trim().to_owned();
         spawn_local(async move {
             if !lifecycle_is_active(&lifecycle) {
                 return;
             }
+            // The user may paste a raw API key (recommended) or an existing
+            // vault secret id (secret_...). A raw key is stored in the vault
+            // as a provider_credential secret scoped to the base-URL host,
+            // then its reference is passed to the model route.
+            let trimmed = secret.trim().to_owned();
+            let secret_reference = if trimmed.is_empty() {
+                None
+            } else if trimmed.starts_with("secret_") {
+                Some(trimmed.clone())
+            } else {
+                let host = url::Url::parse(&base_url)
+                    .ok()
+                    .and_then(|parsed| parsed.host_str().map(str::to_owned))
+                    .unwrap_or_default();
+                let store = Request::post("/api/v1/vault/secrets").json(&StoreSecretPayload {
+                    purpose: "provider_credential",
+                    allowed_hosts: vec![host.clone()],
+                    value: trimmed.clone(),
+                });
+                match store {
+                    Ok(store) => match store.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<SecretMeta>().await {
+                                Ok(meta) => {
+                                    chat_status.set(format!(
+                                    "API key stored in vault (host {host}); creating chat route..."
+                                ));
+                                    Some(meta.id)
+                                }
+                                Err(_) => {
+                                    chat_status.set(
+                                        "Vault stored the key but the response was not valid."
+                                            .into(),
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+                        Ok(response) => {
+                            chat_status.set(format!(
+                                "Could not store the API key in the vault: {}",
+                                api_error(&response).await
+                            ));
+                            return;
+                        }
+                        Err(_) => {
+                            chat_status.set("Vault service did not answer.".into());
+                            return;
+                        }
+                    },
+                    Err(_) => {
+                        chat_status.set("Vault request could not be encoded.".into());
+                        return;
+                    }
+                }
+            };
             let fallback_model_ids = fallback_values.iter().map(String::as_str).collect();
             let request =
                 Request::post("/api/v1/models/chat").json(&CreateChatModelConfiguration {
                     display_name: model_reference.trim(),
                     provider_type: provider.trim(),
-                    base_url: endpoint.trim(),
-                    secret_reference: (!secret.trim().is_empty()).then_some(secret.trim()),
+                    base_url: &base_url,
+                    secret_reference: secret_reference.as_deref(),
                     model_reference: model_reference.trim(),
                     context_window,
                     output_limit,
@@ -4519,7 +4588,8 @@ fn ModelsPage() -> impl IntoView {
                         }).collect_view()}
                     </select>
                 </label>
-                <label>"Vault secret ID"<input placeholder="Optional" prop:value=move || chat_secret.get() on:input=move |event| chat_secret.set(event_target_value(&event)) /></label>
+                <label>"Provider API key (optional — stored in the vault)"
+                    <input maxlength="2048" placeholder="Paste your API key; it is saved to the vault and only its reference is sent to the server" prop:value=move || chat_secret.get() on:input=move |event| chat_secret.set(event_target_value(&event)) /></label>
                 <label>"Context window"<input required inputmode="numeric" prop:value=move || chat_context.get() on:input=move |event| chat_context.set(event_target_value(&event)) /></label>
                 <label>"Output limit"<input required inputmode="numeric" prop:value=move || chat_output.get() on:input=move |event| chat_output.set(event_target_value(&event)) /></label>
                 <label class="fallback-field">"Fallback model IDs"<input placeholder="Comma-separated, in failover order" prop:value=move || chat_fallbacks.get() on:input=move |event| chat_fallbacks.set(event_target_value(&event)) /></label>
