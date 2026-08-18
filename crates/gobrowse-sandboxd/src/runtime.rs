@@ -34,7 +34,6 @@ use crate::{
 };
 
 const MINIMAL_PATH: &str = "/usr/bin:/bin";
-const CONTAINER_HOME: &str = "/tmp";
 const MAX_ACTIVE_SESSIONS_HARD: usize = 1_024;
 const MAX_RETAINED_RECORDS_HARD: usize = 16_384;
 const CLEANUP_RETRY_INTERVAL: Duration = Duration::from_millis(50);
@@ -2660,7 +2659,7 @@ while :; do sleep 0.1; done"#;
         let spec = runtime()
             .start_spec(&start(vec!["true".into()], "none"))
             .unwrap();
-        let command = spec.command(&std::path::Path::new("/tmp"), None);
+        let command = spec.command(std::path::Path::new("/tmp"), None);
         let environment = command
             .as_std()
             .get_envs()
