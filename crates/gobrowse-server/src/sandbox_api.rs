@@ -16,8 +16,7 @@ use axum::{
     http::HeaderMap,
 };
 use gobrowse_core::sandbox::{
-    HARD_RESOURCE_LIMITS, TerminalStartRequest, validate_command,
-    validate_workspace_path,
+    HARD_RESOURCE_LIMITS, TerminalStartRequest, validate_command, validate_workspace_path,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

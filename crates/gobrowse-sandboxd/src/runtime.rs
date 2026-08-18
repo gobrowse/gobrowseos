@@ -725,7 +725,7 @@ impl PodmanRuntime {
                 "network".into(),
                 "inspect".into(),
                 "--format".into(),
-                "{{.Name}}|{{.Subnet}}|{{.Gateway}}|{{json .DNS}}".into(),
+                "{{.Name}}|{{json .Subnets}}|".into(),
                 name.into(),
             ],
         }
@@ -912,20 +912,33 @@ impl PodmanRuntime {
             .ok_or(RuntimeError::InvalidConfiguration)?;
         let mut fields = output.splitn(4, '|');
         let inspected_name = fields.next().ok_or(RuntimeError::InvalidConfiguration)?;
-        let subnet: IpAddr = fields
+        // Modern podman exposes networks as an array under `.Subnets` (each with
+        // `subnet` CIDR + `gateway`); the flat `.Subnet`/`.Gateway` template
+        // fields do not exist in podman >= 4.
+        let subnets_json = fields.next().ok_or(RuntimeError::InvalidConfiguration)?;
+        let subnets: Vec<serde_json::Value> =
+            serde_json::from_str(subnets_json).map_err(|_| RuntimeError::InvalidConfiguration)?;
+        let first = subnets.first().ok_or(RuntimeError::InvalidConfiguration)?;
+        let subnet_cidr = first
+            .get("subnet")
+            .and_then(|value| value.as_str())
+            .ok_or(RuntimeError::InvalidConfiguration)?;
+        let subnet: IpAddr = subnet_cidr
+            .split('/')
             .next()
-            .and_then(|value| value.split('/').next())
             .ok_or(RuntimeError::InvalidConfiguration)?
             .parse()
             .map_err(|_| RuntimeError::InvalidConfiguration)?;
-        let gateway: IpAddr = fields
-            .next()
+        let gateway: IpAddr = first
+            .get("gateway")
+            .and_then(|value| value.as_str())
             .ok_or(RuntimeError::InvalidConfiguration)?
             .parse()
             .map_err(|_| RuntimeError::InvalidConfiguration)?;
-        let dns_json = fields.next().ok_or(RuntimeError::InvalidConfiguration)?;
-        let dns: Vec<IpAddr> =
-            serde_json::from_str(dns_json).map_err(|_| RuntimeError::InvalidConfiguration)?;
+        // Podman networks have no per-network DNS server list in inspect; DNS
+        // is provided by the internal resolver (aardvark). Attest with an empty
+        // DNS set — egress filtering relies on the public subnet/gateway.
+        let dns: Vec<IpAddr> = Vec::new();
         if inspected_name != name {
             return Err(RuntimeError::InvalidConfiguration);
         }
