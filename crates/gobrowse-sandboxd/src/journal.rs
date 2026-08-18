@@ -183,7 +183,25 @@ impl TerminalJournal {
     }
 
     pub fn set_running(&self, terminal_id: Uuid) -> Result<(), JournalError> {
-        self.update_state(terminal_id, TerminalState::Running, None, None, None)
+        // A fast-exiting command may have left the starting phase before
+        // readiness returned; never resurrect an EXITED/TERMINATED/etc.
+        // record back to RUNNING (the monitor owns the terminal state).
+        let changed = self.lock()?.execute(
+            "UPDATE terminals SET state = 'RUNNING', updated_at = ?2 \
+             WHERE terminal_id = ?1 AND state IN ('STARTING', 'RUNNING')",
+            params![terminal_id.to_string(), unix_millis()],
+        )?;
+        if changed == 0 {
+            self.lock()?
+                .query_row(
+                    "SELECT 1 FROM terminals WHERE terminal_id = ?1",
+                    [terminal_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .ok_or(JournalError::NotFound)?;
+        }
+        Ok(())
     }
 
     pub fn set_state(

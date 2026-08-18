@@ -1092,11 +1092,22 @@ impl PodmanRuntime {
         tokio::time::timeout(self.config.readiness_timeout, async {
             loop {
                 if session.lifecycle().is_terminal() {
+                    // A one-shot command may complete before readiness observes
+                    // the container running (fast execs). Normal completion is
+                    // readiness: the output is journaled and drainable. Abnormal
+                    // termination (unrecoverable/terminated/lost) still fails.
+                    if self.exited_normally(session) {
+                        return Ok(());
+                    }
                     return Err(RuntimeError::ReadinessFailed);
                 }
                 match self.inspect_ready(session.terminal_id).await {
                     Ok(true) => {
-                        if session.lifecycle() == LifecycleState::Starting {
+                        // The command may have exited between the inspection and
+                        // the lifecycle check; a journaled normal exit is ready.
+                        if session.lifecycle() == LifecycleState::Starting
+                            || self.exited_normally(session)
+                        {
                             return Ok(());
                         }
                         return Err(RuntimeError::ReadinessFailed);
@@ -1109,6 +1120,15 @@ impl PodmanRuntime {
         })
         .await
         .map_err(|_| RuntimeError::ReadinessFailed)?
+    }
+
+    /// True when the journal records a normal command exit for the session.
+    fn exited_normally(&self, session: &Session) -> bool {
+        self.config
+            .terminal_journal
+            .inspect(session.terminal_id)
+            .map(|record| record.state == TerminalState::Exited)
+            .unwrap_or(false)
     }
 
     fn spawn_timeout(&self, session: Arc<Session>, timeout: Duration) {
@@ -1548,6 +1568,10 @@ impl SandboxRuntime for PodmanRuntime {
         };
 
         let initialized = match self.await_readiness(&session).await {
+            // The command already completed (one-shot exec): skip the resize
+            // and the RUNNING transition — the monitor owns the EXITED state
+            // and the output is journaled for the drain.
+            Ok(()) if session.lifecycle().is_terminal() || self.exited_normally(&session) => Ok(()),
             Ok(()) => self
                 .run_checked(self.resize_spec(
                     session.terminal_id,
@@ -2851,6 +2875,7 @@ case "$1" in
       esac
       [ "$argument" = natural ] && mode=natural
       [ "$argument" = never-ready ] && mode=never-ready
+      [ "$argument" = instant-exit ] && mode=instant-exit
       [ "$argument" = control-recover ] && printf '2\n' > "$control_failures"
       [ "$argument" = control-persistent ] && printf 'persistent\n' > "$control_failures"
       [ "$argument" = resize-fail ] && : > "$resize_failure"
@@ -2859,6 +2884,9 @@ case "$1" in
     done
     printf 'gobrowse-%s|%s|%s\n' "$terminal" "$terminal" "$workspace" > "$container_info"
     if [ "$mode" = never-ready ]; then sleep 0.30; exit 0; fi
+    # Completes before the daemon's readiness probe can ever observe the
+    # container running (one-shot exec race).
+    if [ "$mode" = instant-exit ]; then printf 'instant-exit-output\n'; exit 0; fi
     : > "$marker"
     if [ "$mode" = natural ]; then sleep 0.20; rm -f "$marker"; exit 0; fi
     if [ "$mode" = output-overflow ]; then
@@ -3090,6 +3118,36 @@ esac
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_accepts_a_command_that_exits_before_readiness() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = fake.runtime(Duration::from_millis(500));
+        let terminal_id = Uuid::new_v4();
+        // The fake completes the command before the daemon's readiness probe
+        // can observe the container running — the one-shot exec race.
+        runtime
+            .start(ValidatedStart {
+                terminal_id,
+                ..start(vec!["instant-exit".into()], "none")
+            })
+            .await
+            .unwrap();
+        let inspected = runtime.inspect(terminal_id).await.unwrap();
+        assert_eq!(inspected.state, TerminalState::Exited);
+        assert_eq!(inspected.exit_code, Some(0));
+        // The command's output is journaled and drainable after start.
+        let read = runtime
+            .read_output(terminal_id, 0, 64, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&read.bytes),
+            "instant-exit-output\n"
+        );
+        assert_eq!(read.record.state, TerminalState::Exited);
     }
 
     #[tokio::test]
