@@ -9,7 +9,7 @@ use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
 use gobrowse_core::model::{
     ContentPart, MessageRole, ModelCapability, ModelEvent, ModelIdentity, ModelProvider,
-    ModelRequest, ModelRoute, ModelStream, ProviderError, ToolDefinition,
+    ModelRequest, ModelRoute, ModelStream, NeutralMessage, ProviderError, ToolDefinition,
 };
 use secrecy::{ExposeSecret, SecretString};
 use serde::Serialize;
@@ -95,6 +95,83 @@ struct ProviderStreamState {
     completed: bool,
 }
 
+/// Maps neutral conversation messages onto provider wire messages. Tool
+/// results fan out: one wire message per [`ContentPart::ToolResult`] so that
+/// parallel tool calls in a single round each get a matching result message
+/// (providers reject histories where an assistant tool_call id is missing
+/// its result).
+fn to_wire_messages(messages: &[NeutralMessage]) -> Vec<ChatMessage> {
+    messages
+        .iter()
+        .flat_map(|message| -> Vec<ChatMessage> {
+            let role = role_name(message.role);
+            match message.role {
+                MessageRole::Tool => {
+                    let mut wire_messages = Vec::new();
+                    for part in &message.content {
+                        if let ContentPart::ToolResult {
+                            call_id, output, ..
+                        } = part
+                        {
+                            wire_messages.push(ChatMessage {
+                                role,
+                                content: Some(output.to_string()),
+                                tool_calls: None,
+                                tool_call_id: Some(call_id.clone()),
+                            });
+                        }
+                    }
+                    if wire_messages.is_empty() {
+                        wire_messages.push(ChatMessage {
+                            role,
+                            content: Some(String::new()),
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                    }
+                    wire_messages
+                }
+                MessageRole::Assistant => {
+                    let tool_calls: Vec<_> = message
+                        .content
+                        .iter()
+                        .filter_map(|part| {
+                            if let ContentPart::ToolCall { id, name, input } = part {
+                                Some(AssistantToolCall {
+                                    id: id.clone(),
+                                    type_: "function".into(),
+                                    function: ToolCallFunction {
+                                        name: name.clone(),
+                                        arguments: input.to_string(),
+                                    },
+                                })
+                            } else {
+                                None
+                            }
+                        })
+                        .collect();
+                    vec![ChatMessage {
+                        role,
+                        content: Some(content_text(&message.content)),
+                        tool_calls: if tool_calls.is_empty() {
+                            None
+                        } else {
+                            Some(tool_calls)
+                        },
+                        tool_call_id: None,
+                    }]
+                }
+                _ => vec![ChatMessage {
+                    role,
+                    content: Some(content_text(&message.content)),
+                    tool_calls: None,
+                    tool_call_id: None,
+                }],
+            }
+        })
+        .collect()
+}
+
 #[async_trait]
 impl ModelProvider for HttpChatProvider {
     fn id(&self) -> &str {
@@ -102,73 +179,7 @@ impl ModelProvider for HttpChatProvider {
     }
 
     async fn stream(&self, request: ModelRequest) -> Result<ModelStream, ProviderError> {
-        let messages: Vec<_> = request
-            .messages
-            .iter()
-            .map(|message| -> ChatMessage {
-                let role = role_name(message.role);
-                match message.role {
-                    MessageRole::Tool => {
-                        // Tool result messages: extract call_id and output
-                        let tool_call_result = message.content.iter().find_map(|part| {
-                            if let ContentPart::ToolResult {
-                                call_id, output, ..
-                            } = part
-                            {
-                                Some((call_id.clone(), output.clone()))
-                            } else {
-                                None
-                            }
-                        });
-                        ChatMessage {
-                            role,
-                            content: tool_call_result
-                                .as_ref()
-                                .map(|(_, output)| output.to_string()),
-                            tool_calls: None,
-                            tool_call_id: tool_call_result.map(|(id, _)| id),
-                        }
-                    }
-                    MessageRole::Assistant => {
-                        // Assistant messages may contain ToolCall parts
-                        let tool_calls: Vec<_> = message
-                            .content
-                            .iter()
-                            .filter_map(|part| {
-                                if let ContentPart::ToolCall { id, name, input } = part {
-                                    Some(AssistantToolCall {
-                                        id: id.clone(),
-                                        type_: "function".into(),
-                                        function: ToolCallFunction {
-                                            name: name.clone(),
-                                            arguments: input.to_string(),
-                                        },
-                                    })
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-                        ChatMessage {
-                            role,
-                            content: Some(content_text(&message.content)),
-                            tool_calls: if tool_calls.is_empty() {
-                                None
-                            } else {
-                                Some(tool_calls)
-                            },
-                            tool_call_id: None,
-                        }
-                    }
-                    _ => ChatMessage {
-                        role,
-                        content: Some(content_text(&message.content)),
-                        tool_calls: None,
-                        tool_call_id: None,
-                    },
-                }
-            })
-            .collect();
+        let messages = to_wire_messages(&request.messages);
         let path = if self.provider_type == "ollama" {
             "api/chat"
         } else {
@@ -615,6 +626,56 @@ mod tests {
         assert!(
             matches!(parse_provider_line(&mut state, b"").unwrap(), Some(ModelEvent::TextDelta { text }) if text == "hi")
         );
+    }
+
+    #[test]
+    fn tool_results_fan_out_to_one_wire_message_per_call() {
+        use gobrowse_core::model::{ContentPart, MessageRole, NeutralMessage};
+        let messages = vec![
+            NeutralMessage {
+                role: MessageRole::Assistant,
+                content: vec![
+                    ContentPart::ToolCall {
+                        id: "call-a".into(),
+                        name: "library_search".into(),
+                        input: serde_json::json!({"q": "one"}),
+                    },
+                    ContentPart::ToolCall {
+                        id: "call-b".into(),
+                        name: "library_search".into(),
+                        input: serde_json::json!({"q": "two"}),
+                    },
+                ],
+                provider_provenance: None,
+            },
+            NeutralMessage {
+                role: MessageRole::Tool,
+                content: vec![
+                    ContentPart::ToolResult {
+                        call_id: "call-a".into(),
+                        output: serde_json::json!({"books": []}),
+                        is_error: false,
+                    },
+                    ContentPart::ToolResult {
+                        call_id: "call-b".into(),
+                        output: serde_json::json!({"books": [1]}),
+                        is_error: false,
+                    },
+                ],
+                provider_provenance: None,
+            },
+        ];
+        let wire = to_wire_messages(&messages);
+        assert_eq!(wire.len(), 3);
+        assert_eq!(wire[0].tool_calls.as_ref().unwrap().len(), 2);
+        let tool_messages: Vec<_> = wire
+            .iter()
+            .filter(|message| message.role == "tool")
+            .collect();
+        assert_eq!(tool_messages.len(), 2, "one wire message per tool result");
+        assert_eq!(tool_messages[0].tool_call_id.as_deref(), Some("call-a"));
+        assert_eq!(tool_messages[1].tool_call_id.as_deref(), Some("call-b"));
+        assert_eq!(tool_messages[0].content.as_deref(), Some("{\"books\":[]}"));
     }
 
     #[tokio::test]
