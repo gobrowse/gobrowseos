@@ -253,7 +253,7 @@ pub async fn usage_summary(
     headers: HeaderMap,
     Query(params): Query<UsageWindow>,
 ) -> Result<Json<UsageSummary>, AppError> {
-    let _user = require_user(&state, &headers).await?;
+    let user = require_user(&state, &headers).await?;
     let window_days = match params.window.as_str() {
         "7d" => Some(7_i64),
         "30d" => Some(30_i64),
@@ -267,17 +267,36 @@ pub async fn usage_summary(
     let since =
         window_days.map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(days));
 
-    let rows = sqlx::query_as::<_, (String, String, serde_json::Value, time::OffsetDateTime)>(
-        "SELECT provider, model, usage, created_at \
-         FROM messages \
-         WHERE usage IS NOT NULL \
-           AND provider IS NOT NULL AND model IS NOT NULL \
-           AND ($1::timestamptz IS NULL OR created_at >= $1)",
-    )
-    .bind(since)
-    .fetch_all(&state.pool)
-    .await
-    .map_err(AppError::Database)?;
+    // Tenant isolation: usage is scoped to the authenticated user's profile via
+    // the owning conversation. Only OWNER/ADMIN may see cross-profile totals.
+    let rows = if user.role == "OWNER" || user.role == "ADMIN" {
+        sqlx::query_as::<_, (String, String, serde_json::Value, time::OffsetDateTime)>(
+            "SELECT m.provider, m.model, m.usage, m.created_at \
+             FROM messages m \
+             WHERE m.usage IS NOT NULL \
+               AND m.provider IS NOT NULL AND m.model IS NOT NULL \
+               AND ($1::timestamptz IS NULL OR m.created_at >= $1)",
+        )
+        .bind(since)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+    } else {
+        sqlx::query_as::<_, (String, String, serde_json::Value, time::OffsetDateTime)>(
+            "SELECT m.provider, m.model, m.usage, m.created_at \
+             FROM messages m \
+             JOIN conversations c ON c.id = m.conversation_id \
+             WHERE m.usage IS NOT NULL \
+               AND m.provider IS NOT NULL AND m.model IS NOT NULL \
+               AND c.profile_id = $2 \
+               AND ($1::timestamptz IS NULL OR m.created_at >= $1)",
+        )
+        .bind(since)
+        .bind(user.profile_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::Database)?
+    };
 
     let mut per_model: std::collections::BTreeMap<String, ModelCostRow> = Default::default();
     let mut per_provider: std::collections::BTreeMap<String, ProviderCostRow> = Default::default();
@@ -291,19 +310,23 @@ pub async fn usage_summary(
         let input = usage
             .get("input_tokens")
             .and_then(|v| v.as_i64())
+            .filter(|v| *v >= 0)
             .unwrap_or(0);
         let output = usage
             .get("output_tokens")
             .and_then(|v| v.as_i64())
+            .filter(|v| *v >= 0)
             .unwrap_or(0);
         let (in_price, out_price) = reference_pricing(&provider, &model);
-        let spend = input as f64 / 1_000_000.0 * in_price + output as f64 / 1_000_000.0 * out_price;
-        if spend == 0.0 {
+        // A run is unpriced only when the reference table has no price for this
+        // provider/model, not merely when it consumed zero tokens.
+        if in_price == 0.0 && out_price == 0.0 {
             unpriced += 1;
         }
+        let spend = input as f64 / 1_000_000.0 * in_price + output as f64 / 1_000_000.0 * out_price;
         total_spend += spend;
-        total_input += input;
-        total_output += output;
+        total_input = total_input.saturating_add(input);
+        total_output = total_output.saturating_add(output);
         let key = format!("{provider}::{model}");
         let entry = per_model
             .entry(key.clone())
@@ -315,9 +338,9 @@ pub async fn usage_summary(
                 runs: 0,
                 spend: 0.0,
             });
-        entry.input_tokens += input;
-        entry.output_tokens += output;
-        entry.runs += 1;
+        entry.input_tokens = entry.input_tokens.saturating_add(input);
+        entry.output_tokens = entry.output_tokens.saturating_add(output);
+        entry.runs = entry.runs.saturating_add(1);
         entry.spend += spend;
         let pentry = per_provider
             .entry(provider.clone())
@@ -327,7 +350,7 @@ pub async fn usage_summary(
                 runs: 0,
             });
         pentry.spend += spend;
-        pentry.runs += 1;
+        pentry.runs = pentry.runs.saturating_add(1);
         let day = created_at
             .format(&time::format_description::well_known::Rfc3339)
             .map(|s| s[..10].to_string())

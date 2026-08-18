@@ -1755,29 +1755,44 @@ fn ModelsPage() -> impl IntoView {
         if !lifecycle_is_active(&catalog_lifecycle) {
             return;
         }
-        if let Ok(response) = response
-            && response.ok()
-            && let Ok(list) = response.json::<Vec<CatalogProvider>>().await
-        {
-            catalog.set(list.clone());
-            // Populate the model select for the initial provider so the required
-            // select has a matching option and the form can submit.
-            if let Some(provider) = list
-                .into_iter()
-                .find(|entry| entry.provider_type == chat_provider.get_untracked())
-            {
-                catalog_models.set(provider.models.clone());
-                if let Some(first) = provider.models.first() {
-                    chat_model.set(first.reference.clone());
-                    chat_context.set(first.context_window.to_string());
-                    chat_output.set(first.output_limit.to_string());
+        match response {
+            Ok(response) if response.ok() => {
+                if !lifecycle_is_active(&catalog_lifecycle) {
+                    return;
+                }
+                match response.json::<Vec<CatalogProvider>>().await {
+                    Ok(list) => {
+                        catalog.set(list.clone());
+                        // Populate the model select for the initial provider so the
+                        // required select has a matching option and the form can submit.
+                        if let Some(provider) = list
+                            .into_iter()
+                            .find(|entry| entry.provider_type == chat_provider.get_untracked())
+                        {
+                            catalog_models.set(provider.models.clone());
+                            chat_status.set(String::new());
+                            if let Some(first) = provider.models.first() {
+                                chat_model.set(first.reference.clone());
+                                chat_context.set(first.context_window.to_string());
+                                chat_output.set(first.output_limit.to_string());
+                            }
+                        } else {
+                            chat_status.set(format!(
+                                "{} not in catalog",
+                                chat_provider.get_untracked()
+                            ));
+                        }
+                    }
+                    Err(_) => chat_status.set("Could not load provider catalog".into()),
                 }
             }
+            Ok(_) | Err(_) => chat_status.set("Could not load provider catalog".into()),
         }
     });
     let on_provider_select = move |event: leptos::ev::Event| {
         let provider_type = event_target_value(&event);
         chat_provider.set(provider_type.clone());
+        chat_secret.set(String::new());
         if let Some(provider) = catalog
             .get_untracked()
             .into_iter()
@@ -1901,6 +1916,7 @@ fn ModelsPage() -> impl IntoView {
                         if !lifecycle_is_active(&lifecycle) {
                             return;
                         }
+                        chat_status.set("Chat route created and activated.".into());
                         load_chat_models(chat_configurations, chat_status, Arc::clone(&lifecycle));
                     }
                     Ok(response) => {
@@ -2027,8 +2043,12 @@ fn ModelsPage() -> impl IntoView {
                         }
                         match response {
                             Ok(response) if response.ok() => {
-                                if let Ok(summary) = response.json::<UsageSummary>().await {
-                                    usage.set(Some(summary));
+                                match response.json::<UsageSummary>().await {
+                                    Ok(summary) => {
+                                        usage.set(Some(summary));
+                                        usage_status.set(String::new());
+                                    }
+                                    Err(_) => usage_status.set("Could not decode usage summary".into()),
                                 }
                             }
                             Ok(response) => usage_status.set(format!("Usage endpoint rejected: HTTP {}", response.status())),
