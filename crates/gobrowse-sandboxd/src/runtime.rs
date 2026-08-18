@@ -69,9 +69,11 @@ pub struct PodmanConfig {
     /// sockets/locks); `/run/user/<uid>` when present, else unset.
     pub runtime_dir: Option<PathBuf>,
     /// UID the sandbox container's configured user maps to on the host
-    /// (rootless keep-id maps it 1:1); workspace volumes are chowned to
-    /// `container_uid:daemon_gid` so both the container and the daemon's
-    /// filesystem layer can operate on them.
+    /// (default rootless userns maps it into the daemon's subuid range);
+    /// workspace volumes are chowned to
+    /// `container_uid:<daemon primary gid>` (via `podman unshare`, where
+    /// in-ns gid 0 = the daemon's primary group) so both the container and
+    /// the daemon's filesystem layer can operate on them.
     pub container_uid: u32,
     /// Primary gid of the daemon user (the filesystem layer's group).
     pub daemon_gid: u32,
@@ -619,7 +621,6 @@ impl PodmanRuntime {
             "--cap-drop=ALL".into(),
             "--security-opt=no-new-privileges".into(),
             "--read-only".into(),
-            "--userns=keep-id".into(),
             "--pid=private".into(),
             "--ipc=private".into(),
             "--uts=private".into(),
@@ -747,7 +748,10 @@ impl PodmanRuntime {
             args: vec![
                 "unshare".into(),
                 "chown".into(),
-                format!("{}:{}", self.config.container_uid, self.config.daemon_gid),
+                // gid 0 maps to the daemon user's primary group inside the
+                // rootless userns; the uid maps to the container's host uid
+                // in the default (non-keep-id) namespace.
+                format!("{}:0", self.config.container_uid),
                 mountpoint.into(),
             ],
         }
@@ -1914,11 +1918,12 @@ impl SandboxRuntime for PodmanRuntime {
                 return Err(RuntimeError::PodmanFailed);
             }
         }
-        // The container's configured user maps 1:1 to `container_uid` on the host
-        // (rootless keep-id), while the daemon's filesystem layer runs as the daemon
-        // user. Chown the volume mountpoint to `container_uid:daemon_gid` (via
-        // `podman unshare`, which can reach subuid-owned files) + setgid 775 so both
-        // sides can read/write the shared workspace.
+        // The container runs with the default rootless userns (no keep-id): its
+        // configured user maps to the host subuid range, while the daemon's
+        // filesystem layer runs as the daemon user. Chown the volume mountpoint
+        // to `container_uid:<daemon primary gid>` (via `podman unshare`, which can
+        // reach subuid-owned files; in-ns gid 0 = daemon's primary group) +
+        // setgid 775 so both sides can read/write the shared workspace.
         let mountpoint =
             workspace_volume_mountpoint(&output).ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
         self.run_checked(self.unshare_chown_spec(&mountpoint))
@@ -2515,7 +2520,6 @@ while :; do sleep 0.1; done"#;
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
-            "--userns=keep-id",
             "--pid=private",
             "--ipc=private",
             "--uts=private",
@@ -3814,13 +3818,15 @@ esac
     // They bypass sandboxd's `start` lifecycle (which requires workspace
     // volumes, PTY journal, and the full PodmanRuntime machinery) and
     // instead shell out to the shim directly. The shim translates
-    // `start_spec`-equivalent argv, stripping docker-unsupported flags:
-    //   --userns=keep-id  → translated to --user=1000:1000 (non-root
-    //                        security-equivalent mapping for docker)
+    //   `start_spec`-equivalent argv, stripping docker-unsupported flags:
     //   --pid=private     → dropped (docker defaults to private PID ns)
     //   --uts=private     → dropped (docker defaults to private UTS ns)
     //   --image-volume=ignore → dropped (docker has no --image-volume)
     //   --http-proxy=false    → dropped (docker has no --http-proxy)
+    //
+    // The non-root user property (sandboxd: image USER + default rootless
+    // userns mapping into the daemon's subuid range) is expressed for docker
+    // as `--user=1000:1000`, which docker can express natively.
     //
     // All other isolation flags (--cap-drop=ALL, --security-opt=no-new-
     // privs, --read-only, --ipc=private, --cgroupns=private, --network=
@@ -3849,7 +3855,6 @@ tmp=$(mktemp)\n\
 trap 'rm -f \"$tmp\"' EXIT\n\
 for arg do\n\
     case \"$arg\" in\n\
-        --userns=keep-id) printf '%s\\0' --user=1000:1000 >> \"$tmp\" ;;\n\
         --pid=private|--uts=private|--image-volume=ignore|--http-proxy=false) ;;\n\
         *) printf '%s\\0' \"$arg\" >> \"$tmp\" ;;\n\
     esac\n\
@@ -3907,7 +3912,7 @@ exec xargs -0 -a \"$tmp\" /usr/bin/docker\n";
         cmd.args([
             "run",
             "--rm",
-            "--userns=keep-id",
+            "--user=1000:1000",
             "--cap-drop=ALL",
             "--security-opt=no-new-privileges",
             "--read-only",
@@ -4083,9 +4088,12 @@ exec xargs -0 -a \"$tmp\" /usr/bin/docker\n";
     #[tokio::test]
     #[ignore = "requires docker daemon + GOBROWSE_SANDBOX_DOCKER=1"]
     async fn docker_backed_container_runs_as_non_root_uid() {
-        // Proves the sandboxed process is non-root (the keep-id security
-        // goal); does NOT prove the rootless UID-mapping mechanism itself,
-        // which requires real Podman + /etc/subuid.
+        // Proves the sandboxed process is non-root (the image-USER
+        // security goal; podman's default rootless userns maps the image
+        // user into the daemon's subuid range, expressed for docker as
+        // `--user=1000:1000`); does NOT prove the rootless UID-mapping
+        // mechanism itself, which docker cannot express (that requires
+        // real Podman + /etc/subuid).
         require_docker_boundary();
         let shim = DockerShim::new();
         DockerShim::ensure_alpine_image();
