@@ -7,7 +7,7 @@ STATUS
 - Partial: browser journeys A (terminal) / C (source book) / F (plugin install) / I (upgrade/rollback) PASSED; B (agent sandbox tools) / D (skill book) / E (MCP book) / G (plugin activation) / H (embedded MCP dedup) / J (retrieval scale) partially verified or pending chat-model runs; M22 security acceptance audit in flight (cheaper-checker).
 - Not started: M23 design doc; M24/M24b (recorded in roadmap only).
 
-LAST_GOOD_COMMIT: 29db56d (working tree clean, pushed to initial-agent-os). Preceding: 70e271d, 2f0f5af, 62e89ee, 30d29c8, c5ce19f, e490e96, 36ba8ce, e327ca2, 6fd3728, 3ca3815, 62e89ee… (all pushed).
+LAST_GOOD_COMMIT: abaa3f5 (test-only sandboxd fixture fix; working tree clean, pushed). CI fix: 32138004067 failure was missing container_uid/daemon_gid in test config — fixed + clippy all-targets clean locally; CI rerun pending. Preceding: 70e271d, 2f0f5af, 62e89ee, 30d29c8, c5ce19f, e490e96, 36ba8ce, e327ca2, 6fd3728, 3ca3815, 62e89ee… (all pushed).
 
 SCHEMA_VERSION: 20 (prod verified `select schema_version from schema_metadata` = 20; migration 0020 applied on prod + CI).
 
@@ -45,7 +45,7 @@ BLOCKERS: None hard. M4/M7 remain BLOCKED_EXTERNAL records (preserved). Primary 
 
 MIGRATION_STATE: 0020 applied everywhere (schema 20). No pending migration.
 
-DEPLOYMENT_STATE: Prod main app + m22test run image gobrowse-os-app:m22 (glibc bookworm-compatible release binary ad282697-era; web dist updated to 29db56d on m22test; main app dist NOT yet updated with the final web fixes). sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod (public subnet 45.90.28.0/24).
+DEPLOYMENT_STATE: Prod main app + m22test BOTH run image gobrowse-os-app:m22 = 3311d4ef (current release binary 6168c9ae + current web dist + migrations). Health 200 on 8080 + 8082; doctor sandbox PASS; library search 1 result; plugin hello-gobrowse dormant. sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod. sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod (public subnet 45.90.28.0/24).
 
 ROLLBACK_STATE: DB backup /opt/gobrowse-os/backups/pre-m22-20260818.dump (+sha256). Previous images tagged (ui-fixed3..6, m22). Rollback = restore dump + deploy previous image.
 
