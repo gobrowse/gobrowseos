@@ -57,8 +57,8 @@ Fixed defects (commits):
 | Field | Value |
 |---|---|
 | FULL_CI | PASS (run 32092622585) |
-| DEPLOYED_SHA | `5a7c963` |
-| DEPLOYED_IMAGE_DIGEST | `sha256:8a00b1b0c414e6d28ab9e4fc0142258ba63f1dac8fab8496759f9e93929758ac` |
+| DEPLOYED_SHA | `1529c2e` (post-fix head; deployment image built from ec5e289 + dist) |
+| DEPLOYED_IMAGE_DIGEST | `sha256:9678f97a0c988f23a4d834a4e5a7f729d3d5e18157bf842d582dbca876fbdf04` |
 | SCHEMA_VERSION | 19 |
 | HEALTH_LIVE | PASS |
 | HEALTH_READY | PASS |
