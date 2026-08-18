@@ -7,9 +7,9 @@ STATUS
 - Partial: browser journeys A (terminal) / C (source book) / F (plugin install) / I (upgrade/rollback) PASSED; B (agent sandbox tools) / D (skill book) / E (MCP book) / G (plugin activation) / H (embedded MCP dedup) / J (retrieval scale) partially verified or pending chat-model runs; M22 security acceptance audit in flight (cheaper-checker).
 - Not started: M23 design doc; M24/M24b (recorded in roadmap only).
 
-LAST_GOOD_COMMIT: abaa3f5 (test-only sandboxd fixture fix; working tree clean, pushed). CI fix: 32138004067 failure was missing container_uid/daemon_gid in test config — fixed + clippy all-targets clean locally; CI rerun pending. Preceding: 70e271d, 2f0f5af, 62e89ee, 30d29c8, c5ce19f, e490e96, 36ba8ce, e327ca2, 6fd3728, 3ca3815, 62e89ee… (all pushed).
+LAST_GOOD_COMMIT: 0fe0c1e (security fixes; working tree clean, pushed). Checker (CheaperCheckerM22AcceptanceB) audited c1f6007..29db56d: F1 HIGH (MCP create/update had no role gate → host command spawn by any user via library_load) FIXED (OWNER/ADMIN gate); F2 (no companion Books for NEW skills/MCP servers) FIXED (migration 0021 INSERT triggers, schema 21); F3 (self-asserted VERIFIED trust) FIXED (verify_artifact_signature always false until real publisher keys; PATCH rejects VERIFIED). F4 minor (terminal_id not bound to workspace) recorded, not release-blocking. Clippy all-targets + unit tests clean. Preceding: 70e271d, 2f0f5af, 62e89ee, 30d29c8, c5ce19f, e490e96, 36ba8ce, e327ca2, 6fd3728, 3ca3815, 62e89ee… (all pushed).
 
-SCHEMA_VERSION: 20 (prod verified `select schema_version from schema_metadata` = 20; migration 0020 applied on prod + CI).
+SCHEMA_VERSION: 21 (migration 0021 INSERT triggers; verified 21 on both prod DBs).
 
 FILES_CHANGED_THIS_BATCH: crates/gobrowse-web/src/app.rs (book-card rendering via single-expression match + precomputed non-reactive conversation snapshot + always-rendered pin button; stepper `update()` reactivity; run_search preventDefault; terminal poll stops only on terminal state; TerminalReadResponse.output_complete removed), crates/gobrowse-server/src/plugin_github.rs (api_url query-string fix; v-prefix tag fallback), crates/gobrowse-sandboxd/src/runtime.rs + main.rs (volume ownership chown via podman unshare, container_uid/daemon_gid, real user home for podman env, .Subnets attestation, pty_command env), crates/gobrowse-server/src/run_api.rs (workspace network policy), crates/gobrowse-server/src/plugin_api.rs (canonical version keys), crates/gobrowse-server/src/sandbox_api.rs (policy resolution).
 
@@ -45,7 +45,7 @@ BLOCKERS: None hard. M4/M7 remain BLOCKED_EXTERNAL records (preserved). Primary 
 
 MIGRATION_STATE: 0020 applied everywhere (schema 20). No pending migration.
 
-DEPLOYMENT_STATE: Prod main app + m22test BOTH run image gobrowse-os-app:m22 = 3311d4ef (current release binary 6168c9ae + current web dist + migrations). Health 200 on 8080 + 8082; doctor sandbox PASS; library search 1 result; plugin hello-gobrowse dormant. sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod. sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod (public subnet 45.90.28.0/24).
+DEPLOYMENT_STATE: Prod main app + m22test BOTH run image gobrowse-os-app:m22 (security-fixed binary + web dist + migrations through 0021). Schema 21 verified on gobrowse + gobrowse_m22. Health 200 on 8080 + 8082. Health 200 on 8080 + 8082; doctor sandbox PASS; library search 1 result; plugin hello-gobrowse dormant. sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod. sandboxd release binary deployed with all fixes; cgroup Delegate=yes; restricted network gobrowse-restricted-prod (public subnet 45.90.28.0/24).
 
 ROLLBACK_STATE: DB backup /opt/gobrowse-os/backups/pre-m22-20260818.dump (+sha256). Previous images tagged (ui-fixed3..6, m22). Rollback = restore dump + deploy previous image.
 
