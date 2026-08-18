@@ -378,6 +378,7 @@ pub(crate) async fn create_library_note(
             title: title.to_owned(),
             body: body.to_owned(),
             book_type: gobrowse_core::library::BookType::Note,
+            kind: None, // library_add notes are SOURCE (SQL NULL)
             scope: if workspace_id.is_some() {
                 gobrowse_core::library::BookScope::Workspace
             } else {

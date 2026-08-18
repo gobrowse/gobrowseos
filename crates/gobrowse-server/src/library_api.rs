@@ -6,8 +6,8 @@ use axum::{
     http::HeaderMap,
 };
 use gobrowse_core::library::{
-    Book, BookScope, BookType, EmbeddingStatus, Provenance, RankingWeights, SecurityClassification,
-    TrustLevel, chunk_text, rank_fusion,
+    Book, BookKind, BookScope, BookType, EmbeddingStatus, Provenance, RankingWeights,
+    SecurityClassification, TrustLevel, chunk_text, rank_fusion,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -128,6 +128,7 @@ pub async fn create_book(
         title: input.title.trim().to_owned(),
         body: input.body,
         book_type: input.book_type,
+        kind: None, // user-created Books are SOURCE (SQL NULL)
         scope: input.scope,
         tags: normalize_tags(input.tags)?,
         provenance: input.provenance,
@@ -748,6 +749,11 @@ fn row_to_book(row: &sqlx::postgres::PgRow) -> Result<Book, AppError> {
         title: row.get("title"),
         body: row.get("body"),
         book_type: parse_book_type(row.get::<String, _>("book_type").as_str())?,
+        kind: row
+            .get::<Option<String>, _>("kind")
+            .as_deref()
+            .map(parse_kind)
+            .transpose()?,
         scope: parse_scope(row.get::<String, _>("scope").as_str())?,
         tags: row.get("tags"),
         provenance: parse_provenance(row.get::<String, _>("provenance").as_str())?,
@@ -775,6 +781,9 @@ fn enum_db<T: Serialize>(value: &T) -> String {
 }
 
 fn parse_book_type(value: &str) -> Result<BookType, AppError> {
+    parse_enum(value)
+}
+fn parse_kind(value: &str) -> Result<BookKind, AppError> {
     parse_enum(value)
 }
 fn parse_scope(value: &str) -> Result<BookScope, AppError> {

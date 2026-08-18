@@ -76,6 +76,31 @@ pub enum EmbeddingStatus {
     Stale,
 }
 
+/// Registry role of a Book in the unified library. `None` (SQL NULL) means `Source`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BookKind {
+    Source,
+    Skill,
+    Mcp,
+    Plugin,
+    Autobiography,
+}
+
+/// Lifecycle state of a plugin, matching the `plugins.state` column vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginState {
+    Discovered,
+    Staged,
+    Installed,
+    Enabled,
+    Dormant,
+    Active,
+    Unhealthy,
+    UpdateAvailable,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Book {
     pub id: Uuid,
@@ -83,6 +108,9 @@ pub struct Book {
     pub title: String,
     pub body: String,
     pub book_type: BookType,
+    /// Registry role; `None` (SQL NULL) means `Source`.
+    #[serde(default)]
+    pub kind: Option<BookKind>,
     pub scope: BookScope,
     pub tags: Vec<String>,
     pub provenance: Provenance,
@@ -257,6 +285,7 @@ mod tests {
             title: "Valid Title".into(),
             body: String::new(),
             book_type: BookType::Note,
+            kind: None,
             scope: BookScope::Global,
             tags: vec![],
             provenance: Provenance::User,
@@ -348,6 +377,53 @@ mod tests {
             .validate()
             .is_ok()
         );
+    }
+
+    #[test]
+    fn book_kind_serde_matches_db_vocabulary_and_legacy_json_defaults_to_none() {
+        for (kind, db) in [
+            (BookKind::Source, "SOURCE"),
+            (BookKind::Skill, "SKILL"),
+            (BookKind::Mcp, "MCP"),
+            (BookKind::Plugin, "PLUGIN"),
+            (BookKind::Autobiography, "AUTOBIOGRAPHY"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&kind).unwrap(),
+                format!("\"{db}\""),
+                "BookKind::{kind:?} must match the books.kind CHECK vocabulary"
+            );
+            assert_eq!(
+                serde_json::from_str::<BookKind>(&format!("\"{db}\"")).unwrap(),
+                kind
+            );
+        }
+        for (state, db) in [
+            (PluginState::Discovered, "discovered"),
+            (PluginState::Staged, "staged"),
+            (PluginState::Installed, "installed"),
+            (PluginState::Enabled, "enabled"),
+            (PluginState::Dormant, "dormant"),
+            (PluginState::Active, "active"),
+            (PluginState::Unhealthy, "unhealthy"),
+            (PluginState::UpdateAvailable, "update_available"),
+        ] {
+            assert_eq!(
+                serde_json::to_string(&state).unwrap(),
+                format!("\"{db}\""),
+                "PluginState::{state:?} must match the plugins.state CHECK vocabulary"
+            );
+        }
+
+        // Current Book JSON always carries `kind`; legacy JSON without it parses as None.
+        let mut value = serde_json::to_value(book(|b| b.kind = Some(BookKind::Skill))).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(serde_json::Value::as_str),
+            Some("SKILL")
+        );
+        value.as_object_mut().unwrap().remove("kind");
+        let parsed: Book = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.kind, None);
     }
 
     #[test]
