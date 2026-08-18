@@ -154,6 +154,11 @@ pub async fn create(
     Json(input): Json<CreateMcpServerRequest>,
 ) -> Result<(StatusCode, Json<McpServerResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
+    // MCP servers spawn configured commands as the server user; only
+    // OWNER/ADMIN may introduce or alter the command (F1 security gate).
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
     validate_create(&input)?;
 
     let name = input.name.trim();
@@ -212,6 +217,10 @@ pub async fn update(
     Json(input): Json<UpdateMcpServerRequest>,
 ) -> Result<Json<McpServerResponse>, AppError> {
     let user = require_user(&state, &headers).await?;
+    // Same role gate as create: MCP command configuration is privileged.
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
     validate_update(&input)?;
 
     let mut tx = state.pool.begin().await?;

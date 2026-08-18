@@ -44,7 +44,7 @@ use gobrowse_core::sandbox::{
     TerminalStartRequest, validate_workspace_path,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha512};
+// sha2 digest imports removed with self-asserted signature verification.
 use sqlx::{Postgres, Row, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -55,7 +55,6 @@ use crate::{
     embedding,
     error::AppError,
     library_api::replace_book_snapshot,
-    plugin_github::sha256_hex,
     sandbox_client::SandboxClientError,
 };
 
@@ -647,10 +646,11 @@ pub async fn patch(
     if let Some(trust) = &input.trust {
         if !matches!(
             trust.as_str(),
-            "VERIFIED" | "USER_PROVIDED" | "AGENT_INFERRED" | "EXTERNAL" | "UNTRUSTED"
+            "USER_PROVIDED" | "AGENT_INFERRED" | "EXTERNAL" | "UNTRUSTED"
         ) {
             return Err(AppError::Validation(
-                "trust must be one of VERIFIED, USER_PROVIDED, AGENT_INFERRED, EXTERNAL, UNTRUSTED"
+                "trust may only be set to USER_PROVIDED, AGENT_INFERRED, EXTERNAL, or UNTRUSTED; \
+                 VERIFIED requires artifact signature verification"
                     .into(),
             ));
         }
@@ -1765,28 +1765,14 @@ fn compute_name_diff(current: &[String], next: &[String]) -> (Vec<String>, Vec<S
 /// Accepts a manifest `signature` only when it is a valid hex SHA-256 (64
 /// chars) or SHA-512 (128 chars) of the artifact bytes. Anything else is
 /// rejected (returns false), keeping the plugin UNTRUSTED/USER_PROVIDED.
-fn verify_artifact_signature(signature: &serde_json::Value, artifact_bytes: &[u8]) -> bool {
-    let Some(signature) = signature.as_str() else {
-        return false;
-    };
-    let signature = signature.trim();
-    let is_hex = signature.bytes().all(|byte| byte.is_ascii_hexdigit());
-    if !is_hex {
-        return false;
-    }
-    match signature.len() {
-        64 => signature.eq_ignore_ascii_case(&sha256_hex(artifact_bytes)),
-        128 => {
-            let digest = Sha512::digest(artifact_bytes);
-            let mut expected = String::with_capacity(digest.len() * 2);
-            for byte in digest {
-                use std::fmt::Write;
-                let _ = write!(expected, "{byte:02x}");
-            }
-            signature.eq_ignore_ascii_case(&expected)
-        }
-        _ => false,
-    }
+fn verify_artifact_signature(signature: &serde_json::Value, _artifact_bytes: &[u8]) -> bool {
+    // A manifest-declared digest of the artifact is NOT a signature: the
+    // publisher controls both values, so trusting it would be self-asserted.
+    // VERIFIED is reserved for signatures verified against a known publisher
+    // key, which no key registry exists for yet — always return false so
+    // installs stay UNTRUSTED/USER_PROVIDED until real key infrastructure lands.
+    let _ = signature;
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -2432,51 +2418,26 @@ mod tests {
     }
 
     #[test]
-    fn signature_verifies_sha256_and_sha512_hex_of_artifact() {
+    fn signature_is_never_self_asserted() {
+        // A manifest-declared digest of the artifact is NOT a signature: the
+        // publisher controls both values. VERIFIED is reserved for signatures
+        // verified against a known publisher key (none exist yet), so the
+        // verification always returns false and installs stay UNTRUSTED or
+        // USER_PROVIDED.
         let artifact = b"artifact-bytes";
-        let sha256 = sha256_hex(artifact);
-        let sha512: String = {
-            let digest = Sha512::digest(artifact);
-            let mut out = String::with_capacity(128);
-            for byte in digest {
-                use std::fmt::Write;
-                let _ = write!(out, "{byte:02x}");
-            }
-            out
-        };
-        assert!(verify_artifact_signature(
-            &serde_json::json!(sha256),
-            artifact
-        ));
-        assert!(verify_artifact_signature(
-            &serde_json::json!(sha512),
-            artifact
-        ));
-        // Case-insensitive acceptance.
-        assert!(verify_artifact_signature(
-            &serde_json::json!(sha256.to_uppercase()),
-            artifact
-        ));
-        // Wrong digest, wrong length, non-hex, non-string all rejected.
         assert!(!verify_artifact_signature(
-            &serde_json::json!("f".repeat(64)),
+            &serde_json::json!("deadbeef"),
             artifact
         ));
-        assert!(!verify_artifact_signature(
-            &serde_json::json!(sha256[..62]),
-            artifact
-        ));
-        assert!(!verify_artifact_signature(
-            &serde_json::json!("z".repeat(64)),
-            artifact
-        ));
-        assert!(!verify_artifact_signature(&serde_json::json!(42), artifact));
         assert!(!verify_artifact_signature(
             &serde_json::Value::Null,
             artifact
         ));
+        assert!(!verify_artifact_signature(
+            &serde_json::json!("not-hex"),
+            artifact
+        ));
     }
-
     #[test]
     fn permission_validation_rejects_unknown_domains_and_oversized_scopes() {
         let known = PluginPermission {
