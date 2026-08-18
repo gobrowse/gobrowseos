@@ -106,6 +106,21 @@ struct UpdateBookRequest {
     reason: String,
 }
 
+#[derive(serde::Serialize)]
+struct CreateBookBody {
+    title: String,
+    body: String,
+    book_type: String,
+    scope: String,
+    tags: Vec<String>,
+    provenance: String,
+    trust: String,
+    workspace_id: Option<String>,
+    conversation_id: Option<String>,
+    security_classification: String,
+    metadata: serde_json::Value,
+}
+
 #[derive(serde::Deserialize, Clone, Debug)]
 struct CatalogModel {
     reference: String,
@@ -1527,7 +1542,50 @@ fn LibraryPage() -> impl IntoView {
     let edit_title = RwSignal::new(String::new());
     let edit_body = RwSignal::new(String::new());
     let edit_status = RwSignal::new(String::new());
+    let create_title = RwSignal::new(String::new());
+    let create_body = RwSignal::new(String::new());
+    let create_status = RwSignal::new(String::new());
+    let show_create = RwSignal::new(false);
     load_books(books, status, None);
+    let create_book = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        let title = create_title.get_untracked();
+        if title.trim().is_empty() {
+            create_status.set("Title is required".into());
+            return;
+        }
+        let body = create_body.get_untracked();
+        create_status.set("Creating book...".into());
+        spawn_local(async move {
+            let request = Request::post("/api/v1/library/books").json(&CreateBookBody {
+                title: title.trim().to_owned(),
+                body,
+                book_type: "NOTE".into(),
+                scope: "PROFILE".into(),
+                tags: Vec::new(),
+                provenance: "USER".into(),
+                trust: "USER_PROVIDED".into(),
+                workspace_id: None,
+                conversation_id: None,
+                security_classification: "INTERNAL".into(),
+                metadata: serde_json::Value::Object(Default::default()),
+            });
+            match request {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => {
+                        create_status.set("Created".into());
+                        create_title.set(String::new());
+                        create_body.set(String::new());
+                        show_create.set(false);
+                        load_books(books, status, None);
+                    }
+                    Ok(response) => create_status.set(format!("Create rejected: HTTP {}", response.status())),
+                    Err(_) => create_status.set("Library service did not answer.".into()),
+                },
+                Err(_) => create_status.set("Create request could not be encoded.".into()),
+            }
+        });
+    };
     let search = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         let value = query.get_untracked();
@@ -1595,7 +1653,22 @@ fn LibraryPage() -> impl IntoView {
                 on:input=move |event| query.set(event_target_value(&event)) />
             <button type="submit">"Search"</button>
             <button type="button" on:click=move |_| { query.set(String::new()); load_books(books, status, None); }>"Reset"</button>
+            <button type="button" on:click=move |_| show_create.set(!show_create.get_untracked())>
+                {move || if show_create.get() { "Close form" } else { "Create book" }}
+            </button>
         </form>
+        {move || show_create.get().then(|| view! {
+            <form class="model-form" on:submit=create_book>
+                <label>"Title"<input required maxlength="500" prop:value=move || create_title.get() on:input=move |event| create_title.set(event_target_value(&event)) /></label>
+                <label class="fallback-field">"Body"
+                    <textarea rows="8" maxlength="100000" placeholder="Book contents" prop:value=move || create_body.get() on:input=move |event| create_body.set(event_target_value(&event))></textarea>
+                </label>
+                <div>
+                    <button class="primary" type="submit">"Create"</button>
+                </div>
+                <p class="form-note">{move || create_status.get()}</p>
+            </form>
+        })}
         <p class="form-note">{move || status.get()}</p>
         <div class="index-table" role="table">
             <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"PROVENANCE"</span><span>"RETRIEVAL"</span></div>
