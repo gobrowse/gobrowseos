@@ -10,6 +10,9 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 
 const PENDING_SUBMISSION_KEY: &str = "gobrowse.pending-chat-submission";
 const ACTIVE_RUN_KEY: &str = "gobrowse.active-chat-run";
+const OPEN_TERMINAL_KEY: &str = "gobrowse.open-terminal";
+const TERMINAL_POLL_MS: i32 = 1_000;
+const TERMINAL_MAX_READ_BYTES: u32 = 32_768;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthStage {
@@ -69,10 +72,64 @@ struct ApiError {
 struct BookSummary {
     id: String,
     title: String,
+    #[serde(default)]
+    snippet: String,
+    /// Registry role; SQL NULL / absent means SOURCE.
+    #[serde(default)]
+    kind: Option<String>,
+    /// Capability/component names from `books.metadata->>'capabilities'`.
+    #[serde(default)]
+    capabilities: Vec<String>,
+    #[serde(default)]
     book_type: String,
-    provenance: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
     trust: String,
-    retrieval_mode: String,
+}
+
+/// `POST /library/books/{id}/load` — kind-specific progressive load. The
+/// server injects `book_id`, `title`, `kind`, `book_type`, `trust` and the
+/// book `revision` into the kind-specific payload; optional fields carry the
+/// kind-specific content.
+#[derive(serde::Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+struct LoadedBook {
+    book_id: String,
+    title: String,
+    kind: Option<String>,
+    book_type: String,
+    trust: String,
+    revision: i64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    skill_id: Option<String>,
+    #[serde(default)]
+    mcp_server_id: Option<String>,
+    #[serde(default)]
+    transport: Option<String>,
+    #[serde(default)]
+    tools: Vec<McpToolSummary>,
+    #[serde(default)]
+    components: Vec<ComponentPreview>,
+    #[serde(default)]
+    plugin_id: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    promoted: Option<bool>,
+}
+
+#[derive(serde::Deserialize, Clone, Debug)]
+#[allow(dead_code)]
+struct McpToolSummary {
+    name: String,
+    description: String,
 }
 
 #[derive(serde::Deserialize, Clone, Debug)]
@@ -85,25 +142,6 @@ struct PinnedBookSummary {
     trust: String,
     security_classification: String,
     updated_at: String,
-}
-
-#[derive(serde::Deserialize, Clone, Debug)]
-struct BookDetail {
-    id: String,
-    title: String,
-    body: String,
-    book_type: String,
-    revision: i64,
-}
-
-#[derive(serde::Serialize)]
-struct UpdateBookRequest {
-    title: String,
-    body: String,
-    tags: Vec<String>,
-    metadata: serde_json::Value,
-    expected_revision: i64,
-    reason: String,
 }
 
 #[derive(serde::Serialize)]
@@ -292,35 +330,6 @@ struct CreateChatModelConfiguration<'a> {
     priority: i32,
     activate: bool,
     fallback_model_ids: Vec<&'a str>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct SkillResponse {
-    id: String,
-    profile_id: String,
-    workspace_id: Option<String>,
-    name: String,
-    description: String,
-    active_revision: Option<i64>,
-    promotion_policy: String,
-    created_at: String,
-    updated_at: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct SkillRevisionResponse {
-    id: String,
-    skill_id: String,
-    revision: i64,
-    content: String,
-    author: String,
-    reason: String,
-    source_conversation_ids: Vec<String>,
-    created_at: String,
-    evaluation: Option<serde_json::Value>,
-    promoted: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -551,11 +560,12 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
             <section id="workspace" class="workspace" tabindex="-1">
                 {move || match page.get() {
                     Page::Chat => view! { <ChatPage user_id=user_id.clone() /> }.into_any(),
-                    Page::Library => view! { <LibraryPage /> }.into_any(),
-                    Page::Skills => view! { <SkillsPage /> }.into_any(),
+                    Page::Library => view! { <LibraryPage initial_kind=None page /> }.into_any(),
+                    Page::Skills => view! { <LibraryPage initial_kind=Some("SKILL") page /> }.into_any(),
+                    Page::Mcp => view! { <LibraryPage initial_kind=Some("MCP") page /> }.into_any(),
                     Page::Autobiography => view! { <AutobiographyPage /> }.into_any(),
                     Page::Workspaces => view! { <WorkspacesPage /> }.into_any(),
-                    Page::Mcp => view! { <McpPage /> }.into_any(),
+                    Page::Terminals => view! { <TerminalsPage /> }.into_any(),
                     Page::Models => view! { <ModelsPage /> }.into_any(),
                     Page::Diagnostics => view! { <DiagnosticsPage /> }.into_any(),
                     current => view! { <EmptyOperationalPage page=current /> }.into_any(),
@@ -800,6 +810,15 @@ fn ChatPage(user_id: String) -> impl IntoView {
     let pending_submission = RwSignal::new(restored_submission);
     let generation = RwSignal::new(0_u64);
     let status = RwSignal::new(String::new());
+    // Mirror the open conversation so the unified Library page can offer
+    // "pin to current conversation" (kept across page switches).
+    Effect::new(move |_| {
+        let shared = active_conversation();
+        match selected.get() {
+            Some(conversation) => shared.set(Some(conversation)),
+            None => shared.set(None),
+        }
+    });
     load_conversations(conversations, status, Arc::clone(&lifecycle));
     load_chat_models(chat_models, status, Arc::clone(&lifecycle));
     if let Some(restored_run) = restored_run {
@@ -1294,24 +1313,405 @@ struct CreateWorkspaceBody {
     description: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)]
-struct McpServerSummary {
-    id: String,
-    name: String,
-    transport: String,
-    configuration: serde_json::Value,
-    enabled: bool,
-    auth_secret_reference: Option<String>,
-    created_at: String,
-}
-
 #[derive(Debug, Serialize)]
 struct CreateMcpServerBody {
     name: String,
     transport: String,
     configuration: serde_json::Value,
     enabled: bool,
+}
+
+/// Mirrors `skills_api.rs::CreateSkillRequest` (the server creates the
+/// companion SKILL book in the same transaction).
+#[derive(Debug, Serialize)]
+struct CreateSkillBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    content: String,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_conversation_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    promotion_policy: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Lane F: plugin install + detail types (mirror plugin_api.rs DTOs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LibraryFilter {
+    All,
+    Source,
+    Skill,
+    Plugin,
+    Mcp,
+}
+
+impl LibraryFilter {
+    fn label(self) -> &'static str {
+        match self {
+            LibraryFilter::All => "ALL",
+            LibraryFilter::Source => "SOURCE",
+            LibraryFilter::Skill => "SKILL",
+            LibraryFilter::Plugin => "PLUGIN",
+            LibraryFilter::Mcp => "MCP",
+        }
+    }
+
+    /// Server-side kind filter for `GET /library/search` (None = all kinds).
+    fn kind(self) -> Option<&'static str> {
+        match self {
+            LibraryFilter::All => None,
+            LibraryFilter::Source => Some("SOURCE"),
+            LibraryFilter::Skill => Some("SKILL"),
+            LibraryFilter::Plugin => Some("PLUGIN"),
+            LibraryFilter::Mcp => Some("MCP"),
+        }
+    }
+
+    /// Client-side match for list responses (SOURCE also matches legacy
+    /// NULL-kind books, mirroring the search semantics).
+    fn matches(self, kind: &Option<String>) -> bool {
+        match self {
+            LibraryFilter::All => true,
+            LibraryFilter::Source => matches!(kind.as_deref(), None | Some("SOURCE")),
+            LibraryFilter::Skill => kind.as_deref() == Some("SKILL"),
+            LibraryFilter::Plugin => kind.as_deref() == Some("PLUGIN"),
+            LibraryFilter::Mcp => kind.as_deref() == Some("MCP"),
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct PluginIdentity {
+    source_type: String,
+    source_uri: String,
+    commit_sha: Option<String>,
+    version: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct PluginSourceRef {
+    source_type: String,
+    source_uri: String,
+    commit_sha: Option<String>,
+    digest: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ComponentPreview {
+    #[serde(rename = "type")]
+    component_type: String,
+    name: String,
+    #[serde(rename = "ref")]
+    component_ref: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PermissionPreview {
+    domain: String,
+    scope_value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SelfTestPreview {
+    command: Vec<String>,
+    timeout: u32,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct PluginPreview {
+    identity: PluginIdentity,
+    name: String,
+    version: String,
+    publisher: String,
+    description: String,
+    source: PluginSourceRef,
+    components: Vec<ComponentPreview>,
+    permissions: Vec<PermissionPreview>,
+    network_policy: String,
+    #[serde(default)]
+    resource_limits: Option<serde_json::Value>,
+    #[serde(default)]
+    self_test: Option<SelfTestPreview>,
+    trust: String,
+    #[serde(default)]
+    update_policy: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct InstallResponse {
+    plugin_id: String,
+    book_id: String,
+    state: String,
+    trust: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ComponentRow {
+    component_type: String,
+    name: String,
+    manifest_ref: String,
+    metadata: serde_json::Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct InstallationRow {
+    id: String,
+    version: String,
+    artifact_digest: String,
+    status: String,
+    installed_by: Option<String>,
+    #[serde(default)]
+    self_test_result: Option<serde_json::Value>,
+    installed_at: Option<String>,
+    activated_at: Option<String>,
+    rolled_back_at: Option<String>,
+    created_at: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct PluginDetail {
+    id: String,
+    name: String,
+    description: String,
+    version: String,
+    publisher: Option<String>,
+    source_type: String,
+    source_uri: String,
+    commit_sha: Option<String>,
+    artifact_digest: Option<String>,
+    #[serde(default)]
+    signature: Option<serde_json::Value>,
+    verified: bool,
+    trust: String,
+    state: String,
+    install_path: Option<String>,
+    manifest_version: i32,
+    #[serde(default)]
+    sandbox_policy: serde_json::Value,
+    network_policy: String,
+    #[serde(default)]
+    resource_limits: Option<serde_json::Value>,
+    workspace_id: Option<String>,
+    created_at: String,
+    updated_at: String,
+    components: Vec<ComponentRow>,
+    permissions: Vec<PermissionPreview>,
+    installations: Vec<InstallationRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DiffPair<T> {
+    added: Vec<T>,
+    removed: Vec<T>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct UpgradeDiff {
+    installation_id: String,
+    current_version: String,
+    new_version: String,
+    artifact_digest: String,
+    commit_sha: Option<String>,
+    permissions: DiffPair<PermissionPreview>,
+    components: DiffPair<String>,
+    capabilities: DiffPair<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct MarketplaceResult {
+    name: String,
+    publisher: String,
+    version: String,
+    description: String,
+    source: String,
+    source_uri: String,
+    trust: String,
+    #[serde(default)]
+    capabilities: Vec<String>,
+    popularity: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginPreviewRequest<'a> {
+    source_type: &'a str,
+    source_uri: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginInstallRequest<'a> {
+    source_type: &'a str,
+    source_uri: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+    expected_digest: &'a str,
+    approve: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginSearchRequest<'a> {
+    query: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct PatchPluginRequest<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trust: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PluginUpgradeRequest<'a> {
+    version: &'a str,
+}
+
+/// Modal install stepper state (steps mirror the brief: source → preview →
+/// approval → progress → done/error).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StepperStep {
+    Source,
+    Previewing,
+    Preview,
+    Approve,
+    Installing,
+    Done,
+    Error,
+}
+
+#[derive(Debug, Clone)]
+struct InstallStepperState {
+    step: StepperStep,
+    source_type: String,
+    source_uri: String,
+    version: Option<String>,
+    workspace_id: Option<String>,
+    preview: Option<PluginPreview>,
+    install: Option<InstallResponse>,
+    confirmed: bool,
+    phase: String,
+    error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Lane F: sandbox terminal + file manager types (mirror sandbox_api.rs DTOs)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+struct TerminalStartBody<'a> {
+    workspace_id: &'a str,
+    command: Vec<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<u16>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TerminalStartResponse {
+    terminal_id: String,
+    network_policy: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalWriteBody<'a> {
+    workspace_id: &'a str,
+    data_base64: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalReadBody<'a> {
+    workspace_id: &'a str,
+    after_cursor: u64,
+    max_bytes: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TerminalReadResponse {
+    data_base64: String,
+    next_cursor: u64,
+    state: String,
+    output_complete: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalResizeBody<'a> {
+    workspace_id: &'a str,
+    cols: u16,
+    rows: u16,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkspaceIdBody<'a> {
+    workspace_id: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SandboxPathBody<'a> {
+    workspace_id: &'a str,
+    path: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct SandboxWriteBody<'a> {
+    workspace_id: &'a str,
+    path: &'a str,
+    data_base64: &'a str,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FileListResponse {
+    entries: Vec<FsEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct FsEntry {
+    name: String,
+    kind: String,
+    size: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct ReadFileResponse {
+    data_base64: String,
+    sha256: String,
+}
+
+/// A persisted browser terminal session (survives page reloads so the user
+/// can reconnect to a fresh session in the same workspace).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct OpenTerminalSession {
+    workspace_id: String,
+    terminal_id: String,
+}
+
+/// Mirrors the active chat conversation so the unified Library page can offer
+/// "pin to current conversation" without ChatPage exposing its internals.
+fn active_conversation() -> RwSignal<Option<ConversationSummary>> {
+    static ACTIVE_CONVERSATION: std::sync::OnceLock<RwSignal<Option<ConversationSummary>>> =
+        std::sync::OnceLock::new();
+    ACTIVE_CONVERSATION
+        .get_or_init(|| RwSignal::new(None))
+        .to_owned()
 }
 
 #[component]
@@ -1405,164 +1805,184 @@ fn WorkspacesPage() -> impl IntoView {
 }
 
 #[component]
-fn McpPage() -> impl IntoView {
-    let servers = RwSignal::new(Vec::<McpServerSummary>::new());
-    let status = RwSignal::new(String::new());
-    let name = RwSignal::new(String::new());
-    let transport = RwSignal::new("stdio".to_owned());
-    let configuration = RwSignal::new(String::new());
-
-    let load = move || {
-        status.set("Loading MCP servers...".into());
-        spawn_local(async move {
-            match Request::get("/api/v1/mcp/servers").send().await {
-                Ok(response) if response.ok() => {
-                    match response.json::<Vec<McpServerSummary>>().await {
-                        Ok(list) => {
-                            servers.set(list);
-                            status.set(String::new());
-                        }
-                        Err(_) => status.set("MCP server response was not valid.".into()),
-                    }
-                }
-                Ok(response) => status.set(format!(
-                    "MCP server request failed: HTTP {}",
-                    response.status()
-                )),
-                Err(_) => status.set("MCP server service did not answer.".into()),
-            }
-        });
-    };
-
-    load();
-
-    let create = move |event: leptos::ev::SubmitEvent| {
-        event.prevent_default();
-        let name_val = name.get_untracked().trim().to_owned();
-        if name_val.is_empty() {
-            status.set("Name is required.".into());
-            return;
-        }
-        let transport_val = transport.get_untracked();
-        let config_text = configuration.get_untracked().trim().to_owned();
-        let config_value = if config_text.is_empty() {
-            serde_json::Value::Object(serde_json::Map::new())
-        } else {
-            match serde_json::from_str(&config_text) {
-                Ok(v) => v,
-                Err(e) => {
-                    status.set(format!("Invalid configuration JSON: {e}"));
-                    return;
-                }
-            }
-        };
-        status.set("Creating MCP server...".into());
-        spawn_local(async move {
-            let body = CreateMcpServerBody {
-                name: name_val,
-                transport: transport_val,
-                configuration: config_value,
-                enabled: true,
-            };
-            match Request::post("/api/v1/mcp/servers").json(&body) {
-                Ok(request) => match request.send().await {
-                    Ok(response) if response.ok() => {
-                        name.set(String::new());
-                        configuration.set(String::new());
-                        load();
-                    }
-                    Ok(response) => {
-                        status.set(format!("Create failed: HTTP {}", response.status()))
-                    }
-                    Err(_) => status.set("MCP server service did not answer.".into()),
-                },
-                Err(_) => status.set("Create request could not be encoded.".into()),
-            }
-        });
-    };
-
-    let delete_server = move |server_id: String| {
-        spawn_local({
-            let status = status;
-            let load = load;
-            async move {
-                match Request::delete(&format!("/api/v1/mcp/servers/{server_id}"))
-                    .send()
-                    .await
-                {
-                    Ok(response) if response.ok() => load(),
-                    Ok(response) => {
-                        status.set(format!("Delete failed: HTTP {}", response.status()))
-                    }
-                    Err(_) => status.set("MCP server service did not answer.".into()),
-                }
-            }
-        });
-    };
-
-    view! {
-        <div class="page-heading">
-            <div><p class="utility">"CONNECT / MCP"</p><h1>"MCP Servers"</h1></div>
-            <span class="utility">{move || format!("{} SERVERS", servers.get().len())}</span>
-        </div>
-        <form class="filter-row" on:submit=create>
-            <input placeholder="Server name" prop:value=move || name.get()
-                on:input=move |event| name.set(event_target_value(&event)) />
-            <select prop:value=move || transport.get()
-                on:change=move |event| transport.set(event_target_value(&event))>
-                <option value="stdio">"stdio"</option>
-                <option value="streamable_http">"streamable_http"</option>
-            </select>
-            <textarea placeholder="Configuration (JSON)" prop:value=move || configuration.get()
-                on:input=move |event| configuration.set(event_target_value(&event))></textarea>
-            <button type="submit">"Add"</button>
-        </form>
-        <p class="form-note">{move || status.get()}</p>
-        <div class="index-table" role="table">
-            <div class="index-row header" role="row"><span>"NAME"</span><span>"TRANSPORT"</span><span>"STATE"</span><span>"ACTIONS"</span></div>
-            {move || servers.get().into_iter().map(|server| {
-                let sid = server.id.clone();
-                view! { <div class="index-row" role="row">
-                    <strong>{server.name}</strong>
-                    <span>{server.transport.to_uppercase()}</span>
-                    <span class="spine-cell">{if server.enabled { "ENABLED" } else { "DISABLED" }}</span>
-                    <button class="text-button" on:click=move |_| delete_server(sid.clone())>"Delete"</button>
-                </div> }
-            }).collect_view()}
-        </div>
-    }
-}
-
-#[component]
-fn LibraryPage() -> impl IntoView {
-    let books = RwSignal::new(Vec::<BookSummary>::new());
+fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl IntoView {
+    let filter = RwSignal::new(match initial_kind {
+        Some("SKILL") => LibraryFilter::Skill,
+        Some("MCP") => LibraryFilter::Mcp,
+        Some("PLUGIN") => LibraryFilter::Plugin,
+        Some("SOURCE") => LibraryFilter::Source,
+        _ => LibraryFilter::All,
+    });
+    let all_books = RwSignal::new(Vec::<BookSummary>::new());
+    let search_hits = RwSignal::new(None::<Vec<BookSummary>>);
     let query = RwSignal::new(String::new());
     let status = RwSignal::new(String::new());
-    let selected = RwSignal::new(None::<BookDetail>);
-    let edit_title = RwSignal::new(String::new());
-    let edit_body = RwSignal::new(String::new());
-    let edit_status = RwSignal::new(String::new());
+    let workspaces = RwSignal::new(Vec::<WorkspaceSummary>::new());
+    let loaded = RwSignal::new(None::<LoadedBook>);
+    let load_status = RwSignal::new(String::new());
+    let plugin_detail_id = RwSignal::new(None::<String>);
+    let plugin_detail_tick = RwSignal::new(0_u64);
+    let marketplace_open = RwSignal::new(false);
+    let marketplace_results = RwSignal::new(Vec::<MarketplaceResult>::new());
+    let marketplace_query = RwSignal::new(String::new());
+    let marketplace_status = RwSignal::new(String::new());
+    let marketplace_loading = RwSignal::new(false);
+    let new_menu = RwSignal::new(false);
+    let new_form = RwSignal::new(None::<&'static str>);
     let create_title = RwSignal::new(String::new());
     let create_body = RwSignal::new(String::new());
+    let create_tags = RwSignal::new(String::new());
+    let create_scope = RwSignal::new("PROFILE".to_owned());
     let create_status = RwSignal::new(String::new());
-    let show_create = RwSignal::new(false);
-    load_books(books, status, None);
+    let creating = RwSignal::new(false);
+    let skill_name = RwSignal::new(String::new());
+    let skill_description = RwSignal::new(String::new());
+    let skill_content = RwSignal::new(String::new());
+    let skill_status = RwSignal::new(String::new());
+    let skill_creating = RwSignal::new(false);
+    let mcp_name = RwSignal::new(String::new());
+    let mcp_transport = RwSignal::new("stdio".to_owned());
+    let mcp_configuration = RwSignal::new(String::new());
+    let mcp_status = RwSignal::new(String::new());
+    let mcp_creating = RwSignal::new(false);
+    let stepper = RwSignal::new(None::<InstallStepperState>);
+    let stepper_source = RwSignal::new(String::new());
+    let stepper_version = RwSignal::new(String::new());
+    let stepper_workspace = RwSignal::new(String::new());
+
+    load_library_list(all_books, status, None);
+    load_workspaces(workspaces);
+
+    // ---- list refresh helpers ----
+    let refresh = {
+        move || {
+            load_library_list(all_books, status, None);
+            search_hits.set(None);
+        }
+    };
+
+    // ---- search + filter ----
+    let run_search = {
+        move |_| {
+            let value = query.get_untracked();
+            let trimmed = value.trim().to_owned();
+            if trimmed.is_empty() {
+                search_hits.set(None);
+                load_library_list(all_books, status, None);
+                return;
+            }
+            search_hits.set(Some(Vec::new()));
+            status.set("Searching the index...".into());
+            let kind = filter.get_untracked().kind().map(str::to_owned);
+            spawn_local(async move {
+                match search_library(&trimmed, kind.as_deref()).await {
+                    Ok(found) => {
+                        search_hits.set(Some(found));
+                        status.set("Search complete.".into());
+                    }
+                    Err(error) => status.set(format!("Search failed: {error}")),
+                }
+            });
+        }
+    };
+    let set_filter = {
+        move |next: LibraryFilter| {
+            filter.set(next);
+            let value = query.get_untracked();
+            if value.trim().is_empty() {
+                search_hits.set(None);
+                load_library_list(all_books, status, None);
+            } else {
+                let trimmed = value.trim().to_owned();
+                let kind = next.kind().map(str::to_owned);
+                spawn_local(async move {
+                    match search_library(&trimmed, kind.as_deref()).await {
+                        Ok(found) => search_hits.set(Some(found)),
+                        Err(error) => status.set(format!("Search failed: {error}")),
+                    }
+                });
+            }
+        }
+    };
+
+    // ---- open kind-specific detail (progressive load) ----
+    let open_book = {
+        move |book_id: String| {
+            load_status.set("Loading book content...".into());
+            let loaded = loaded;
+            let load_status = load_status;
+            spawn_local(async move {
+                match load_library_book(&book_id).await {
+                    Ok(found) => {
+                        loaded.set(Some(found));
+                        load_status.set(String::new());
+                    }
+                    Err(error) => load_status.set(format!("Could not open book: {error}")),
+                }
+            });
+        }
+    };
+
+    // ---- pin to the current conversation (when one is open) ----
+    let pin_book = move |book_id: String| {
+        let Some(conversation) = active_conversation().get_untracked() else {
+            return;
+        };
+        let conversation_id = conversation.id.clone();
+        status.set("Pinning to the current conversation...".into());
+        spawn_local(async move {
+            match Request::put(&format!(
+                "/api/v1/conversations/{conversation_id}/pins/{book_id}"
+            ))
+            .send()
+            .await
+            {
+                Ok(response) if response.ok() => {
+                    status.set("Pinned to the current conversation.".into());
+                }
+                Ok(response) => status.set(format!("Pin failed: {}", api_error(&response).await)),
+                Err(_) => status.set("Library service did not answer.".into()),
+            }
+        });
+    };
+
+    // ---- create: source book / skill / mcp server ----
     let create_book = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
+        if creating.get_untracked() {
+            return;
+        }
         let title = create_title.get_untracked();
         if title.trim().is_empty() {
-            create_status.set("Title is required".into());
+            create_status.set("Title is required.".into());
             return;
         }
         let body = create_body.get_untracked();
-        create_status.set("Creating book...".into());
+        let tags = create_tags
+            .get_untracked()
+            .split(',')
+            .map(|tag| tag.trim().to_owned())
+            .filter(|tag| !tag.is_empty())
+            .collect::<Vec<_>>();
+        let scope = create_scope.get_untracked();
+        creating.set(true);
+        create_status.set("Creating source book...".into());
+        let all_books = all_books;
+        let status = status;
+        let loaded = loaded;
+        let new_form = new_form;
+        let create_title = create_title;
+        let create_body = create_body;
+        let create_tags = create_tags;
+        let create_status = create_status;
+        let creating = creating;
         spawn_local(async move {
             let request = Request::post("/api/v1/library/books").json(&CreateBookBody {
                 title: title.trim().to_owned(),
                 body,
                 book_type: "NOTE".into(),
-                scope: "PROFILE".into(),
-                tags: Vec::new(),
+                scope,
+                tags,
                 provenance: "USER".into(),
                 trust: "USER_PROVIDED".into(),
                 workspace_id: None,
@@ -1570,149 +1990,2202 @@ fn LibraryPage() -> impl IntoView {
                 security_classification: "INTERNAL".into(),
                 metadata: serde_json::Value::Object(Default::default()),
             });
-            match request {
+            let outcome = match request {
                 Ok(request) => match request.send().await {
                     Ok(response) if response.ok() => {
-                        create_status.set("Created".into());
                         create_title.set(String::new());
                         create_body.set(String::new());
-                        show_create.set(false);
-                        load_books(books, status, None);
+                        create_tags.set(String::new());
+                        new_form.set(None);
+                        loaded.set(None);
+                        "Source book created.".to_owned()
                     }
-                    Ok(response) => {
-                        create_status.set(format!("Create rejected: HTTP {}", response.status()))
-                    }
-                    Err(_) => create_status.set("Library service did not answer.".into()),
+                    Ok(response) => format!("Create rejected: {}", api_error(&response).await),
+                    Err(_) => "Library service did not answer.".to_owned(),
                 },
-                Err(_) => create_status.set("Create request could not be encoded.".into()),
-            }
+                Err(_) => "Create request could not be encoded.".to_owned(),
+            };
+            create_status.set(outcome);
+            creating.set(false);
+            load_library_list(all_books, status, None);
         });
     };
-    let search = move |event: leptos::ev::SubmitEvent| {
+    let create_skill = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        let value = query.get_untracked();
-        let query_value = (!value.trim().is_empty()).then(|| value.trim().to_owned());
-        load_books(books, status, query_value);
-    };
-    let open_book = move |book_id: String| {
-        spawn_local(async move {
-            let response = Request::get(&format!("/api/v1/library/books/{book_id}"))
-                .send()
-                .await;
-            match response {
-                Ok(response) if response.ok() => {
-                    if let Ok(detail) = response.json::<BookDetail>().await {
-                        edit_title.set(detail.title.clone());
-                        edit_body.set(detail.body.clone());
-                        selected.set(Some(detail));
-                    } else {
-                        edit_status.set("Could not decode book".into());
-                    }
-                }
-                Ok(response) => {
-                    edit_status.set(format!("Book rejected: HTTP {}", response.status()))
-                }
-                Err(_) => edit_status.set("Library service did not answer.".into()),
-            }
-        });
-    };
-    let save_book = move |event: leptos::ev::SubmitEvent| {
-        event.prevent_default();
-        let Some(detail) = selected.get_untracked() else {
+        if skill_creating.get_untracked() {
             return;
-        };
-        let book_id = detail.id.clone();
-        let title = edit_title.get_untracked();
-        let body = edit_body.get_untracked();
+        }
+        let name = skill_name.get_untracked();
+        if name.trim().is_empty() {
+            skill_status.set("Name is required.".into());
+            return;
+        }
+        let description = skill_description.get_untracked();
+        let content = skill_content.get_untracked();
+        skill_creating.set(true);
+        skill_status.set("Creating skill...".into());
+        let all_books = all_books;
+        let status = status;
+        let loaded = loaded;
+        let new_form = new_form;
+        let skill_name = skill_name;
+        let skill_description = skill_description;
+        let skill_content = skill_content;
+        let skill_status = skill_status;
+        let skill_creating = skill_creating;
         spawn_local(async move {
-            let request = Request::put(&format!("/api/v1/library/books/{book_id}")).json(
-                &UpdateBookRequest {
-                    title: title.trim().to_owned(),
-                    body: body.clone(),
-                    tags: Vec::new(),
-                    metadata: serde_json::Value::Object(Default::default()),
-                    expected_revision: detail.revision,
-                    reason: "Edited from the operator UI".into(),
-                },
-            );
-            match request {
+            let body = CreateSkillBody {
+                name: name.trim().to_owned(),
+                description,
+                content,
+                reason: "Created from the Library page".into(),
+                workspace_id: None,
+                source_conversation_ids: Vec::new(),
+                promotion_policy: None,
+            };
+            let request = Request::post("/api/v1/skills").json(&body);
+            let outcome = match request {
                 Ok(request) => match request.send().await {
                     Ok(response) if response.ok() => {
-                        edit_status.set("Saved".into());
-                        selected.set(None);
-                        load_books(books, status, None);
+                        skill_name.set(String::new());
+                        skill_description.set(String::new());
+                        skill_content.set(String::new());
+                        new_form.set(None);
+                        loaded.set(None);
+                        "Skill created; its SKILL book is now indexed.".to_owned()
                     }
-                    Ok(response) => {
-                        edit_status.set(format!("Save rejected: HTTP {}", response.status()))
-                    }
-                    Err(_) => edit_status.set("Library service did not answer.".into()),
+                    Ok(response) => format!("Create rejected: {}", api_error(&response).await),
+                    Err(_) => "Skills service did not answer.".to_owned(),
                 },
-                Err(_) => edit_status.set("Edit request could not be encoded.".into()),
-            }
+                Err(_) => "Create request could not be encoded.".to_owned(),
+            };
+            skill_status.set(outcome);
+            skill_creating.set(false);
+            load_library_list(all_books, status, None);
         });
     };
+    let create_mcp = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        if mcp_creating.get_untracked() {
+            return;
+        }
+        let name = mcp_name.get_untracked();
+        if name.trim().is_empty() {
+            mcp_status.set("Name is required.".into());
+            return;
+        }
+        let transport = mcp_transport.get_untracked();
+        let config_text = mcp_configuration.get_untracked().trim().to_owned();
+        let config_value = if config_text.is_empty() {
+            serde_json::Value::Object(serde_json::Map::new())
+        } else {
+            match serde_json::from_str(&config_text) {
+                Ok(value) => value,
+                Err(error) => {
+                    mcp_status.set(format!("Invalid configuration JSON: {error}"));
+                    return;
+                }
+            }
+        };
+        mcp_creating.set(true);
+        mcp_status.set("Creating MCP server...".into());
+        let all_books = all_books;
+        let status = status;
+        let loaded = loaded;
+        let new_form = new_form;
+        let mcp_name = mcp_name;
+        let mcp_configuration = mcp_configuration;
+        let mcp_status = mcp_status;
+        let mcp_creating = mcp_creating;
+        spawn_local(async move {
+            let body = CreateMcpServerBody {
+                name: name.trim().to_owned(),
+                transport,
+                configuration: config_value,
+                enabled: true,
+            };
+            let request = Request::post("/api/v1/mcp/servers").json(&body);
+            let outcome = match request {
+                Ok(request) => match request.send().await {
+                    Ok(response) if response.ok() => {
+                        mcp_name.set(String::new());
+                        mcp_configuration.set(String::new());
+                        new_form.set(None);
+                        loaded.set(None);
+                        "MCP server created; its MCP book is now indexed.".to_owned()
+                    }
+                    Ok(response) => format!("Create rejected: {}", api_error(&response).await),
+                    Err(_) => "MCP server service did not answer.".to_owned(),
+                },
+                Err(_) => "Create request could not be encoded.".to_owned(),
+            };
+            mcp_status.set(outcome);
+            mcp_creating.set(false);
+            load_library_list(all_books, status, None);
+        });
+    };
+
+    // ---- plugin install stepper ----
+    let open_stepper = {
+        move |source_uri: Option<String>, version: Option<String>| {
+            stepper_source.set(
+                source_uri
+                    .unwrap_or_else(|| "https://github.com/".to_owned())
+                    .trim()
+                    .to_owned(),
+            );
+            stepper_version.set(version.unwrap_or_default());
+            stepper_workspace.set(String::new());
+            stepper.set(Some(InstallStepperState {
+                step: StepperStep::Source,
+                source_type: "github_release".into(),
+                source_uri: String::new(),
+                version: None,
+                workspace_id: None,
+                preview: None,
+                install: None,
+                confirmed: false,
+                phase: String::new(),
+                error: None,
+            }));
+        }
+    };
+    let close_stepper = move |_| stepper.set(None);
+    let stepper_preview = {
+        move |_| {
+            let source_uri = stepper_source.get_untracked().trim().to_owned();
+            if source_uri.is_empty() {
+                if let Some(state) = stepper.get_untracked().as_mut() {
+                    state.error = Some(
+                        "Enter a GitHub URL (https://github.com/owner/repo) or owner/repo.".into(),
+                    );
+                }
+                return;
+            }
+            let version = {
+                let value = stepper_version.get_untracked().trim().to_owned();
+                (!value.is_empty()).then_some(value)
+            };
+            let workspace_id = {
+                let value = stepper_workspace.get_untracked();
+                (!value.is_empty()).then_some(value)
+            };
+            if let Some(state) = stepper.get_untracked().as_mut() {
+                state.step = StepperStep::Previewing;
+                state.source_type = "github_release".into();
+                state.source_uri = source_uri.clone();
+                state.version = version.clone();
+                state.workspace_id = workspace_id.clone();
+                state.error = None;
+                state.preview = None;
+            }
+            let stepper = stepper;
+            spawn_local(async move {
+                let request =
+                    Request::post("/api/v1/plugins/preview").json(&PluginPreviewRequest {
+                        source_type: "github_release",
+                        source_uri: &source_uri,
+                        version: version.as_deref(),
+                    });
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<PluginPreview>().await {
+                                Ok(preview) => {
+                                    if let Some(state) = stepper.get_untracked().as_mut() {
+                                        state.preview = Some(preview);
+                                        state.step = StepperStep::Preview;
+                                    }
+                                    Ok(())
+                                }
+                                Err(_) => Err("The preview response was not valid.".to_owned()),
+                            }
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Plugin service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The preview request could not be encoded.".to_owned()),
+                };
+                if let Err(error) = outcome
+                    && let Some(state) = stepper.get_untracked().as_mut()
+                {
+                    state.error = Some(error);
+                    state.step = StepperStep::Error;
+                }
+            });
+        }
+    };
+    let stepper_to_approve = {
+        move |_| {
+            if let Some(state) = stepper.get_untracked().as_mut() {
+                state.step = StepperStep::Approve;
+                state.confirmed = false;
+            }
+        }
+    };
+    let stepper_back = {
+        move |_| {
+            if let Some(state) = stepper.get_untracked().as_mut() {
+                state.step = if state.install.is_some() {
+                    StepperStep::Done
+                } else if state.preview.is_some() {
+                    StepperStep::Preview
+                } else {
+                    StepperStep::Source
+                };
+                state.error = None;
+            }
+        }
+    };
+    let stepper_confirm = {
+        move |checked: bool| {
+            if let Some(state) = stepper.get_untracked().as_mut() {
+                state.confirmed = checked;
+            }
+        }
+    };
+    let stepper_install = {
+        move |_| {
+            let Some(current) = stepper.get_untracked() else {
+                return;
+            };
+            if !current.confirmed {
+                if let Some(state) = stepper.get_untracked().as_mut() {
+                    state.error =
+                        Some("Confirm that you reviewed the manifest before installing.".into());
+                }
+                return;
+            }
+            let Some(preview) = current.preview.clone() else {
+                return;
+            };
+            let source_uri = current.source_uri.clone();
+            let version = current.version.clone();
+            let workspace_id = current.workspace_id.clone();
+            if let Some(state) = stepper.get_untracked().as_mut() {
+                state.step = StepperStep::Installing;
+                state.phase = "Staging artifact...".into();
+                state.error = None;
+            }
+            let stepper = stepper;
+            spawn_local(async move {
+                // Staged progress labels while the synchronous install runs.
+                let labels = [
+                    "Staging artifact...",
+                    "Running sandbox self-test...",
+                    "Installing components...",
+                    "Finalizing...",
+                ];
+                for label in labels {
+                    if let Some(state) = stepper.get_untracked().as_mut()
+                        && state.step == StepperStep::Installing
+                    {
+                        state.phase = label.into();
+                    }
+                    wait_for_poll(300).await;
+                }
+                let request =
+                    Request::post("/api/v1/plugins/install").json(&PluginInstallRequest {
+                        source_type: "github_release",
+                        source_uri: &source_uri,
+                        version: version.as_deref(),
+                        expected_digest: &preview.source.digest,
+                        approve: true,
+                        workspace_id: workspace_id.as_deref(),
+                    });
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<InstallResponse>().await {
+                                Ok(installed) => {
+                                    if let Some(state) = stepper.get_untracked().as_mut() {
+                                        state.install = Some(installed);
+                                        state.step = StepperStep::Done;
+                                    }
+                                    Ok(())
+                                }
+                                Err(_) => Err("The install response was not valid.".to_owned()),
+                            }
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Plugin service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The install request could not be encoded.".to_owned()),
+                };
+                if let Err(error) = outcome
+                    && let Some(state) = stepper.get_untracked().as_mut()
+                {
+                    state.error = Some(error);
+                    state.step = StepperStep::Error;
+                }
+                load_library_list(all_books, status, None);
+                plugin_detail_tick.update(|tick| *tick = tick.wrapping_add(1));
+            });
+        }
+    };
+    let stepper_enable = {
+        move |_| {
+            let Some(installed) = stepper
+                .get_untracked()
+                .and_then(|state| state.install.clone())
+            else {
+                return;
+            };
+            if let Some(state) = stepper.get_untracked().as_mut() {
+                state.phase = "Enabling...".into();
+            }
+            let stepper = stepper;
+            spawn_local(async move {
+                let request = Request::patch(&format!("/api/v1/plugins/{}", installed.plugin_id))
+                    .json(&PatchPluginRequest {
+                        state: Some("enabled"),
+                        trust: None,
+                    });
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            if let Some(state) = stepper.get_untracked().as_mut() {
+                                state.step = StepperStep::Done;
+                                state.phase = "Enabled.".into();
+                            }
+                            Ok(())
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Plugin service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The enable request could not be encoded.".to_owned()),
+                };
+                if let Err(error) = outcome
+                    && let Some(state) = stepper.get_untracked().as_mut()
+                {
+                    state.error = Some(error);
+                    state.step = StepperStep::Error;
+                }
+                load_library_list(all_books, status, None);
+                plugin_detail_tick.update(|tick| *tick = tick.wrapping_add(1));
+            });
+        }
+    };
+
+    // ---- marketplace ----
+    let open_marketplace = {
+        move |_| {
+            marketplace_open.set(true);
+            marketplace_results.set(Vec::new());
+            marketplace_status.set("Search the marketplace to see installable plugins.".into());
+        }
+    };
+    let close_marketplace = move |_| marketplace_open.set(false);
+    let marketplace_search = {
+        move |event: leptos::ev::SubmitEvent| {
+            event.prevent_default();
+            let value = marketplace_query.get_untracked().trim().to_owned();
+            if value.is_empty() {
+                marketplace_status.set("Enter a marketplace query.".into());
+                return;
+            }
+            marketplace_loading.set(true);
+            marketplace_status.set("Searching the marketplace...".into());
+            let marketplace_results = marketplace_results;
+            let marketplace_status = marketplace_status;
+            let marketplace_loading = marketplace_loading;
+            spawn_local(async move {
+                let request = Request::post("/api/v1/plugins/search")
+                    .json(&PluginSearchRequest { query: &value });
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<Vec<MarketplaceResult>>().await {
+                                Ok(found) => {
+                                    marketplace_results.set(found);
+                                    Ok("Marketplace results loaded.".to_owned())
+                                }
+                                Err(_) => Err("The marketplace response was not valid.".to_owned()),
+                            }
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Marketplace service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The search request could not be encoded.".to_owned()),
+                };
+                marketplace_loading.set(false);
+                match outcome {
+                    Ok(message) => marketplace_status.set(message),
+                    Err(error) => marketplace_status.set(format!("Search failed: {error}")),
+                }
+            });
+        }
+    };
+    let marketplace_pick = {
+        move |result: MarketplaceResult| {
+            // The marketplace reports github_release sources
+            // (`github_release:owner/repo`); the server preview/install only
+            // accept `github_release`, so pass its URL + no pinned version
+            // (resolves the latest release).
+            open_stepper(Some(result.source_uri), None);
+            marketplace_open.set(false);
+        }
+    };
+
+    // ---- plugin detail ----
+    let open_plugin = { move |plugin_id: String| plugin_detail_id.set(Some(plugin_id)) };
+
+    let active_conv = active_conversation();
+
     view! {
-        <div class="page-heading">
-            <div><p class="utility">"GLOBAL CONTEXT / LIBRARY"</p><h1>"Books"</h1></div>
-            <span class="utility">{move || format!("{} RESULTS", books.get().len())}</span>
-        </div>
-        <form class="filter-row" on:submit=search>
-            <input placeholder="Lexical + semantic search" prop:value=move || query.get()
-                on:input=move |event| query.set(event_target_value(&event)) />
-            <button type="submit">"Search"</button>
-            <button type="button" on:click=move |_| { query.set(String::new()); load_books(books, status, None); }>"Reset"</button>
-            <button type="button" on:click=move |_| show_create.set(!show_create.get_untracked())>
-                {move || if show_create.get() { "Close form" } else { "Create book" }}
-            </button>
-        </form>
-        {move || show_create.get().then(|| view! {
-            <form class="model-form" on:submit=create_book>
-                <label>"Title"<input required maxlength="500" prop:value=move || create_title.get() on:input=move |event| create_title.set(event_target_value(&event)) /></label>
-                <label class="fallback-field">"Body"
-                    <textarea rows="8" maxlength="100000" placeholder="Book contents" prop:value=move || create_body.get() on:input=move |event| create_body.set(event_target_value(&event))></textarea>
-                </label>
-                <div>
-                    <button class="primary" type="submit">"Create"</button>
-                </div>
-                <p class="form-note">{move || create_status.get()}</p>
-            </form>
-        })}
-        <p class="form-note">{move || status.get()}</p>
-        <div class="index-table" role="table">
-            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"PROVENANCE"</span><span>"RETRIEVAL"</span></div>
-            {move || books.get().into_iter().map(|book| {
-                let short_id = book.id.chars().take(8).collect::<String>();
-                let book_id = book.id.clone();
-                view! { <div class="index-row" role="row">
-                    <span class="spine-cell">{short_id}</span>
-                    <button class="text-button" on:click=move |_| open_book(book_id.clone())>{format!("{} / {}", book.title, book.book_type)}</button>
-                    <span>{format!("{} · {}", book.provenance, book.trust)}</span>
-                    <span>{book.retrieval_mode.to_uppercase()}</span>
-                </div> }
-            }).collect_view()}
-        </div>
-        {move || if let Some(detail) = selected.get() {
-            let revision = detail.revision;
-            let book_type = detail.book_type.clone();
+        {move || plugin_detail_id.get().map(|plugin_id| {
+            let plugin_id = plugin_id.clone();
+            let on_back: std::sync::Arc<dyn Fn() + Send + Sync + 'static> = {
+                std::sync::Arc::new(move || plugin_detail_id.set(None))
+            };
+            let on_upgrade_done: std::sync::Arc<dyn Fn() + Send + Sync + 'static> = {
+                std::sync::Arc::new(move || plugin_detail_tick.update(|tick| *tick = tick.wrapping_add(1)))
+            };
+            let on_changed: std::sync::Arc<dyn Fn() + Send + Sync + 'static> =
+                std::sync::Arc::new(refresh);
             view! {
-                <section class="model-section">
-                    <div class="section-heading"><div><p class="utility">"BOOK / DETAIL"</p><h2>{format!("{} · rev {}", detail.title, revision)}</h2></div>
-                        <span class="spine-cell">{book_type}</span></div>
-                    <form class="model-form" on:submit=save_book>
-                        <label>"Title"<input required maxlength="500" prop:value=move || edit_title.get() on:input=move |event| edit_title.set(event_target_value(&event)) /></label>
-                        <label class="fallback-field">"Body"
-                            <textarea rows="16" required maxlength="100000" prop:value=move || edit_body.get() on:input=move |event| edit_body.set(event_target_value(&event))></textarea>
-                        </label>
-                        <div>
-                            <button class="primary" type="submit">"Save changes"</button>
-                            <button class="text-button" type="button" on:click=move |_| { selected.set(None); }>"Close"</button>
+                <PluginDetailView plugin_id=plugin_id on_back on_upgrade_done on_changed />
+            }.into_any()
+        })}
+        {move || if plugin_detail_id.get().is_none() && marketplace_open.get() {
+            view! {
+                <div class="page-heading">
+                    <div><p class="utility">"CONNECT / PLUGIN MARKETPLACE"</p><h1>"Marketplace"</h1></div>
+                    <button class="text-button" on:click=close_marketplace>"← Back to Library"</button>
+                </div>
+                <form class="filter-row" on:submit=marketplace_search>
+                    <input placeholder="Search plugins (e.g. mcp-server, claude, tools)" prop:value=move || marketplace_query.get()
+                        on:input=move |event| marketplace_query.set(event_target_value(&event)) />
+                    <button type="submit" disabled=move || marketplace_loading.get()>
+                        {move || if marketplace_loading.get() { "Searching..." } else { "Search" }}
+                    </button>
+                </form>
+                <p class="form-note">{move || marketplace_status.get()}</p>
+                <div class="book-grid">
+                    {move || marketplace_results.get().into_iter().map(|result| {
+                        let result_clone = result.clone();
+                        let pick = marketplace_pick;
+                        view! {
+                            <article class="book-card">
+                                <div class="book-card-head">
+                                    <strong>{result.name}</strong>
+                                    <span class="kind-badge plugin">"PLUGIN"</span>
+                                </div>
+                                <p>{result.description}</p>
+                                <div class="book-card-meta">
+                                    <span class="spine-cell">{result.publisher}</span>
+                                    <span class="cap-chip">{result.version}</span>
+                                    <span class="cap-chip">{format!("{} downloads", result.popularity)}</span>
+                                    <span class="trust-badge untrusted">"UNTRUSTED"</span>
+                                </div>
+                                <button class="text-button" on:click=move |_| pick(result_clone.clone())>"Preview & install →"</button>
+                            </article>
+                        }
+                    }).collect_view()}
+                </div>
+            }.into_any()
+        } else if plugin_detail_id.get().is_none() {
+            view! {
+                <div class="page-heading">
+                    <div><p class="utility">"GLOBAL CONTEXT / LIBRARY"</p><h1>"Library"</h1></div>
+                    <span class="utility">{move || format!("{} RESULTS", visible_book_count(all_books, search_hits, filter))}</span>
+                </div>
+                <div class="library-toolbar">
+                    <div class="kind-tabs" role="tablist" aria-label="Library kind filter">
+                        {[LibraryFilter::All, LibraryFilter::Source, LibraryFilter::Skill, LibraryFilter::Plugin, LibraryFilter::Mcp]
+                            .into_iter().map(|candidate| {
+                                view! {
+                                    <button class:active=move || filter.get() == candidate
+                                        role="tab" aria-selected=move || filter.get() == candidate
+                                        on:click=move |_| set_filter(candidate)>
+                                        {candidate.label()}
+                                    </button>
+                                }
+                            }).collect_view()}
+                    </div>
+                    <div class="library-actions">
+                        <button class="text-button" on:click=move |_| page.set(Page::Autobiography)>"Autobiography →"</button>
+                        <button class="text-button" on:click=open_marketplace>"Browse marketplace"</button>
+                        <div class="new-menu">
+                            <button class="secondary" on:click=move |_| new_menu.set(!new_menu.get_untracked())>"New ▾"</button>
+                            {move || new_menu.get().then(|| view! {
+                                <div class="new-menu-list">
+                                    <button type="button" on:click=move |_| { new_menu.set(false); new_form.set(Some("source")); }>"New Source Book"</button>
+                                    <button type="button" on:click=move |_| { new_menu.set(false); new_form.set(Some("skill")); }>"New Skill"</button>
+                                    <button type="button" on:click=move |_| { new_menu.set(false); new_form.set(Some("mcp")); }>"New MCP Server"</button>
+                                    <button type="button" on:click=move |_| { new_menu.set(false); open_stepper(None, None); }>"Install Plugin"</button>
+                                </div>
+                            })}
                         </div>
-                    </form>
-                    <p class="form-note">{move || edit_status.get()}</p>
-                </section>
+                    </div>
+                </div>
+                <form class="filter-row" on:submit=run_search>
+                    <input placeholder="Lexical + semantic search across all kinds" prop:value=move || query.get()
+                        on:input=move |event| query.set(event_target_value(&event)) />
+                    <button type="submit">"Search"</button>
+                    <button type="button" on:click=move |_| refresh()>"Reset"</button>
+                </form>
+                <p class="form-note">{move || status.get()}</p>
+                {move || new_form.get().map(|form| {
+                    view! {
+                        <section class="model-section">
+                            <div class="section-heading">
+                                <div><p class="utility">"LIBRARY / NEW"</p><h2>{
+                                    match form { "source" => "New Source Book", "skill" => "New Skill", _ => "New MCP Server" }
+                                }</h2></div>
+                                <button class="text-button" on:click=move |_| new_form.set(None)>"Close"</button>
+                            </div>
+                            {if form == "source" {
+                                view! {
+                                    <form class="model-form" on:submit=create_book>
+                                        <label>"Title"<input required maxlength="500" prop:value=move || create_title.get() on:input=move |event| create_title.set(event_target_value(&event)) /></label>
+                                        <label>"Tags (comma separated)"<input maxlength="500" placeholder="tag1, tag2" prop:value=move || create_tags.get() on:input=move |event| create_tags.set(event_target_value(&event)) /></label>
+                                        <label>"Scope"
+                                            <select prop:value=move || create_scope.get()
+                                                on:change=move |event| create_scope.set(event_target_value(&event))>
+                                                <option value="PROFILE">"PROFILE"</option>
+                                                <option value="USER">"USER"</option>
+                                                <option value="PRIVATE">"PRIVATE"</option>
+                                                <option value="WORKSPACE">"WORKSPACE"</option>
+                                            </select>
+                                        </label>
+                                        <label class="fallback-field">"Body"
+                                            <textarea rows="8" maxlength="100000" placeholder="Book contents" prop:value=move || create_body.get() on:input=move |event| create_body.set(event_target_value(&event))></textarea>
+                                        </label>
+                                        <div>
+                                            <button class="primary" type="submit" disabled=move || creating.get()>
+                                                {move || if creating.get() { "Creating..." } else { "Create source book" }}
+                                            </button>
+                                        </div>
+                                        <p class="form-note">{move || create_status.get()}</p>
+                                    </form>
+                                }.into_any()
+                            } else if form == "skill" {
+                                view! {
+                                    <form class="model-form" on:submit=create_skill>
+                                        <label>"Name"<input required maxlength="200" prop:value=move || skill_name.get() on:input=move |event| skill_name.set(event_target_value(&event)) /></label>
+                                        <label class="fallback-field">"Description"
+                                            <input maxlength="10000" placeholder="What the skill does" prop:value=move || skill_description.get() on:input=move |event| skill_description.set(event_target_value(&event)) />
+                                        </label>
+                                        <label class="fallback-field">"Instructions (content)"
+                                            <textarea rows="10" maxlength="100000" placeholder="Procedure content for the first revision" prop:value=move || skill_content.get() on:input=move |event| skill_content.set(event_target_value(&event))></textarea>
+                                        </label>
+                                        <div>
+                                            <button class="primary" type="submit" disabled=move || skill_creating.get()>
+                                                {move || if skill_creating.get() { "Creating..." } else { "Create skill" }}
+                                            </button>
+                                        </div>
+                                        <p class="form-note">{move || skill_status.get()}</p>
+                                    </form>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <form class="model-form" on:submit=create_mcp>
+                                        <label>"Name"<input required maxlength="200" prop:value=move || mcp_name.get() on:input=move |event| mcp_name.set(event_target_value(&event)) /></label>
+                                        <label>"Transport"
+                                            <select prop:value=move || mcp_transport.get()
+                                                on:change=move |event| mcp_transport.set(event_target_value(&event))>
+                                                <option value="stdio">"stdio"</option>
+                                                <option value="streamable_http">"streamable_http"</option>
+                                            </select>
+                                        </label>
+                                        <label class="fallback-field">"Configuration (JSON)"
+                                            <textarea rows="8" placeholder="{\"command\": \"npx\", \"args\": [\"-y\", \"@modelcontextprotocol/server-filesystem\"]}" prop:value=move || mcp_configuration.get() on:input=move |event| mcp_configuration.set(event_target_value(&event))></textarea>
+                                        </label>
+                                        <div>
+                                            <button class="primary" type="submit" disabled=move || mcp_creating.get()>
+                                                {move || if mcp_creating.get() { "Creating..." } else { "Create MCP server" }}
+                                            </button>
+                                        </div>
+                                        <p class="form-note">{move || mcp_status.get()}</p>
+                                    </form>
+                                }.into_any()
+                            }}
+                        </section>
+                    }.into_any()
+                })}
+                <p class="form-note">{move || load_status.get()}</p>
+                <div class="book-grid">
+                    {move || {
+                        let kind_filter = filter.get();
+                        let list = match search_hits.get() {
+                            Some(hits) => hits,
+                            None => all_books.get().into_iter().filter(|book| kind_filter.matches(&book.kind)).collect::<Vec<_>>(),
+                        };
+                        list.into_iter().map(|book| {
+                            let open_id = book.id.clone();
+                            let pin_id = book.id.clone();
+                            let kind_label = book.kind.clone().unwrap_or_else(|| "SOURCE".into());
+                            let kind_class = kind_label.to_lowercase();
+                            let trust_class = book.trust.to_lowercase();
+                            let conversation_id = active_conv.get().map(|c| c.id.clone());
+                            view! {
+                                <article class="book-card">
+                                    <div class="book-card-head">
+                                        <span class=format!("kind-badge {}", kind_class)>{kind_label}</span>
+                                        <strong>{book.title}</strong>
+                                        <span class=format!("trust-badge {}", trust_class)>{book.trust}</span>
+                                    </div>
+                                    <p class="book-snippet">{book.snippet}</p>
+                                    <div class="book-card-meta">
+                                        {book.tags.iter().take(4).map(|tag| view! { <span class="cap-chip">{tag.clone()}</span> }).collect_view()}
+                                        {book.capabilities.iter().take(4).map(|cap| view! { <span class="cap-chip">{cap.clone()}</span> }).collect_view()}
+                                    </div>
+                                    <div class="book-card-actions">
+                                        <button class="text-button" on:click=move |_| open_book(open_id.clone())>"Open detail"</button>
+                                        {if let Some(current_conversation) = conversation_id.clone() {
+                                            view! {
+                                                <button class="text-button" on:click=move |_| pin_book(pin_id.clone())>
+                                                    {format!("Pin to {}", &current_conversation[..8.min(current_conversation.len())])}
+                                                </button>
+                                            }.into_any()
+                                        } else {
+                                            view! { <span class="utility">"NO CONVERSATION"</span> }.into_any()
+                                        }}
+                                    </div>
+                                </article>
+                            }
+                        }).collect_view()
+                    }}
+                </div>
+                {move || loaded.get().map(|book| {
+                    let close = move |_| loaded.set(None);
+                    view! {
+                        <section class="model-section book-detail">
+                            <div class="section-heading">
+                                <div><p class="utility">"LIBRARY / DETAIL"</p><h2>{book.title.clone()}</h2></div>
+                                <div>
+                                    <span class="spine-cell">{book.kind.clone().unwrap_or_else(|| "SOURCE".into())}</span>
+                                    <button class="text-button" on:click=close>"Close"</button>
+                                </div>
+                            </div>
+                            <LoadedBookDetail book=book.clone() on_open_plugin=open_plugin />
+                        </section>
+                    }.into_any()
+                })}
             }.into_any()
         } else {
             view! { <span class="utility"></span> }.into_any()
+        }}
+        {move || stepper.get().map(|state| {
+            let state = state.clone();
+            let close = close_stepper;
+            let preview = stepper_preview;
+            let to_approve = stepper_to_approve;
+            let back = stepper_back;
+            let confirm = stepper_confirm;
+            let install = stepper_install;
+            let enable = stepper_enable;
+            view! {
+                <div class="modal-backdrop" role="presentation">
+                    <section class="modal" role="dialog" aria-modal="true" aria-label="Install plugin">
+                        <div class="modal-head">
+                            <p class="utility">"PLUGIN INSTALL / STEPPER"</p>
+                            <button class="text-button" on:click=close>"Close"</button>
+                        </div>
+                        {match state.step {
+                            StepperStep::Source => view! {
+                                <>
+                                    <div class="stepper-step"><span class="utility">"STEP 1 / 4 · SOURCE"</span></div>
+                                    <label>"GitHub source"
+                                        <input required maxlength="2048" placeholder="https://github.com/owner/repo or owner/repo"
+                                            prop:value=move || stepper_source.get()
+                                            on:input=move |event| stepper_source.set(event_target_value(&event)) />
+                                    </label>
+                                    <label>"Version (optional, defaults to the latest release)"
+                                        <input maxlength="64" placeholder="1.2.3" prop:value=move || stepper_version.get()
+                                            on:input=move |event| stepper_version.set(event_target_value(&event)) />
+                                    </label>
+                                    <label>"Install into workspace (optional; profile scope requires an OWNER/ADMIN role)"
+                                        <select prop:value=move || stepper_workspace.get()
+                                            on:change=move |event| stepper_workspace.set(event_target_value(&event))>
+                                            <option value="">"Profile scope"</option>
+                                            {workspaces.get().into_iter().map(|ws| {
+                                                let id = ws.id.clone();
+                                                let title = ws.title.clone();
+                                                view! { <option value=id>{title}</option> }
+                                            }).collect_view()}
+                                        </select>
+                                    </label>
+                                    {state.error.clone().map(|error| view! { <p class="form-note error-note">{error}</p> })}
+                                    <div class="stepper-actions">
+                                        <button class="secondary" type="button" on:click=close>"Cancel"</button>
+                                        <button class="primary" type="button" on:click=preview>"Preview manifest"</button>
+                                    </div>
+                                </>
+                            }.into_any(),
+                            StepperStep::Previewing => view! {
+                                <div class="stepper-loading">
+                                    <p class="utility">"STEP 2 / 4 · RESOLVING MANIFEST"</p>
+                                    <p>"Fetching and validating the plugin manifest..."</p>
+                                </div>
+                            }.into_any(),
+                            StepperStep::Preview => view! {
+                                <>
+                                    <div class="stepper-step"><span class="utility">"STEP 2 / 4 · MANIFEST PREVIEW"</span></div>
+                                    {state.preview.clone().map(|preview| {
+                                        view! {
+                                            <ManifestPreview preview=preview.clone() />
+                                        }
+                                    })}
+                                    {state.error.clone().map(|error| view! { <p class="form-note error-note">{error}</p> })}
+                                    <div class="stepper-actions">
+                                        <button class="secondary" type="button" on:click=back>"Back"</button>
+                                        <button class="primary" type="button" on:click=to_approve>"Review approval →"</button>
+                                    </div>
+                                </>
+                            }.into_any(),
+                            StepperStep::Approve => view! {
+                                <>
+                                    <div class="stepper-step"><span class="utility">"STEP 3 / 4 · APPROVAL"</span></div>
+                                    <p class="stepper-note">"Installing runs the plugin's self-test inside the sandbox (if declared) and grants the permission scope listed above. Permission values are references only — never secret material."</p>
+                                    {state.preview.clone().map(|preview| {
+                                        if preview.trust == "UNTRUSTED" {
+                                            view! { <p class="form-note error-note">"Unknown publisher — verify the source commit and digest before install."</p> }.into_any()
+                                        } else {
+                                            view! { <span></span> }.into_any()
+                                        }
+                                    })}
+                                    <label class="confirm-row">
+                                        <input type="checkbox" prop:checked=move || state.confirmed
+                                            on:change=move |event| confirm(event_target_checked(&event)) />
+                                        <span>"I reviewed the manifest and approve installing this plugin."</span>
+                                    </label>
+                                    {state.error.clone().map(|error| view! { <p class="form-note error-note">{error}</p> })}
+                                    <div class="stepper-actions">
+                                        <button class="secondary" type="button" on:click=back>"Back"</button>
+                                        <button class="primary" type="button" disabled=move || !state.confirmed on:click=install>"Approve & Install"</button>
+                                    </div>
+                                </>
+                            }.into_any(),
+                            StepperStep::Installing => view! {
+                                <div class="stepper-loading">
+                                    <p class="utility">"STEP 4 / 4 · INSTALLING"</p>
+                                    <p>{state.phase.clone()}</p>
+                                </div>
+                            }.into_any(),
+                            StepperStep::Done => view! {
+                                <>
+                                    <div class="stepper-step"><span class="utility">"INSTALLED · DORMANT"</span></div>
+                                    {state.install.clone().map(|installed| {
+                                        let installed = installed.clone();
+                                        view! {
+                                            <p class="stepper-note">"The plugin is installed and dormant: it cannot execute until enabled."</p>
+                                            <div class="index-table">
+                                                <div class="index-row"><span class="spine-cell">"PLUGIN"</span><span>{installed.plugin_id.clone()}</span></div>
+                                                <div class="index-row"><span class="spine-cell">"BOOK"</span><span>{installed.book_id.clone()}</span></div>
+                                                <div class="index-row"><span class="spine-cell">"STATE"</span><span>{installed.state.to_uppercase()}</span></div>
+                                                <div class="index-row"><span class="spine-cell">"TRUST"</span><span>{installed.trust}</span></div>
+                                            </div>
+                                            <div class="stepper-actions">
+                                                <button class="secondary" type="button" on:click=close>"Close"</button>
+                                                <button class="primary" type="button" on:click=enable>
+                                                    {move || if state.phase == "Enabling..." { "Enabling..." } else { "Enable" }}
+                                                </button>
+                                            </div>
+                                        }
+                                    })}
+                                </>
+                            }.into_any(),
+                            StepperStep::Error => view! {
+                                <>
+                                    <div class="stepper-step"><span class="utility">"INSTALL FAILED"</span></div>
+                                    {state.error.clone().map(|error| view! {
+                                        <div class="inline-error" role="alert">
+                                            <p>{error}</p>
+                                            <p class="form-note">"No changes were made. Fix the reported issue and preview again."</p>
+                                        </div>
+                                    })}
+                                    <div class="stepper-actions">
+                                        <button class="secondary" type="button" on:click=back>"Back"</button>
+                                        <button class="secondary" type="button" on:click=close>"Close"</button>
+                                    </div>
+                                </>
+                            }.into_any(),
+                        }}
+                    </section>
+                </div>
+            }.into_any()
+        })}
+    }
+}
+
+#[component]
+fn ManifestPreview(preview: PluginPreview) -> impl IntoView {
+    view! {
+        <div class="manifest-preview">
+            <div class="manifest-head">
+                <div>
+                    <h3>{format!("{} · {}", preview.name.clone(), preview.version.clone())}</h3>
+                    <p>{preview.description.clone()}</p>
+                </div>
+                <span class="trust-badge untrusted">"UNTRUSTED"</span>
+            </div>
+            <div class="index-table">
+                <div class="index-row"><span class="spine-cell">"PUBLISHER"</span><span>{preview.publisher.clone()}</span></div>
+                <div class="index-row"><span class="spine-cell">"SOURCE"</span><span>{preview.source.source_uri.clone()}</span></div>
+                <div class="index-row"><span class="spine-cell">"COMMIT"</span><span class="mono-break">{preview.source.commit_sha.clone().unwrap_or_else(|| "—".into())}</span></div>
+                <div class="index-row"><span class="spine-cell">"DIGEST"</span><span class="mono-break">{preview.source.digest.clone()}</span></div>
+                <div class="index-row"><span class="spine-cell">"NETWORK"</span><span>{preview.network_policy.clone()}</span></div>
+                {preview.self_test.clone().map(|test| view! {
+                    <div class="index-row"><span class="spine-cell">"SELF-TEST"</span><span>{format!("{} ({}s timeout)", test.command.join(" "), test.timeout)}</span></div>
+                })}
+            </div>
+            <p class="utility">"COMPONENTS"</p>
+            <div class="index-table">
+                {preview.components.iter().map(|component| {
+                    view! { <div class="index-row component-row">
+                        <span class="spine-cell">{component.component_type.to_uppercase()}</span>
+                        <strong>{component.name.clone()}</strong>
+                        <span>{component.component_ref.clone()}</span>
+                        <span>{component.description.clone().unwrap_or_default()}</span>
+                    </div> }
+                }).collect_view()}
+            </div>
+            <p class="utility">"PERMISSIONS (REFERENCES ONLY)"</p>
+            <div class="index-table">
+                {preview.permissions.iter().map(|permission| {
+                    view! { <div class="index-row component-row">
+                        <span class="spine-cell">{permission.domain.to_uppercase()}</span>
+                        <span>{permission.scope_value.clone()}</span>
+                        <span></span>
+                        <span></span>
+                    </div> }
+                }).collect_view()}
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn LoadedBookDetail(
+    book: LoadedBook,
+    on_open_plugin: impl Fn(String) + Clone + 'static,
+) -> impl IntoView {
+    let kind = book.kind.clone().unwrap_or_else(|| "SOURCE".into());
+    let open_plugin = on_open_plugin.clone();
+    view! {
+        {match kind.as_str() {
+            "SKILL" => view! {
+                <div class="book-detail-body">
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"NAME"</span><span>{book.name.clone().unwrap_or_default()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"REVISION"</span><span>{format!("rev {}", book.revision)}</span></div>
+                        <div class="index-row"><span class="spine-cell">"PROMOTED"</span><span>{if book.promoted.unwrap_or(false) { "YES" } else { "NO" }}</span></div>
+                    </div>
+                    <p class="utility">"INSTRUCTIONS"</p>
+                    <pre>{book.content.clone().unwrap_or_default()}</pre>
+                </div>
+            }.into_any(),
+            "MCP" => view! {
+                <div class="book-detail-body">
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"NAME"</span><span>{book.name.clone().unwrap_or_default()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"TRANSPORT"</span><span>{book.transport.clone().unwrap_or_default().to_uppercase()}</span></div>
+                    </div>
+                    <p class="utility">"DISCOVERED TOOLS"</p>
+                    <div class="index-table">
+                        {book.tools.iter().map(|tool| {
+                            view! { <div class="index-row component-row">
+                                <span class="spine-cell">"TOOL"</span>
+                                <strong>{tool.name.clone()}</strong>
+                                <span>{tool.description.clone()}</span>
+                                <span></span>
+                            </div> }
+                        }).collect_view()}
+                    </div>
+                </div>
+            }.into_any(),
+            "PLUGIN" => view! {
+                <div class="book-detail-body">
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"NAME"</span><span>{book.name.clone().unwrap_or_default()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"VERSION"</span><span>{book.version.clone().unwrap_or_default()}</span></div>
+                    </div>
+                    <p class="utility">"COMPONENTS"</p>
+                    <div class="index-table">
+                        {book.components.iter().map(|component| {
+                            view! { <div class="index-row component-row">
+                                <span class="spine-cell">{component.component_type.to_uppercase()}</span>
+                                <strong>{component.name.clone()}</strong>
+                                <span>{component.component_ref.clone()}</span>
+                                <span>{component.description.clone().unwrap_or_default()}</span>
+                            </div> }
+                        }).collect_view()}
+                    </div>
+                    {book.plugin_id.clone().map(|plugin_id| {
+                        let open_plugin = open_plugin.clone();
+                        view! { <button class="primary" type="button" on:click=move |_| open_plugin(plugin_id.clone())>"Manage plugin →"</button> }
+                    })}
+                </div>
+            }.into_any(),
+            "AUTOBIOGRAPHY" => view! {
+                <div class="book-detail-body">
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"REVISION"</span><span>{format!("rev {}", book.revision)}</span></div>
+                    </div>
+                    <pre>{book.body.clone().unwrap_or_default()}</pre>
+                </div>
+            }.into_any(),
+            _ => view! {
+                <div class="book-detail-body">
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"KIND"</span><span>{kind.clone()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"REVISION"</span><span>{format!("rev {}", book.revision)}</span></div>
+                    </div>
+                    <pre>{book.body.clone().unwrap_or_default()}</pre>
+                </div>
+            }.into_any(),
+        }}
+    }
+}
+
+#[component]
+fn PluginDetailView(
+    plugin_id: String,
+    on_back: Arc<dyn Fn() + Send + Sync + 'static>,
+    on_upgrade_done: Arc<dyn Fn() + Send + Sync + 'static>,
+    on_changed: Arc<dyn Fn() + Send + Sync + 'static>,
+) -> impl IntoView {
+    let detail = RwSignal::new(None::<PluginDetail>);
+    let status = RwSignal::new(String::new());
+    let loading = RwSignal::new(true);
+    let busy = RwSignal::new(false);
+    let upgrade_open = RwSignal::new(false);
+    let upgrade_version = RwSignal::new(String::new());
+    let upgrade_diff = RwSignal::new(None::<UpgradeDiff>);
+    let upgrade_status = RwSignal::new(String::new());
+    let upgrade_busy = RwSignal::new(false);
+    let uninstall_armed = RwSignal::new(false);
+
+    let load = {
+        let plugin_id = plugin_id.clone();
+        move |_| {
+            loading.set(true);
+            let plugin_id = plugin_id.clone();
+            let detail = detail;
+            let status = status;
+            let loading = loading;
+            spawn_local(async move {
+                match Request::get(&format!("/api/v1/plugins/{plugin_id}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.ok() => match response.json::<PluginDetail>().await {
+                        Ok(found) => {
+                            detail.set(Some(found));
+                            status.set(String::new());
+                        }
+                        Err(_) => status.set("Plugin response was not valid.".into()),
+                    },
+                    Ok(response) => status.set(format!(
+                        "Plugin request failed: {}",
+                        api_error(&response).await
+                    )),
+                    Err(_) => status.set("Plugin service did not answer.".into()),
+                }
+                loading.set(false);
+            });
+        }
+    };
+    load(());
+
+    let set_state = {
+        let on_changed = on_changed.clone();
+        let load = load.clone();
+        move |next_state: &'static str| {
+            let Some(current) = detail.get_untracked() else {
+                return;
+            };
+            let plugin_id = current.id.clone();
+            busy.set(true);
+            status.set(if next_state == "enabled" {
+                "Enabling...".into()
+            } else {
+                "Disabling...".into()
+            });
+            let on_changed = on_changed.clone();
+            let load = load.clone();
+            spawn_local(async move {
+                let request = Request::patch(&format!("/api/v1/plugins/{plugin_id}")).json(
+                    &PatchPluginRequest {
+                        state: Some(next_state),
+                        trust: None,
+                    },
+                );
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            on_changed();
+                            if next_state == "enabled" {
+                                "Plugin enabled.".into()
+                            } else {
+                                "Plugin disabled.".into()
+                            }
+                        }
+                        Ok(response) => {
+                            format!("Update rejected: {}", api_error(&response).await)
+                        }
+                        Err(_) => "Plugin service did not answer.".into(),
+                    },
+                    Err(_) => "The update request could not be encoded.".into(),
+                };
+                status.set(outcome);
+                busy.set(false);
+                load(());
+            });
+        }
+    };
+
+    let start_upgrade = {
+        move |_| {
+            upgrade_open.set(true);
+            upgrade_diff.set(None);
+            upgrade_status.set(String::new());
+            upgrade_version.set(String::new());
+        }
+    };
+    let cancel_upgrade = {
+        move |_: leptos::ev::MouseEvent| {
+            upgrade_open.set(false);
+            upgrade_diff.set(None);
+        }
+    };
+    let stage_upgrade = {
+        move |event: leptos::ev::SubmitEvent| {
+            event.prevent_default();
+            let version = upgrade_version.get_untracked().trim().to_owned();
+            if version.is_empty() {
+                upgrade_status.set("Enter the target version.".into());
+                return;
+            }
+            let Some(current) = detail.get_untracked() else {
+                return;
+            };
+            let plugin_id = current.id.clone();
+            upgrade_busy.set(true);
+            upgrade_status.set("Staging upgrade and computing the diff...".into());
+            let upgrade_diff = upgrade_diff;
+            let upgrade_status = upgrade_status;
+            let upgrade_busy = upgrade_busy;
+            spawn_local(async move {
+                let request = Request::post(&format!("/api/v1/plugins/{plugin_id}/upgrade"))
+                    .json(&PluginUpgradeRequest { version: &version });
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => match response.json::<UpgradeDiff>().await
+                        {
+                            Ok(diff) => {
+                                upgrade_diff.set(Some(diff));
+                                Ok("Review the diff below before activating.".to_owned())
+                            }
+                            Err(_) => Err("The upgrade response was not valid.".to_owned()),
+                        },
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Plugin service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The upgrade request could not be encoded.".to_owned()),
+                };
+                upgrade_busy.set(false);
+                match outcome {
+                    Ok(message) => upgrade_status.set(message),
+                    Err(error) => upgrade_status.set(format!("Upgrade staging failed: {error}")),
+                }
+            });
+        }
+    };
+    let activate_upgrade = {
+        let on_upgrade_done = on_upgrade_done.clone();
+        let load = load.clone();
+        move |_| {
+            let Some(current) = detail.get_untracked() else {
+                return;
+            };
+            let Some(diff) = upgrade_diff.get_untracked() else {
+                return;
+            };
+            let plugin_id = current.id.clone();
+            let version = diff.new_version.clone();
+            upgrade_busy.set(true);
+            upgrade_status.set("Running self-test and activating...".into());
+            let on_upgrade_done = on_upgrade_done.clone();
+            let load = load.clone();
+            let upgrade_open = upgrade_open;
+            let upgrade_diff = upgrade_diff;
+            spawn_local(async move {
+                let request = Request::post(&format!(
+                    "/api/v1/plugins/{plugin_id}/upgrade/{version}/activate"
+                ))
+                .send();
+                let outcome = match request.await {
+                    Ok(response) if response.ok() => {
+                        on_upgrade_done();
+                        upgrade_open.set(false);
+                        upgrade_diff.set(None);
+                        load(());
+                        Ok("Upgrade activated.".to_owned())
+                    }
+                    Ok(response) => Err(api_error(&response).await),
+                    Err(_) => Err("Plugin service did not answer.".to_owned()),
+                };
+                upgrade_busy.set(false);
+                match outcome {
+                    Ok(message) => upgrade_status.set(message),
+                    Err(error) => upgrade_status.set(format!("Activation failed: {error}")),
+                }
+            });
+        }
+    };
+    let rollback = {
+        let on_changed = on_changed.clone();
+        let load = load.clone();
+        move |_| {
+            let Some(current) = detail.get_untracked() else {
+                return;
+            };
+            let plugin_id = current.id.clone();
+            busy.set(true);
+            status.set("Rolling back to the previous version...".into());
+            let on_changed = on_changed.clone();
+            let load = load.clone();
+            spawn_local(async move {
+                let request = Request::post(&format!("/api/v1/plugins/{plugin_id}/rollback"));
+                let outcome = match request.send().await {
+                    Ok(response) if response.ok() => {
+                        on_changed();
+                        Ok("Rolled back to the previous version.".to_owned())
+                    }
+                    Ok(response) => Err(api_error(&response).await),
+                    Err(_) => Err("Plugin service did not answer.".to_owned()),
+                };
+                busy.set(false);
+                match outcome {
+                    Ok(message) => status.set(message),
+                    Err(error) => status.set(format!("Rollback failed: {error}")),
+                }
+                load(());
+            });
+        }
+    };
+    let uninstall = {
+        let on_changed = on_changed.clone();
+        let on_back = on_back.clone();
+        move |_| {
+            if !uninstall_armed.get_untracked() {
+                uninstall_armed.set(true);
+                status.set("Click Uninstall again to confirm removal.".into());
+                return;
+            }
+            let Some(current) = detail.get_untracked() else {
+                return;
+            };
+            let plugin_id = current.id.clone();
+            busy.set(true);
+            status.set("Uninstalling...".into());
+            let on_changed = on_changed.clone();
+            let on_back = on_back.clone();
+            spawn_local(async move {
+                let outcome = match Request::delete(&format!("/api/v1/plugins/{plugin_id}"))
+                    .send()
+                    .await
+                {
+                    Ok(response) if response.ok() => {
+                        on_changed();
+                        on_back();
+                        Ok(())
+                    }
+                    Ok(response) => Err(api_error(&response).await),
+                    Err(_) => Err("Plugin service did not answer.".to_owned()),
+                };
+                if let Err(error) = outcome {
+                    status.set(format!("Uninstall failed: {error}"));
+                    busy.set(false);
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"CONNECT / PLUGIN"</p><h1>{move || detail.get().map_or_else(|| "Plugin".into(), |plugin| plugin.name.clone())}</h1></div>
+            <button class="text-button" on:click=move |_| on_back()>"← Back to Library"</button>
+        </div>
+        <p class="form-note">{move || status.get()}</p>
+        {move || if loading.get() {
+            view! { <div class="stepper-loading"><p>"Loading plugin detail..."</p></div> }.into_any()
+        } else if let Some(plugin) = detail.get() {
+            let plugin = plugin.clone();
+            let set_state = set_state.clone();
+            let rollback = rollback.clone();
+            let uninstall = uninstall.clone();
+            let activate_upgrade = activate_upgrade.clone();
+            let has_previous = plugin.installations.iter().filter(|install| install.status == "active").count() >= 2;
+            view! {
+                <div class="manifest-preview">
+                    <div class="manifest-head">
+                        <div>
+                            <h3>{format!("{} · {}", plugin.name.clone(), plugin.version.clone())}</h3>
+                            <p>{plugin.description.clone()}</p>
+                        </div>
+                        <span class=format!("state-badge {}", plugin.state.to_lowercase())>{plugin.state.to_uppercase()}</span>
+                    </div>
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"ID"</span><span>{plugin.id.clone()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"PUBLISHER"</span><span>{plugin.publisher.clone().unwrap_or_else(|| "—".into())}</span></div>
+                        <div class="index-row"><span class="spine-cell">"TRUST"</span><span>{plugin.trust.clone()}{if plugin.verified { " · VERIFIED SIGNATURE" } else { "" }}</span></div>
+                        <div class="index-row"><span class="spine-cell">"SOURCE"</span><span>{plugin.source_uri.clone()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"COMMIT"</span><span class="mono-break">{plugin.commit_sha.clone().unwrap_or_else(|| "—".into())}</span></div>
+                        <div class="index-row"><span class="spine-cell">"DIGEST"</span><span class="mono-break">{plugin.artifact_digest.clone().unwrap_or_else(|| "—".into())}</span></div>
+                        <div class="index-row"><span class="spine-cell">"NETWORK"</span><span>{plugin.network_policy.clone()}</span></div>
+                    </div>
+                    <p class="utility">"COMPONENTS"</p>
+                    <div class="index-table">
+                        {plugin.components.iter().map(|component| {
+                            view! { <div class="index-row component-row">
+                                <span class="spine-cell">{component.component_type.to_uppercase()}</span>
+                                <strong>{component.name.clone()}</strong>
+                                <span>{component.manifest_ref.clone()}</span>
+                                <span>{component.metadata.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_owned()}</span>
+                            </div> }
+                        }).collect_view()}
+                    </div>
+                    <p class="utility">"PERMISSIONS (REFERENCES ONLY)"</p>
+                    <div class="index-table">
+                        {plugin.permissions.iter().map(|permission| {
+                            view! { <div class="index-row component-row">
+                                <span class="spine-cell">{permission.domain.to_uppercase()}</span>
+                                <span>{permission.scope_value.clone()}</span>
+                                <span></span><span></span>
+                            </div> }
+                        }).collect_view()}
+                    </div>
+                    <p class="utility">"INSTALLATION HISTORY"</p>
+                    <div class="index-table">
+                        <div class="index-row header" role="row"><span>"VERSION"</span><span>"STATUS"</span><span>"INSTALLED"</span><span>"ACTIVATED"</span></div>
+                        {plugin.installations.iter().map(|install| {
+                            view! { <div class="index-row component-row">
+                                <strong>{install.version.clone()}</strong>
+                                <span>{install.status.to_uppercase()}</span>
+                                <span>{install.installed_at.clone().unwrap_or_else(|| "—".into())}</span>
+                                <span>{install.activated_at.clone().unwrap_or_else(|| "—".into())}</span>
+                            </div> }
+                        }).collect_view()}
+                    </div>
+                    <div class="stepper-actions">
+                        {if plugin.state == "enabled" {
+                            view! { <button class="secondary" type="button" disabled=move || busy.get() on:click=move |_| set_state("dormant")>"Disable"</button> }.into_any()
+                        } else {
+                            view! { <button class="primary" type="button" disabled=move || busy.get() on:click=move |_| set_state("enabled")>"Enable"</button> }.into_any()
+                        }}
+                        <button class="secondary" type="button" on:click=start_upgrade>"Upgrade"</button>
+                        <button class="secondary" type="button" disabled=move || busy.get() || !has_previous on:click=rollback>"Rollback"</button>
+                        <button class="secondary danger" type="button" disabled=move || busy.get() on:click=uninstall>
+                            {move || if uninstall_armed.get() { "Confirm uninstall" } else { "Uninstall" }}
+                        </button>
+                    </div>
+                </div>
+                {move || upgrade_open.get().then(|| {
+                    let activate_upgrade = activate_upgrade.clone();
+                    view! {
+                        <section class="model-section">
+                            <div class="section-heading">
+                                <div><p class="utility">"PLUGIN / UPGRADE"</p><h2>"Staged upgrade"</h2></div>
+                                <button class="text-button" on:click=cancel_upgrade>"Close"</button>
+                            </div>
+                            {move || upgrade_diff.get().map_or_else(
+                                || view! {
+                                    <form class="filter-row" on:submit=stage_upgrade>
+                                        <input required maxlength="64" placeholder="Target version (e.g. 1.4.0)" prop:value=move || upgrade_version.get()
+                                            on:input=move |event| upgrade_version.set(event_target_value(&event)) />
+                                        <button type="submit" class="primary" disabled=move || upgrade_busy.get()>
+                                            {move || if upgrade_busy.get() { "Staging..." } else { "Stage upgrade" }}
+                                        </button>
+                                    </form>
+                                }.into_any(),
+                                |diff| {
+                                    let diff = diff.clone();
+                                    let activate_upgrade = activate_upgrade.clone();
+                                    view! {
+                                        <div class="upgrade-diff">
+                                            <div class="index-table">
+                                                <div class="index-row"><span class="spine-cell">"CURRENT"</span><span>{diff.current_version.clone()}</span></div>
+                                                <div class="index-row"><span class="spine-cell">"TARGET"</span><span>{diff.new_version.clone()}</span></div>
+                                                <div class="index-row"><span class="spine-cell">"DIGEST"</span><span class="mono-break">{diff.artifact_digest.clone()}</span></div>
+                                                <div class="index-row"><span class="spine-cell">"COMMIT"</span><span class="mono-break">{diff.commit_sha.clone().unwrap_or_else(|| "—".into())}</span></div>
+                                            </div>
+                                            <p class="utility">"PERMISSION DIFF"</p>
+                                            <div class="diff-grid">
+                                                <div><strong class="diff-added">"ADDED"</strong>
+                                                    {diff.permissions.added.iter().map(|permission| view! { <div class="diff-line">{format!("{} → {}", permission.domain.to_uppercase(), permission.scope_value)}</div> }).collect_view()}
+                                                </div>
+                                                <div><strong class="diff-removed">"REMOVED"</strong>
+                                                    {diff.permissions.removed.iter().map(|permission| view! { <div class="diff-line">{format!("{} → {}", permission.domain.to_uppercase(), permission.scope_value)}</div> }).collect_view()}
+                                                </div>
+                                            </div>
+                                            <p class="utility">"CAPABILITY DIFF"</p>
+                                            <div class="diff-grid">
+                                                <div><strong class="diff-added">"ADDED"</strong>
+                                                    {diff.capabilities.added.iter().map(|name| view! { <div class="diff-line">{name.clone()}</div> }).collect_view()}
+                                                </div>
+                                                <div><strong class="diff-removed">"REMOVED"</strong>
+                                                    {diff.capabilities.removed.iter().map(|name| view! { <div class="diff-line">{name.clone()}</div> }).collect_view()}
+                                                </div>
+                                            </div>
+                                            <div class="stepper-actions">
+                                                <button class="secondary" type="button" on:click=cancel_upgrade>"Cancel"</button>
+                                                <button class="primary" type="button" disabled=move || upgrade_busy.get() on:click=activate_upgrade>
+                                                    {move || if upgrade_busy.get() { "Activating..." } else { "Activate upgrade" }}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    }.into_any()
+                                }
+                            )}
+                            <p class="form-note">{move || upgrade_status.get()}</p>
+                        </section>
+                    }.into_any()
+                })}
+            }.into_any()
+        } else {
+            view! { <div class="operational-empty"><p>"Plugin not found or no longer visible."</p></div> }.into_any()
+        }}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Lane F: sandbox terminal page helpers
+// ---------------------------------------------------------------------------
+
+fn load_open_terminal() -> Option<OpenTerminalSession> {
+    let storage = web_sys::window()?.session_storage().ok()??;
+    let value = storage.get_item(OPEN_TERMINAL_KEY).ok()??;
+    serde_json::from_str(&value).ok()
+}
+
+fn store_open_terminal(session: &OpenTerminalSession) {
+    let Some(storage) =
+        web_sys::window().and_then(|window| window.session_storage().ok().flatten())
+    else {
+        return;
+    };
+    if let Ok(value) = serde_json::to_string(session) {
+        let _ = storage.set_item(OPEN_TERMINAL_KEY, &value);
+    }
+}
+
+fn clear_open_terminal() {
+    let Some(storage) =
+        web_sys::window().and_then(|window| window.session_storage().ok().flatten())
+    else {
+        return;
+    };
+    let _ = storage.remove_item(OPEN_TERMINAL_KEY);
+}
+
+/// Encodes UTF-8 bytes as base64 via the browser's `btoa` (each byte maps to
+/// one Latin-1 char code).
+fn base64_encode_utf8(text: &str) -> Result<String, ()> {
+    let binary = text
+        .as_bytes()
+        .iter()
+        .map(|byte| *byte as char)
+        .collect::<String>();
+    web_sys::window().ok_or(())?.btoa(&binary).map_err(|_| ())
+}
+
+/// Decodes base64 (browser `atob`) back into UTF-8 text.
+fn base64_decode_utf8(encoded: &str) -> Result<String, ()> {
+    let binary = web_sys::window().ok_or(())?.atob(encoded).map_err(|_| ())?;
+    let bytes = binary.chars().map(|ch| ch as u8).collect::<Vec<u8>>();
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+fn terminal_ended(state: &str) -> bool {
+    matches!(state, "Exited" | "Terminated" | "Unrecoverable" | "Lost")
+}
+
+fn join_sandbox_path(parent: &str, name: &str) -> String {
+    let trimmed = parent.trim_end_matches('/');
+    if trimmed.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{trimmed}/{name}")
+    }
+}
+
+#[component]
+fn TerminalsPage() -> impl IntoView {
+    let lifecycle = Arc::new(AtomicBool::new(true));
+    on_cleanup({
+        let lifecycle = Arc::clone(&lifecycle);
+        move || lifecycle.store(false, Ordering::Release)
+    });
+    let workspaces = RwSignal::new(Vec::<WorkspaceSummary>::new());
+    let status = RwSignal::new(String::new());
+    let selected_workspace = RwSignal::new(String::new());
+    let start_command = RwSignal::new("/bin/sh".to_owned());
+    let starting = RwSignal::new(false);
+    let session = RwSignal::new(None::<OpenTerminalSession>);
+    let output = RwSignal::new(String::new());
+    let cursor = RwSignal::new(0_u64);
+    let term_state = RwSignal::new(String::new());
+    let term_started = RwSignal::new(false);
+    let input_line = RwSignal::new(String::new());
+    let sending = RwSignal::new(false);
+    let busy = RwSignal::new(false);
+    let cols = RwSignal::new(80_u16);
+    let rows = RwSignal::new(24_u16);
+    let term_generation = RwSignal::new(0_u64);
+    let reconnect_target = RwSignal::new(load_open_terminal());
+    let output_ref = NodeRef::<leptos::html::Pre>::new();
+    // file manager
+    let fm_path = RwSignal::new(".".to_owned());
+    let fm_entries = RwSignal::new(Vec::<FsEntry>::new());
+    let fm_status = RwSignal::new(String::new());
+    let fm_content = RwSignal::new(None::<(String, String)>);
+    let fm_loading = RwSignal::new(false);
+    let fm_file_name = RwSignal::new(String::new());
+    let fm_file_body = RwSignal::new(String::new());
+    let fm_write_status = RwSignal::new(String::new());
+    let fm_writing = RwSignal::new(false);
+
+    load_workspaces(workspaces);
+    // Auto-select the first workspace when the list arrives.
+    Effect::new(move |_| {
+        if selected_workspace.get_untracked().is_empty()
+            && let Some(first) = workspaces.get().first()
+        {
+            selected_workspace.set(first.id.clone());
+        }
+    });
+    // Auto-scroll the terminal output to the bottom on new output.
+    Effect::new(move |_| {
+        let _ = output.get();
+        if let Some(element) = output_ref.get() {
+            element.set_scroll_top(element.scroll_height());
+        }
+    });
+
+    let start_terminal = {
+        let lifecycle = Arc::clone(&lifecycle);
+        move |workspace_id: String, command: Vec<String>| {
+            starting.set(true);
+            status.set("Starting sandbox terminal...".into());
+            let session_gen = term_generation.get_untracked().wrapping_add(1);
+            term_generation.set(session_gen);
+            let lifecycle = Arc::clone(&lifecycle);
+            let session = session;
+            let output = output;
+            let cursor = cursor;
+            let term_state = term_state;
+            let term_started = term_started;
+            let status = status;
+            let starting = starting;
+            let term_generation = term_generation;
+            let reconnect_target = reconnect_target;
+            let cols = cols;
+            let rows = rows;
+            let fm_path = fm_path;
+            let fm_entries = fm_entries;
+            let fm_status = fm_status;
+            spawn_local(async move {
+                let body = TerminalStartBody {
+                    workspace_id: &workspace_id,
+                    command: command.iter().map(String::as_str).collect(),
+                    cols: Some(cols.get_untracked()),
+                    rows: Some(rows.get_untracked()),
+                };
+                let request = Request::post("/api/v1/sandbox/terminal/start").json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<TerminalStartResponse>().await {
+                                Ok(started) => Ok(started),
+                                Err(_) => Err("The terminal response was not valid.".to_owned()),
+                            }
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The start request could not be encoded.".to_owned()),
+                };
+                if !lifecycle_is_active(&lifecycle) {
+                    return;
+                }
+                if term_generation.get_untracked() != session_gen {
+                    return;
+                }
+                let started = match outcome {
+                    Ok(started) => started,
+                    Err(error) => {
+                        status.set(format!("Could not start terminal: {error}"));
+                        starting.set(false);
+                        return;
+                    }
+                };
+                let active = OpenTerminalSession {
+                    workspace_id: workspace_id.clone(),
+                    terminal_id: started.terminal_id.clone(),
+                };
+                store_open_terminal(&active);
+                reconnect_target.set(None);
+                session.set(Some(active));
+                output.set(String::new());
+                cursor.set(0_u64);
+                term_state.set("Running".into());
+                term_started.set(true);
+                starting.set(false);
+                status.set(format!(
+                    "Terminal ready · network {}",
+                    started.network_policy
+                ));
+                fm_path.set(".".into());
+                fm_entries.set(Vec::new());
+                fm_status.set("List the workspace files below.".into());
+                // Poll loop: read every second while the page is visible.
+                loop {
+                    if !lifecycle_is_active(&lifecycle) {
+                        return;
+                    }
+                    if term_generation.get_untracked() != session_gen {
+                        return;
+                    }
+                    let Some(current) = session.get() else {
+                        return;
+                    };
+                    if current.terminal_id != started.terminal_id {
+                        return;
+                    }
+                    let read_body = TerminalReadBody {
+                        workspace_id: &current.workspace_id,
+                        after_cursor: cursor.get_untracked(),
+                        max_bytes: TERMINAL_MAX_READ_BYTES,
+                    };
+                    let request = Request::post(&format!(
+                        "/api/v1/sandbox/terminal/{}/read",
+                        current.terminal_id
+                    ))
+                    .json(&read_body);
+                    let read = match request {
+                        Ok(request) => request.send().await,
+                        Err(_) => break,
+                    };
+                    let read = match read {
+                        Ok(response) if response.ok() => {
+                            match response.json::<TerminalReadResponse>().await {
+                                Ok(found) => found,
+                                Err(_) => {
+                                    status.set("Terminal read response was not valid.".into());
+                                    continue;
+                                }
+                            }
+                        }
+                        Ok(response) => {
+                            if matches!(response.status(), 401 | 403 | 404) {
+                                status.set(format!(
+                                    "Terminal access was lost: {}",
+                                    api_error(&response).await
+                                ));
+                                break;
+                            }
+                            status.set(format!(
+                                "Terminal read failed: {}",
+                                api_error(&response).await
+                            ));
+                            continue;
+                        }
+                        Err(_) => {
+                            status.set("Sandbox service did not answer.".into());
+                            continue;
+                        }
+                    };
+                    if let Ok(text) = base64_decode_utf8(&read.data_base64)
+                        && !text.is_empty()
+                    {
+                        output.update(|current| current.push_str(&text));
+                    }
+                    cursor.set(read.next_cursor);
+                    term_state.set(read.state.clone());
+                    if terminal_ended(&read.state) || read.output_complete {
+                        status.set(format!("Terminal {}", read.state.to_uppercase()));
+                        break;
+                    }
+                    wait_for_poll(TERMINAL_POLL_MS).await;
+                }
+            });
+        }
+    };
+
+    let reconnect = {
+        let start_terminal = start_terminal.clone();
+        move |target: OpenTerminalSession| {
+            let old = target.clone();
+            let command = start_command
+                .get_untracked()
+                .split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<String>>();
+            let workspace_id = old.workspace_id.clone();
+            status.set("Reconnecting to a fresh session in the same workspace...".into());
+            let start_terminal = start_terminal.clone();
+            spawn_local(async move {
+                // Best-effort close of the previous daemon session.
+                if let Ok(request) = Request::post(&format!(
+                    "/api/v1/sandbox/terminal/{}/close",
+                    old.terminal_id
+                ))
+                .json(&WorkspaceIdBody {
+                    workspace_id: &old.workspace_id,
+                }) {
+                    let _ = request.send().await;
+                }
+                start_terminal(workspace_id, command);
+            });
+        }
+    };
+    let dismiss_reconnect = move |_| reconnect_target.set(None);
+
+    let send_line = {
+        move |event: leptos::ev::SubmitEvent| {
+            event.prevent_default();
+            let Some(current) = session.get_untracked() else {
+                return;
+            };
+            let line = input_line.get_untracked();
+            if line.is_empty() {
+                return;
+            }
+            sending.set(true);
+            let Ok(encoded) = base64_encode_utf8(&format!("{line}\n")) else {
+                status.set("Browser base64 encoding is unavailable.".into());
+                sending.set(false);
+                return;
+            };
+            let input_line = input_line;
+            let sending = sending;
+            let status = status;
+            spawn_local(async move {
+                let body = TerminalWriteBody {
+                    workspace_id: &current.workspace_id,
+                    data_base64: &encoded,
+                };
+                let request = Request::post(&format!(
+                    "/api/v1/sandbox/terminal/{}/write",
+                    current.terminal_id
+                ))
+                .json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => Ok(()),
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The write request could not be encoded.".to_owned()),
+                };
+                if let Err(error) = outcome {
+                    status.set(format!("Write failed: {error}"));
+                } else {
+                    input_line.set(String::new());
+                }
+                sending.set(false);
+            });
+        }
+    };
+    let apply_resize = {
+        move |_| {
+            let Some(current) = session.get_untracked() else {
+                return;
+            };
+            busy.set(true);
+            status.set("Resizing terminal...".into());
+            let busy = busy;
+            let status = status;
+            spawn_local(async move {
+                let body = TerminalResizeBody {
+                    workspace_id: &current.workspace_id,
+                    cols: cols.get_untracked(),
+                    rows: rows.get_untracked(),
+                };
+                let request = Request::post(&format!(
+                    "/api/v1/sandbox/terminal/{}/resize",
+                    current.terminal_id
+                ))
+                .json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => Ok("Terminal resized.".to_owned()),
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The resize request could not be encoded.".to_owned()),
+                };
+                match outcome {
+                    Ok(message) => status.set(message),
+                    Err(error) => status.set(format!("Resize failed: {error}")),
+                }
+                busy.set(false);
+            });
+        }
+    };
+    let interrupt = {
+        move |_| {
+            let Some(current) = session.get_untracked() else {
+                return;
+            };
+            busy.set(true);
+            status.set("Interrupting (SIGINT)...".into());
+            let busy = busy;
+            let status = status;
+            spawn_local(async move {
+                let body = WorkspaceIdBody {
+                    workspace_id: &current.workspace_id,
+                };
+                let request = Request::post(&format!(
+                    "/api/v1/sandbox/terminal/{}/interrupt",
+                    current.terminal_id
+                ))
+                .json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => Ok("Interrupt sent.".to_owned()),
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The interrupt request could not be encoded.".to_owned()),
+                };
+                match outcome {
+                    Ok(message) => status.set(message),
+                    Err(error) => status.set(format!("Interrupt failed: {error}")),
+                }
+                busy.set(false);
+            });
+        }
+    };
+    let close_terminal = {
+        move |_| {
+            let Some(current) = session.get_untracked() else {
+                return;
+            };
+            busy.set(true);
+            status.set("Closing terminal...".into());
+            let session = session;
+            let busy = busy;
+            let status = status;
+            let term_generation = term_generation;
+            let term_started = term_started;
+            let output = output;
+            spawn_local(async move {
+                let body = WorkspaceIdBody {
+                    workspace_id: &current.workspace_id,
+                };
+                let request = Request::post(&format!(
+                    "/api/v1/sandbox/terminal/{}/close",
+                    current.terminal_id
+                ))
+                .json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => Ok(()),
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The close request could not be encoded.".to_owned()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        clear_open_terminal();
+                        term_generation.update(|value| *value = value.wrapping_add(1));
+                        session.set(None);
+                        term_started.set(false);
+                        output.set(String::new());
+                        status.set("Terminal closed.".into());
+                    }
+                    Err(error) => status.set(format!("Close failed: {error}")),
+                }
+                busy.set(false);
+            });
+        }
+    };
+
+    // ---- file manager ----
+    let fm_list = {
+        move |path: Option<String>| {
+            let Some(workspace_id) =
+                session
+                    .get()
+                    .map(|current| current.workspace_id)
+                    .or_else(|| {
+                        let value = selected_workspace.get_untracked();
+                        (!value.is_empty()).then_some(value)
+                    })
+            else {
+                fm_status.set("Select a workspace first.".into());
+                return;
+            };
+            if let Some(path) = path {
+                fm_path.set(path.clone());
+            }
+            let path = fm_path.get_untracked();
+            fm_loading.set(true);
+            fm_status.set("Listing files...".into());
+            let fm_path = fm_path;
+            let fm_entries = fm_entries;
+            let fm_status = fm_status;
+            let fm_loading = fm_loading;
+            spawn_local(async move {
+                let body = SandboxPathBody {
+                    workspace_id: &workspace_id,
+                    path: &path,
+                };
+                let request = Request::post("/api/v1/sandbox/files/list").json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<FileListResponse>().await {
+                                Ok(found) => {
+                                    fm_entries.set(found.entries);
+                                    fm_path.set(path);
+                                    Ok("".to_owned())
+                                }
+                                Err(_) => Err("The listing response was not valid.".to_owned()),
+                            }
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The listing request could not be encoded.".to_owned()),
+                };
+                fm_loading.set(false);
+                match outcome {
+                    Ok(message) => {
+                        if !message.is_empty() {
+                            fm_status.set(message);
+                        }
+                    }
+                    Err(error) => fm_status.set(format!("Listing failed: {error}")),
+                }
+            });
+        }
+    };
+    let fm_open = {
+        move |entry: FsEntry| {
+            if entry.kind == "Directory" {
+                fm_content.set(None);
+                let path = join_sandbox_path(&fm_path.get_untracked(), &entry.name);
+                fm_list(Some(path));
+                return;
+            }
+            let Some(workspace_id) =
+                session
+                    .get()
+                    .map(|current| current.workspace_id)
+                    .or_else(|| {
+                        let value = selected_workspace.get_untracked();
+                        (!value.is_empty()).then_some(value)
+                    })
+            else {
+                fm_status.set("Select a workspace first.".into());
+                return;
+            };
+            let path = join_sandbox_path(&fm_path.get_untracked(), &entry.name);
+            fm_status.set(format!("Reading {}", path));
+            let fm_content = fm_content;
+            let fm_status = fm_status;
+            spawn_local(async move {
+                let body = SandboxPathBody {
+                    workspace_id: &workspace_id,
+                    path: &path,
+                };
+                let request = Request::post("/api/v1/sandbox/files/read").json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => {
+                            match response.json::<ReadFileResponse>().await {
+                                Ok(found) => match base64_decode_utf8(&found.data_base64) {
+                                    Ok(text) => {
+                                        fm_content.set(Some((path.clone(), text)));
+                                        Ok("".to_owned())
+                                    }
+                                    Err(_) => {
+                                        Err("The file content could not be decoded.".to_owned())
+                                    }
+                                },
+                                Err(_) => Err("The file response was not valid.".to_owned()),
+                            }
+                        }
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The read request could not be encoded.".to_owned()),
+                };
+                match outcome {
+                    Ok(message) => {
+                        if !message.is_empty() {
+                            fm_status.set(message);
+                        }
+                    }
+                    Err(error) => fm_status.set(format!("Read failed: {error}")),
+                }
+            });
+        }
+    };
+    let fm_delete = {
+        move |entry: FsEntry| {
+            let Some(workspace_id) =
+                session
+                    .get()
+                    .map(|current| current.workspace_id)
+                    .or_else(|| {
+                        let value = selected_workspace.get_untracked();
+                        (!value.is_empty()).then_some(value)
+                    })
+            else {
+                fm_status.set("Select a workspace first.".into());
+                return;
+            };
+            let path = join_sandbox_path(&fm_path.get_untracked(), &entry.name);
+            let confirmed = web_sys::window().is_some_and(|window| {
+                window
+                    .confirm_with_message(&format!("Delete {path}?"))
+                    .unwrap_or(false)
+            });
+            if !confirmed {
+                return;
+            }
+            fm_status.set(format!("Deleting {}", path));
+            let fm_status = fm_status;
+            let fm_list = fm_list;
+            spawn_local(async move {
+                let body = SandboxPathBody {
+                    workspace_id: &workspace_id,
+                    path: &path,
+                };
+                let request = Request::post("/api/v1/sandbox/files/remove").json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => Ok(()),
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The delete request could not be encoded.".to_owned()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        fm_status.set(format!("Deleted {path}."));
+                        fm_list(None);
+                    }
+                    Err(error) => fm_status.set(format!("Delete failed: {error}")),
+                }
+            });
+        }
+    };
+    let fm_write = {
+        move |event: leptos::ev::SubmitEvent| {
+            event.prevent_default();
+            let Some(workspace_id) =
+                session
+                    .get()
+                    .map(|current| current.workspace_id)
+                    .or_else(|| {
+                        let value = selected_workspace.get_untracked();
+                        (!value.is_empty()).then_some(value)
+                    })
+            else {
+                fm_write_status.set("Select a workspace first.".into());
+                return;
+            };
+            let name = fm_file_name.get_untracked().trim().to_owned();
+            if name.is_empty() {
+                fm_write_status.set("Enter a file name.".into());
+                return;
+            }
+            let body_text = fm_file_body.get_untracked();
+            let Ok(encoded) = base64_encode_utf8(&body_text) else {
+                fm_write_status.set("Browser base64 encoding is unavailable.".into());
+                return;
+            };
+            let path = join_sandbox_path(&fm_path.get_untracked(), &name);
+            fm_writing.set(true);
+            fm_write_status.set("Writing file...".into());
+            let fm_write_status = fm_write_status;
+            let fm_writing = fm_writing;
+            let fm_file_name = fm_file_name;
+            let fm_file_body = fm_file_body;
+            let fm_list = fm_list;
+            spawn_local(async move {
+                let body = SandboxWriteBody {
+                    workspace_id: &workspace_id,
+                    path: &path,
+                    data_base64: &encoded,
+                };
+                let request = Request::post("/api/v1/sandbox/files/write").json(&body);
+                let outcome = match request {
+                    Ok(request) => match request.send().await {
+                        Ok(response) if response.ok() => Ok(()),
+                        Ok(response) => Err(api_error(&response).await),
+                        Err(_) => Err("Sandbox service did not answer.".to_owned()),
+                    },
+                    Err(_) => Err("The write request could not be encoded.".to_owned()),
+                };
+                fm_writing.set(false);
+                match outcome {
+                    Ok(()) => {
+                        fm_file_name.set(String::new());
+                        fm_file_body.set(String::new());
+                        fm_write_status.set(format!("Wrote {path}."));
+                        fm_list(None);
+                    }
+                    Err(error) => fm_write_status.set(format!("Write failed: {error}")),
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"OPERATE / SANDBOX TERMINAL"</p><h1>"Terminals"</h1></div>
+            <span class="utility">{move || format!("{} WORKSPACES", workspaces.get().len())}</span>
+        </div>
+        <p class="form-note">{move || status.get()}</p>
+        {move || if reconnect_target.get().is_some() && session.get().is_none() {
+            let target = reconnect_target.get().unwrap();
+            let reconnect = reconnect.clone();
+            let dismiss = dismiss_reconnect;
+            view! {
+                <div class="reconnect-banner">
+                    <p>"A terminal session from a previous visit is still open in this workspace. Session ids are assigned server-side, so reconnecting starts a fresh session in the same workspace (the old session is closed)."</p>
+                    <div>
+                        <button class="secondary" type="button" on:click=move |_| reconnect(target.clone())>"Reconnect (fresh session)"</button>
+                        <button class="text-button" type="button" on:click=dismiss>"Dismiss"</button>
+                    </div>
+                </div>
+            }.into_any()
+        } else {
+            view! { <span></span> }.into_any()
+        }}
+        {move || if session.get().is_none() {
+            let start_terminal = start_terminal.clone();
+            view! {
+                <form class="filter-row" on:submit=move |event: leptos::ev::SubmitEvent| {
+                    event.prevent_default();
+                    let workspace_id = selected_workspace.get_untracked();
+                    if workspace_id.is_empty() {
+                        status.set("Select a workspace first.".into());
+                        return;
+                    }
+                    let command = start_command.get_untracked();
+                    let parsed = command.split_whitespace().map(str::to_owned).collect::<Vec<String>>();
+                    if parsed.is_empty() {
+                        status.set("Enter a command such as /bin/sh.".into());
+                        return;
+                    }
+                    start_terminal(workspace_id, parsed);
+                }>
+                    <select prop:value=move || selected_workspace.get()
+                        on:change=move |event| selected_workspace.set(event_target_value(&event))>
+                        {workspaces.get().into_iter().map(|ws| {
+                            let id = ws.id.clone();
+                            let title = ws.title.clone();
+                            view! { <option value=id>{title}</option> }
+                        }).collect_view()}
+                    </select>
+                    <input placeholder="Command (default /bin/sh)" prop:value=move || start_command.get()
+                        on:input=move |event| start_command.set(event_target_value(&event)) />
+                    <button class="primary" type="submit" disabled=move || starting.get()>
+                        {move || if starting.get() { "Starting..." } else { "Start terminal" }}
+                    </button>
+                </form>
+                <div class="terminal-empty">
+                    <span class="index-spine">"TTY"</span>
+                    <div><h2>"No terminal open"</h2><p>"Terminals run inside the configured sandbox for the selected workspace. Output streams here; commands echo through the same session."</p></div>
+                </div>
+            }.into_any()
+        } else {
+            let fm_list = fm_list;
+            view! {
+                <div class="terminal-layout">
+                    <div class="terminal-pane">
+                        <div class="terminal-toolbar">
+                            <span class=move || format!("state-badge {}", term_state.get().to_lowercase())>{move || term_state.get().to_uppercase()}</span>
+                            <label>"Resize"
+                                <select prop:value=move || format!("{}x{}", cols.get(), rows.get())
+                                    on:change=move |event| {
+                                        let value = event_target_value(&event);
+                                        let mut parts = value.split('x');
+                                        if let (Some(c), Some(r)) = (parts.next(), parts.next())
+                                            && let (Ok(c), Ok(r)) =
+                                                (c.parse::<u16>(), r.parse::<u16>())
+                                        {
+                                            cols.set(c);
+                                            rows.set(r);
+                                        }
+                                    }>
+                                    <option value="80x24">"80 × 24"</option>
+                                    <option value="120x40">"120 × 40"</option>
+                                    <option value="160x50">"160 × 50"</option>
+                                    <option value="200x60">"200 × 60"</option>
+                                </select>
+                            </label>
+                            <button class="secondary" type="button" disabled=move || busy.get() on:click=apply_resize>"Resize"</button>
+                            <button class="secondary" type="button" disabled=move || busy.get() on:click=interrupt>"Interrupt"</button>
+                            <button class="secondary danger" type="button" disabled=move || busy.get() on:click=close_terminal>"Close"</button>
+                        </div>
+                        <pre class="terminal-output" node_ref=output_ref tabindex="0">{move || output.get()}</pre>
+                        <form class="terminal-input-row" on:submit=send_line>
+                            <input placeholder="Type a command…" disabled=move || sending.get()
+                                prop:value=move || input_line.get()
+                                on:input=move |event| input_line.set(event_target_value(&event)) />
+                            <button class="primary" type="submit" disabled=move || sending.get()>
+                                {move || if sending.get() { "Sending..." } else { "Send" }}
+                            </button>
+                        </form>
+                    </div>
+                    <aside class="file-pane">
+                        <div class="section-heading"><div><p class="utility">"WORKSPACE FILES"</p></div>
+                            <button class="text-button" type="button" on:click=move |_| fm_list(None)>"Refresh"</button>
+                        </div>
+                        <p class="form-note">{move || fm_status.get()}</p>
+                        <div class="file-nav">
+                            <button class="text-button" type="button" on:click=move |_| fm_list(Some(".".into()))>"."</button>
+                            <span class="mono-break">{move || fm_path.get()}</span>
+                        </div>
+                        <div class="index-table file-list">
+                            {move || fm_entries.get().into_iter().map(|entry| {
+                                let open_entry = entry.clone();
+                                let delete_entry = entry.clone();
+                                view! {
+                                    <div class="index-row component-row">
+                                        <span class="spine-cell">{if entry.kind == "Directory" { "DIR" } else { "FILE" }}</span>
+                                        <button class="text-button" type="button" on:click=move |_| fm_open(open_entry.clone())>{entry.name.clone()}</button>
+                                        <span>{entry.size}</span>
+                                        <button class="text-button" type="button" on:click=move |_| fm_delete(delete_entry.clone())>"Delete"</button>
+                                    </div>
+                                }
+                            }).collect_view()}
+                        </div>
+                        {move || fm_content.get().map(|(path, text)| {
+                            let (path, text) = (path.clone(), text.clone());
+                            view! {
+                                <details class="file-viewer" open>
+                                    <summary>{path}</summary>
+                                    <pre>{text}</pre>
+                                </details>
+                            }.into_any()
+                        })}
+                        <form class="file-write" on:submit=fm_write>
+                            <p class="utility">"WRITE FILE"</p>
+                            <input maxlength="500" placeholder="File name" prop:value=move || fm_file_name.get()
+                                on:input=move |event| fm_file_name.set(event_target_value(&event)) />
+                            <textarea rows="4" placeholder="File contents" prop:value=move || fm_file_body.get()
+                                on:input=move |event| fm_file_body.set(event_target_value(&event))></textarea>
+                            <button class="secondary" type="submit" disabled=move || fm_writing.get()>
+                                {move || if fm_writing.get() { "Writing..." } else { "Write file" }}
+                            </button>
+                            <p class="form-note">{move || fm_write_status.get()}</p>
+                        </form>
+                    </aside>
+                </div>
+            }.into_any()
         }}
     }
 }
@@ -2182,76 +4655,6 @@ fn DiagnosticsPage() -> impl IntoView {
                 <span class="spine-cell">{job.id.chars().take(8).collect::<String>()}</span><strong>{job.status}</strong>
                 <span>{job.last_error_code.unwrap_or_else(|| "NONE".into())}</span><span>"DURABLE"</span>
             </div> }).collect_view()}
-        </div>
-    }
-}
-
-#[component]
-fn SkillsPage() -> impl IntoView {
-    let skills = RwSignal::new(Vec::<SkillResponse>::new());
-    let status = RwSignal::new(String::new());
-    let expanded_skill = RwSignal::new(None::<String>);
-    let revisions = RwSignal::new(Vec::<SkillRevisionResponse>::new());
-    load_skills(skills, status);
-    let toggle = move |skill_id: String| {
-        let current = expanded_skill.get_untracked();
-        if current.as_deref() == Some(&skill_id) {
-            expanded_skill.set(None);
-            revisions.set(Vec::new());
-        } else {
-            expanded_skill.set(Some(skill_id.clone()));
-            load_skill_revisions(skill_id, revisions, status);
-        }
-    };
-    view! {
-        <div class="page-heading">
-            <div><p class="utility">"PROCEDURES / SKILLS"</p><h1>"Skills"</h1></div>
-            <span class="utility">{move || format!("{} SKILLS", skills.get().len())}</span>
-        </div>
-        <p class="form-note">{move || status.get()}</p>
-        <div class="index-table" role="table">
-            <div class="index-row header" role="row"><span>"ID"</span><span>"NAME"</span><span>"DESCRIPTION"</span><span>"REVISION"</span><span>"POLICY"</span></div>
-            {move || skills.get().into_iter().map(|skill| {
-                let skill_id = skill.id.clone();
-                let short_id = skill_id.chars().take(8).collect::<String>();
-                let is_expanded = {
-                    let skill_id = skill_id.clone();
-                    move || expanded_skill.get().as_deref() == Some(&skill_id)
-                };
-                let is_expanded_again = {
-                    let skill_id = skill_id.clone();
-                    move || expanded_skill.get().as_deref() == Some(&skill_id)
-                };
-                view! {
-                    <>
-                    <button class="index-row index-action" type="button" role="row"
-                        class:active=is_expanded
-                        on:click=move |_| toggle(skill_id.clone())>
-                        <span class="spine-cell">{short_id}</span>
-                        <strong>{skill.name}</strong>
-                        <span class="utility">{skill.description}</span>
-                        <span>{skill.active_revision.map_or("—".into(), |r| format!("v{r}"))}</span>
-                        <span>{skill.promotion_policy.to_uppercase()}</span>
-                    </button>
-                    {move || is_expanded_again().then(|| {
-                        let current_revisions = revisions.get();
-                        view! {
-                            <div class="index-table">
-                                <div class="index-row header" role="row"><span>"REV"</span><span>"STATUS"</span><span>"CONTENT"</span><span>"REASON"</span></div>
-                                {current_revisions.iter().map(|rev| {
-                                    view! { <div class="index-row" role="row">
-                                        <span class="spine-cell">{format!("v{}", rev.revision)}</span>
-                                        <span>{if rev.promoted { "PROMOTED" } else { "DRAFT" }}</span>
-                                        <pre>{rev.content.clone()}</pre>
-                                        <span>{rev.reason.clone()}</span>
-                                    </div> }
-                                }).collect_view()}
-                            </div>
-                        }
-                    })}
-                    </>
-                }
-            }).collect_view()}
         </div>
     }
 }
@@ -2999,18 +5402,14 @@ fn new_client_submission_id() -> Option<String> {
     ))
 }
 
-fn load_books(books: RwSignal<Vec<BookSummary>>, status: RwSignal<String>, query: Option<String>) {
+fn load_library_list(
+    books: RwSignal<Vec<BookSummary>>,
+    status: RwSignal<String>,
+    _query: Option<String>,
+) {
     status.set("Reading authorized index...".into());
     spawn_local(async move {
-        let endpoint = query.map_or_else(
-            || "/api/v1/library/books".to_owned(),
-            |query| {
-                let encoded =
-                    url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
-                format!("/api/v1/library/search?q={encoded}")
-            },
-        );
-        match Request::get(&endpoint).send().await {
+        match Request::get("/api/v1/library/books").send().await {
             Ok(response) if response.ok() => match response.json::<Vec<BookSummary>>().await {
                 Ok(found) => {
                     let count = found.len();
@@ -3020,12 +5419,94 @@ fn load_books(books: RwSignal<Vec<BookSummary>>, status: RwSignal<String>, query
                 Err(_) => status.set("Library response was not valid.".into()),
             },
             Ok(response) => status.set(format!(
-                "Library request failed: HTTP {}",
-                response.status()
+                "Library request failed: {}",
+                api_error(&response).await
             )),
             Err(_) => status.set("Library service did not answer.".into()),
         }
     });
+}
+
+/// Number of books currently visible under the active filter/search.
+fn visible_book_count(
+    all_books: RwSignal<Vec<BookSummary>>,
+    search_hits: RwSignal<Option<Vec<BookSummary>>>,
+    filter: RwSignal<LibraryFilter>,
+) -> usize {
+    match search_hits.get() {
+        Some(hits) => hits.len(),
+        None => {
+            let kind_filter = filter.get();
+            all_books
+                .get()
+                .into_iter()
+                .filter(|book| kind_filter.matches(&book.kind))
+                .count()
+        }
+    }
+}
+
+/// `GET /library/search?q=&kind=` — unified search across all book kinds.
+async fn search_library(query: &str, kind: Option<&str>) -> Result<Vec<BookSummary>, String> {
+    let encoded = url::form_urlencoded::byte_serialize(query.as_bytes()).collect::<String>();
+    let mut endpoint = format!("/api/v1/library/search?q={encoded}");
+    if let Some(kind) = kind {
+        let encoded_kind =
+            url::form_urlencoded::byte_serialize(kind.as_bytes()).collect::<String>();
+        endpoint.push_str(&format!("&kind={encoded_kind}"));
+    }
+    match Request::get(&endpoint).send().await {
+        Ok(response) if response.ok() => response
+            .json::<Vec<BookSummary>>()
+            .await
+            .map_err(|_| "Library response was not valid.".to_owned()),
+        Ok(response) => Err(api_error(&response).await),
+        Err(_) => Err("Library service did not answer.".to_owned()),
+    }
+}
+
+/// `POST /library/books/{id}/load` — kind-specific progressive load.
+async fn load_library_book(book_id: &str) -> Result<LoadedBook, String> {
+    match Request::post(&format!("/api/v1/library/books/{book_id}/load"))
+        .send()
+        .await
+    {
+        Ok(response) if response.ok() => response
+            .json::<LoadedBook>()
+            .await
+            .map_err(|_| "Book response was not valid.".to_owned()),
+        Ok(response) => Err(api_error(&response).await),
+        Err(_) => Err("Library service did not answer.".to_owned()),
+    }
+}
+
+fn load_workspaces(workspaces: RwSignal<Vec<WorkspaceSummary>>) {
+    spawn_local(async move {
+        if let Ok(response) = Request::get("/api/v1/workspaces").send().await
+            && response.ok()
+            && let Ok(list) = response.json::<Vec<WorkspaceSummary>>().await
+        {
+            workspaces.set(list);
+        }
+    });
+}
+
+/// Renders the error envelope `{message, correlation_id}` or a fallback.
+/// `Response::json` borrows, so the caller can format without consuming.
+async fn api_error(response: &gloo_net::http::Response) -> String {
+    let status = response.status();
+    response.json::<ApiError>().await.map_or_else(
+        |_| format!("The request failed with HTTP {status}."),
+        |api| format!("{} Reference: {}", api.message, api.correlation_id),
+    )
+}
+
+/// Reads a checkbox's checked state from a change event.
+fn event_target_checked(event: &leptos::ev::Event) -> bool {
+    event
+        .target()
+        .and_then(|target| target.dyn_into::<web_sys::HtmlInputElement>().ok())
+        .is_some_and(|input| input.checked())
 }
 
 fn load_chat_models(
@@ -3154,54 +5635,6 @@ fn load_jobs(jobs: RwSignal<Vec<EmbeddingJob>>, status: RwSignal<String>) {
             },
             Ok(response) => status.set(format!("Queue request failed: HTTP {}", response.status())),
             Err(_) => status.set("Queue service did not answer.".into()),
-        }
-    });
-}
-
-fn load_skills(skills: RwSignal<Vec<SkillResponse>>, status: RwSignal<String>) {
-    status.set("Reading Skills index...".into());
-    spawn_local(async move {
-        match Request::get("/api/v1/skills").send().await {
-            Ok(response) if response.ok() => match response.json::<Vec<SkillResponse>>().await {
-                Ok(found) => {
-                    let count = found.len();
-                    skills.set(found);
-                    status.set(format!("{count} Skills loaded."));
-                }
-                Err(_) => status.set("Skills response was not valid.".into()),
-            },
-            Ok(response) => {
-                status.set(format!("Skills request failed: HTTP {}", response.status()))
-            }
-            Err(_) => status.set("Skills service did not answer.".into()),
-        }
-    });
-}
-
-fn load_skill_revisions(
-    skill_id: String,
-    revisions: RwSignal<Vec<SkillRevisionResponse>>,
-    status: RwSignal<String>,
-) {
-    status.set("Reading revision history...".into());
-    spawn_local(async move {
-        let endpoint = format!("/api/v1/skills/{skill_id}/revisions");
-        match Request::get(&endpoint).send().await {
-            Ok(response) if response.ok() => {
-                match response.json::<Vec<SkillRevisionResponse>>().await {
-                    Ok(found) => {
-                        let count = found.len();
-                        revisions.set(found);
-                        status.set(format!("{count} revisions loaded."));
-                    }
-                    Err(_) => status.set("Revision response was not valid.".into()),
-                }
-            }
-            Ok(response) => status.set(format!(
-                "Revisions request failed: HTTP {}",
-                response.status()
-            )),
-            Err(_) => status.set("Revisions service did not answer.".into()),
         }
     });
 }
