@@ -63,3 +63,9 @@ is added. Consider extracting the version into a shared constant.
   switching to the SDK server for richer protocol coverage.
 - Several migration version assertions (schema_v14_to_v18, deployed_v3_to_v18)
   are tightly coupled. Consider a shared migration chain constant.
+
+## M21 UI Backlog (P3)
+
+- Models page: no delete button for model routes. Add route deletion (DELETE /api/v1/models/chat/{id}) + UI.
+- Library page: books are creatable via the new Create Book form; also creatable via the chat library_add tool. No action needed.
+- Mobile viewport session-cookie behavior: testing at 390x844 may show login instead of the dashboard when the browser context has no session cookie — normal auth behavior, verify with a persistent context in future mobile testing.
