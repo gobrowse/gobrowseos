@@ -1848,7 +1848,6 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
     let stepper_source = RwSignal::new(String::new());
     let stepper_version = RwSignal::new(String::new());
     let stepper_workspace = RwSignal::new(String::new());
-
     load_library_list(all_books, status, None);
     load_workspaces(workspaces);
 
@@ -2462,7 +2461,7 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
     // ---- plugin detail ----
     let open_plugin = { move |plugin_id: String| plugin_detail_id.set(Some(plugin_id)) };
 
-    let active_conv = active_conversation();
+    let _active_conv = active_conversation();
 
     view! {
         {move || plugin_detail_id.get().map(|plugin_id| {
@@ -2638,46 +2637,73 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                 })}
                 <p class="form-note">{move || load_status.get()}</p>
                 <div class="book-grid">
-                    {move || {
+                    <p class="form-note">"GRID-DEBUG: "{move || format!("{}", {
                         let kind_filter = filter.get();
                         let list = match search_hits.get() {
                             Some(hits) => hits,
                             None => all_books.get().into_iter().filter(|book| kind_filter.matches(&book.kind)).collect::<Vec<_>>(),
                         };
-                        list.into_iter().map(|book| {
-                            let open_id = book.id.clone();
-                            let pin_id = book.id.clone();
-                            let kind_label = book.kind.clone().unwrap_or_else(|| "SOURCE".into());
-                            let kind_class = kind_label.to_lowercase();
-                            let trust_class = book.trust.to_lowercase();
-                            let conversation_id = active_conv.get().map(|c| c.id.clone());
-                            view! {
+                        list.len()
+                    })}</p>
+                    {move || match search_hits.get() {
+                        Some(hits) => hits
+                            .into_iter()
+                            .map(|book| view! {
                                 <article class="book-card">
                                     <div class="book-card-head">
-                                        <span class=format!("kind-badge {}", kind_class)>{kind_label}</span>
-                                        <strong>{book.title}</strong>
-                                        <span class=format!("trust-badge {}", trust_class)>{book.trust}</span>
+                                        <span class="kind-badge plugin">{book.kind.clone().unwrap_or_else(|| "SOURCE".into())}</span>
+                                        <strong>{book.title.clone()}</strong>
+                                        <span class="trust-badge untrusted">{book.trust.clone()}</span>
                                     </div>
-                                    <p class="book-snippet">{book.snippet}</p>
+                                    <p class="book-snippet">{book.snippet.clone()}</p>
                                     <div class="book-card-meta">
                                         {book.tags.iter().take(4).map(|tag| view! { <span class="cap-chip">{tag.clone()}</span> }).collect_view()}
                                         {book.capabilities.iter().take(4).map(|cap| view! { <span class="cap-chip">{cap.clone()}</span> }).collect_view()}
                                     </div>
                                     <div class="book-card-actions">
-                                        <button class="text-button" on:click=move |_| open_book(open_id.clone())>"Open detail"</button>
-                                        {if let Some(current_conversation) = conversation_id.clone() {
-                                            view! {
-                                                <button class="text-button" on:click=move |_| pin_book(pin_id.clone())>
-                                                    {format!("Pin to {}", &current_conversation[..8.min(current_conversation.len())])}
-                                                </button>
-                                            }.into_any()
-                                        } else {
-                                            view! { <span class="utility">"NO CONVERSATION"</span> }.into_any()
-                                        }}
+                                        <button class="text-button" on:click={
+                                            let book_id = book.id.clone();
+                                            move |_| open_book(book_id.clone())
+                                        }>"Open detail"</button>
+                                        <button class="text-button" on:click={
+                                            let book_id = book.id.clone();
+                                            move |_| pin_book(book_id.clone())
+                                        }>"Pin to conversation"</button>
                                     </div>
                                 </article>
-                            }
-                        }).collect_view()
+                            })
+                            .collect_view()
+                            .into_any(),
+                        None => all_books
+                            .get()
+                            .into_iter()
+                            .filter(|book| filter.get().matches(&book.kind))
+                            .map(|book| view! {
+                                <article class="book-card">
+                                    <div class="book-card-head">
+                                        <span class="kind-badge plugin">{book.kind.clone().unwrap_or_else(|| "SOURCE".into())}</span>
+                                        <strong>{book.title.clone()}</strong>
+                                        <span class="trust-badge untrusted">{book.trust.clone()}</span>
+                                    </div>
+                                    <p class="book-snippet">{book.snippet.clone()}</p>
+                                    <div class="book-card-meta">
+                                        {book.tags.iter().take(4).map(|tag| view! { <span class="cap-chip">{tag.clone()}</span> }).collect_view()}
+                                        {book.capabilities.iter().take(4).map(|cap| view! { <span class="cap-chip">{cap.clone()}</span> }).collect_view()}
+                                    </div>
+                                    <div class="book-card-actions">
+                                        <button class="text-button" on:click={
+                                            let book_id = book.id.clone();
+                                            move |_| open_book(book_id.clone())
+                                        }>"Open detail"</button>
+                                        <button class="text-button" on:click={
+                                            let book_id = book.id.clone();
+                                            move |_| pin_book(book_id.clone())
+                                        }>"Pin to conversation"</button>
+                                    </div>
+                                </article>
+                            })
+                            .collect_view()
+                            .into_any(),
                     }}
                 </div>
                 {move || loaded.get().map(|book| {
