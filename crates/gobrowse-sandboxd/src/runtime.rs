@@ -2437,6 +2437,8 @@ while :; do sleep 0.1; done"#;
             executable: PathBuf::from("/usr/bin/podman"),
             home: PathBuf::from("/tmp"),
             runtime_dir: None,
+            container_uid: 1_000,
+            daemon_gid: 1_000,
             image: "registry.example/gobrowse/sandbox@sha256:abc123".into(),
             readiness_timeout: Duration::from_secs(5),
             control_timeout: Duration::from_secs(5),
