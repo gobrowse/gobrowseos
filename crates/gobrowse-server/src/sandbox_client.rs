@@ -18,10 +18,10 @@ use std::{path::PathBuf, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use gobrowse_core::sandbox::{
-    FilesystemEntry, MAX_FILE_PAYLOAD_BYTES, MAX_PROTOCOL_LINE_BYTES, MAX_TERMINAL_INPUT_BYTES,
-    MAX_TERMINAL_OUTPUT_READ_BYTES, NetworkPolicy, RequestEnvelope, ResourceLimits,
-    ResponseEnvelope, SANDBOX_PROTOCOL_VERSION, SandboxErrorCode, SandboxOperation, SandboxProcess,
-    SandboxResult, TerminalStartRequest, TerminalState,
+    FilesystemEntry, FilesystemMetadata, MAX_FILE_PAYLOAD_BYTES, MAX_PROTOCOL_LINE_BYTES,
+    MAX_TERMINAL_INPUT_BYTES, MAX_TERMINAL_OUTPUT_READ_BYTES, NetworkPolicy, RequestEnvelope,
+    ResourceLimits, ResponseEnvelope, SANDBOX_PROTOCOL_VERSION, SandboxErrorCode, SandboxOperation,
+    SandboxProcess, SandboxResult, TerminalStartRequest, TerminalState,
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
@@ -294,6 +294,26 @@ impl SandboxClient {
         }
     }
 
+    /// Returns metadata for a workspace path (kind, size, mode, mtime).
+    pub async fn fs_stat(
+        &self,
+        workspace_id: Uuid,
+        path: &str,
+    ) -> Result<FilesystemMetadata, SandboxClientError> {
+        match self
+            .send(SandboxOperation::FsMetadata {
+                workspace_id,
+                path: path.into(),
+            })
+            .await?
+        {
+            SandboxResult::FsMetadata { metadata } => Ok(metadata),
+            _ => Err(SandboxClientError::ProtocolViolation(
+                "unexpected response to fs_metadata".into(),
+            )),
+        }
+    }
+
     pub async fn fs_delete(
         &self,
         workspace_id: Uuid,
@@ -513,6 +533,44 @@ impl SandboxClient {
             SandboxResult::Processes { processes } => Ok(processes),
             _ => Err(SandboxClientError::ProtocolViolation(
                 "unexpected response to terminal processes".into(),
+            )),
+        }
+    }
+
+    /// Read-only snapshot of a session from [`SandboxOperation::Inspect`].
+    /// Unlike [`Self::terminal_reconnect`] this never touches replay state.
+    pub async fn terminal_inspect(
+        &self,
+        terminal_id: Uuid,
+    ) -> Result<TerminalSessionInfo, SandboxClientError> {
+        match self.send(SandboxOperation::Inspect { terminal_id }).await? {
+            SandboxResult::Inspected {
+                terminal_id: echoed,
+                workspace_id,
+                state,
+                cols,
+                rows,
+                exit_code,
+                reason,
+                output_start_cursor,
+                output_end_cursor,
+                acked_cursor,
+                output_complete,
+            } if echoed == terminal_id => Ok(TerminalSessionInfo {
+                terminal_id,
+                workspace_id,
+                state,
+                cols,
+                rows,
+                exit_code,
+                reason,
+                output_start_cursor,
+                output_end_cursor,
+                acked_cursor,
+                output_complete,
+            }),
+            _ => Err(SandboxClientError::ProtocolViolation(
+                "unexpected response to terminal inspect".into(),
             )),
         }
     }
@@ -901,6 +959,19 @@ mod tests {
                         },
                     )
                 }),
+                handler(|request| {
+                    ok_response(
+                        &request,
+                        SandboxResult::FsMetadata {
+                            metadata: FilesystemMetadata {
+                                kind: FilesystemEntryKind::File,
+                                size: 5,
+                                mode: 0o644,
+                                modified_unix_seconds: 1_700_000_000,
+                            },
+                        },
+                    )
+                }),
                 handler(|request| ok_response(&request, SandboxResult::FsCreated)),
                 handler(|request| ok_response(&request, SandboxResult::FsDeleted)),
             ],
@@ -919,6 +990,10 @@ mod tests {
             .unwrap();
         assert_eq!(written, 5);
         assert_eq!(digest, "deadbeef");
+        let metadata = client.fs_stat(workspace_id, "hello.txt").await.unwrap();
+        assert_eq!(metadata.kind, FilesystemEntryKind::File);
+        assert_eq!(metadata.size, 5);
+        assert_eq!(metadata.mode, 0o644);
         assert!(client.fs_mkdir(workspace_id, "sub").await.is_ok());
         assert!(client.fs_delete(workspace_id, "sub").await.is_ok());
     }
@@ -982,6 +1057,55 @@ mod tests {
         assert!(output.output_complete);
         assert!(client.terminal_resize(terminal_id, 100, 40).await.is_ok());
         assert!(client.terminal_interrupt(terminal_id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn terminal_inspect_returns_readonly_session_snapshot() {
+        let terminal_id = Uuid::new_v4();
+        let daemon = FakeDaemon::responding(
+            vec![
+                handler(move |request| {
+                    ok_response(
+                        &request,
+                        SandboxResult::Inspected {
+                            terminal_id,
+                            workspace_id: Uuid::new_v4(),
+                            state: TerminalState::Exited,
+                            cols: 80,
+                            rows: 24,
+                            exit_code: Some(3),
+                            reason: Some("command exited".into()),
+                            output_start_cursor: 0,
+                            output_end_cursor: 6,
+                            acked_cursor: 6,
+                            output_complete: true,
+                        },
+                    )
+                }),
+                handler(|request| {
+                    ok_response(
+                        &request,
+                        SandboxResult::Started {
+                            terminal_id: Uuid::new_v4(),
+                            limits: HARD_RESOURCE_LIMITS,
+                            network_policy: NetworkPolicy::None,
+                        },
+                    )
+                }),
+            ],
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        let client = client(daemon.socket_path());
+        let info = client.terminal_inspect(terminal_id).await.unwrap();
+        assert_eq!(info.terminal_id, terminal_id);
+        assert_eq!(info.state, TerminalState::Exited);
+        assert_eq!(info.exit_code, Some(3));
+        assert!(info.output_complete);
+        // Unexpected variant is rejected as a protocol violation.
+        assert!(matches!(
+            client.terminal_inspect(terminal_id).await,
+            Err(SandboxClientError::ProtocolViolation(_))
+        ));
     }
 
     #[tokio::test]

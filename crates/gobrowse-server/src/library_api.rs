@@ -55,6 +55,9 @@ pub struct SearchQuery {
     pub q: String,
     pub workspace_id: Option<Uuid>,
     pub limit: Option<i64>,
+    /// Optional registry-kind filter (`SOURCE`|`SKILL`|`MCP`|`PLUGIN`|
+    /// `AUTOBIOGRAPHY`). `SOURCE` also matches legacy NULL-kind books.
+    pub kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -62,6 +65,11 @@ pub struct BookSummary {
     pub id: Uuid,
     pub title: String,
     pub snippet: String,
+    /// Registry role; `null` (SQL NULL) means `SOURCE`.
+    pub kind: Option<String>,
+    /// Capability/component names from `books.metadata->>'capabilities'`.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
     pub book_type: String,
     pub scope: String,
     pub tags: Vec<String>,
@@ -219,6 +227,444 @@ pub async fn get_book(
     Ok(Json(row_to_book(&row)?))
 }
 
+// ---------------------------------------------------------------------------
+// Progressive loading (Lane E): POST /library/books/{id}/load
+// ---------------------------------------------------------------------------
+
+/// Character bounds for Stage-3 body loads. SOURCE bodies are limited to
+/// 24,000 chars (~6k tokens); AUTOBIOGRAPHY keeps the schema-99,999 bound.
+const SOURCE_BODY_MAX_CHARS: usize = 24_000;
+const SKILL_CONTENT_MAX_CHARS: usize = 24_000;
+const AUTOBIOGRAPHY_MAX_CHARS_LOAD: usize = 99_999;
+
+#[derive(Debug, Deserialize)]
+pub struct LoadBookQuery {
+    /// Stage-4: load a single MCP tool schema / PLUGIN component instead of
+    /// the full list.
+    pub component: Option<String>,
+}
+
+/// Kind-specific result of resolving one Book's full content. Shared by the
+/// `library_load` tool (run_tools) and the `POST /library/books/{id}/load`
+/// endpoint so both surfaces resolve identically.
+pub(crate) struct LoadedBookPayload {
+    pub book_id: Uuid,
+    pub title: String,
+    pub kind: Option<BookKind>,
+    pub book_type: BookType,
+    pub trust: TrustLevel,
+    pub revision: i64,
+    /// Kind-specific JSON shape (body / skill content / MCP tools / plugin
+    /// components). Never contains secret values.
+    pub payload: serde_json::Value,
+    /// Total characters of body/content included in `payload`.
+    pub loaded_chars: usize,
+    /// Number of tools/components surfaced by this load (MCP/PLUGIN only).
+    pub tools_discovered: usize,
+    /// 1 when a Stage-4 component/tool schema was resolved.
+    pub tools_loaded: usize,
+}
+
+/// Book-level metadata shared by the per-kind resolvers.
+struct BookMeta {
+    book_id: Uuid,
+    title: String,
+    book_type: BookType,
+    trust: TrustLevel,
+    revision: i64,
+}
+
+/// Resolves a Book's full body or capability schemas with the same
+/// authorization predicates as [`get_book`]. `component` triggers Stage-4
+/// schema resolution for MCP/PLUGIN books.
+pub(crate) async fn load_book_content(
+    state: &AppState,
+    profile_id: Uuid,
+    user_id: Uuid,
+    role: &str,
+    book_id: Uuid,
+    component: Option<&str>,
+) -> Result<LoadedBookPayload, AppError> {
+    let row = sqlx::query(
+        "SELECT id, title, kind, book_type, body, trust, revision, metadata \
+         FROM books WHERE id=$1 AND profile_id=$2 \
+         AND ($3 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
+         AND ($3 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('USER','PRIVATE') OR owner_user_id=$4) \
+         AND (scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
+             $3 IN ('OWNER','ADMIN') OR (c.workspace_id IS NULL AND c.created_by_user_id=$4) OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$4)))) \
+         AND ($3 IN ('OWNER','ADMIN') OR scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+             SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$4))",
+    )
+    .bind(book_id)
+    .bind(profile_id)
+    .bind(role)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let title: String = row.get("title");
+    let kind: Option<String> = row.get("kind");
+    let book_type: String = row.get("book_type");
+    let body: String = row.get("body");
+    let trust: String = row.get("trust");
+    let revision: i64 = row.get("revision");
+    let metadata: serde_json::Value = row.get("metadata");
+    let kind_enum = match kind.as_deref() {
+        None | Some("SOURCE") => BookKind::Source,
+        Some("SKILL") => BookKind::Skill,
+        Some("MCP") => BookKind::Mcp,
+        Some("PLUGIN") => BookKind::Plugin,
+        Some("AUTOBIOGRAPHY") => BookKind::Autobiography,
+        Some(_) => return Err(AppError::Validation("book has an unknown kind".into())),
+    };
+    let book_type_enum = parse_book_type(&book_type)?;
+    let trust_enum = parse_trust(&trust)?;
+    let meta = BookMeta {
+        book_id,
+        title,
+        book_type: book_type_enum,
+        trust: trust_enum,
+        revision,
+    };
+    let loaded = match kind_enum {
+        BookKind::Source => {
+            let bounded = truncate_chars(&body, SOURCE_BODY_MAX_CHARS);
+            LoadedBookPayload {
+                book_id,
+                kind: None,
+                loaded_chars: bounded.chars().count(),
+                tools_discovered: 0,
+                tools_loaded: 0,
+                payload: serde_json::json!({
+                    "kind": "SOURCE", "body": bounded, "revision": meta.revision
+                }),
+                title: meta.title.clone(),
+                book_type: meta.book_type,
+                trust: meta.trust,
+                revision: meta.revision,
+            }
+        }
+        BookKind::Autobiography => {
+            let bounded = truncate_chars(&body, AUTOBIOGRAPHY_MAX_CHARS_LOAD);
+            LoadedBookPayload {
+                book_id,
+                kind: Some(BookKind::Autobiography),
+                loaded_chars: bounded.chars().count(),
+                tools_discovered: 0,
+                tools_loaded: 0,
+                payload: serde_json::json!({
+                    "kind": "AUTOBIOGRAPHY", "body": bounded, "revision": meta.revision
+                }),
+                title: meta.title.clone(),
+                book_type: meta.book_type,
+                trust: meta.trust,
+                revision: meta.revision,
+            }
+        }
+        BookKind::Skill => load_skill_payload(state, profile_id, &metadata, &meta).await?,
+        BookKind::Mcp => load_mcp_payload(state, profile_id, &metadata, &meta, component).await?,
+        BookKind::Plugin => {
+            load_plugin_payload(state, profile_id, &metadata, &meta, component).await?
+        }
+    };
+    Ok(loaded)
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_owned();
+    }
+    text.chars().take(max_chars).collect()
+}
+
+async fn load_skill_payload(
+    state: &AppState,
+    profile_id: Uuid,
+    metadata: &serde_json::Value,
+    meta: &BookMeta,
+) -> Result<LoadedBookPayload, AppError> {
+    let skill_id = metadata
+        .get("skill_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(AppError::NotFound)?;
+    let row = sqlx::query(
+        "SELECT s.name, r.content, r.revision \
+         FROM skills s JOIN skill_revisions r ON r.skill_id = s.id AND r.revision = s.active_revision \
+         WHERE s.id=$1 AND s.profile_id=$2",
+    )
+    .bind(skill_id)
+    .bind(profile_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let name: String = row.get("name");
+    let content: String = row.get("content");
+    let active_revision: i64 = row.get("revision");
+    let bounded = truncate_chars(&content, SKILL_CONTENT_MAX_CHARS);
+    Ok(LoadedBookPayload {
+        book_id: meta.book_id,
+        title: meta.title.clone(),
+        kind: Some(BookKind::Skill),
+        book_type: meta.book_type,
+        trust: meta.trust,
+        revision: meta.revision,
+        loaded_chars: bounded.chars().count(),
+        tools_discovered: 0,
+        tools_loaded: 0,
+        payload: serde_json::json!({
+            "kind": "SKILL",
+            "skill_id": skill_id,
+            "name": name,
+            "content": bounded,
+            "revision": active_revision,
+            "promoted": true,
+        }),
+    })
+}
+
+async fn load_mcp_payload(
+    state: &AppState,
+    profile_id: Uuid,
+    metadata: &serde_json::Value,
+    meta: &BookMeta,
+    component: Option<&str>,
+) -> Result<LoadedBookPayload, AppError> {
+    let mcp_server_id = metadata
+        .get("mcp_server_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(AppError::NotFound)?;
+    let name: String =
+        sqlx::query_scalar("SELECT name FROM mcp_servers WHERE id=$1 AND profile_id=$2")
+            .bind(mcp_server_id)
+            .bind(profile_id)
+            .fetch_one(&state.pool)
+            .await?;
+    let client = state
+        .mcp_clients
+        .get_or_connect(state, profile_id, mcp_server_id)
+        .await
+        .map_err(mcp_error_to_app)?;
+    let mut guard = client.lock().await;
+    let tools = guard.tools_list().await.map_err(mcp_error_to_app)?;
+    if let Some(component_name) = component {
+        let tool = tools
+            .iter()
+            .find(|tool| tool.name == component_name)
+            .ok_or(AppError::NotFound)?;
+        Ok(LoadedBookPayload {
+            book_id: meta.book_id,
+            title: meta.title.clone(),
+            kind: Some(BookKind::Mcp),
+            book_type: meta.book_type,
+            trust: meta.trust,
+            revision: meta.revision,
+            loaded_chars: 0,
+            tools_discovered: tools.len(),
+            tools_loaded: 1,
+            payload: serde_json::json!({
+                "kind": "MCP",
+                "mcp_server_id": mcp_server_id,
+                "name": name,
+                "transport": "stdio",
+                "component": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                    "output_schema": tool.output_schema,
+                },
+            }),
+        })
+    } else {
+        let summaries: Vec<serde_json::Value> = tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                })
+            })
+            .collect();
+        Ok(LoadedBookPayload {
+            book_id: meta.book_id,
+            title: meta.title.clone(),
+            kind: Some(BookKind::Mcp),
+            book_type: meta.book_type,
+            trust: meta.trust,
+            revision: meta.revision,
+            loaded_chars: 0,
+            tools_discovered: summaries.len(),
+            tools_loaded: 0,
+            payload: serde_json::json!({
+                "kind": "MCP",
+                "mcp_server_id": mcp_server_id,
+                "name": name,
+                "transport": "stdio",
+                "tools": summaries,
+            }),
+        })
+    }
+}
+
+async fn load_plugin_payload(
+    state: &AppState,
+    profile_id: Uuid,
+    metadata: &serde_json::Value,
+    meta: &BookMeta,
+    component: Option<&str>,
+) -> Result<LoadedBookPayload, AppError> {
+    let plugin_id = metadata
+        .get("plugin_id")
+        .and_then(|value| value.as_str())
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .ok_or(AppError::NotFound)?;
+    let plugin = sqlx::query("SELECT name, version FROM plugins WHERE id=$1 AND profile_id=$2")
+        .bind(plugin_id)
+        .bind(profile_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let name: String = plugin.get("name");
+    let version: String = plugin.get("version");
+    let rows = sqlx::query(
+        "SELECT component_type, name, manifest_ref, metadata FROM plugin_components \
+         WHERE plugin_id=$1 ORDER BY name",
+    )
+    .bind(plugin_id)
+    .fetch_all(&state.pool)
+    .await?;
+    let to_component = |row: &sqlx::postgres::PgRow| {
+        let component_metadata: serde_json::Value = row.get("metadata");
+        let description = component_metadata
+            .get("description")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        serde_json::json!({
+            "type": row.get::<String, _>("component_type"),
+            "name": row.get::<String, _>("name"),
+            "ref": row.get::<String, _>("manifest_ref"),
+            "description": description,
+        })
+    };
+    if let Some(component_name) = component {
+        let matched = rows
+            .iter()
+            .find(|row| row.get::<String, _>("name") == component_name);
+        let Some(matched) = matched else {
+            return Err(AppError::NotFound);
+        };
+        Ok(LoadedBookPayload {
+            book_id: meta.book_id,
+            title: meta.title.clone(),
+            kind: Some(BookKind::Plugin),
+            book_type: meta.book_type,
+            trust: meta.trust,
+            revision: meta.revision,
+            loaded_chars: 0,
+            tools_discovered: rows.len(),
+            tools_loaded: 1,
+            payload: serde_json::json!({
+                "kind": "PLUGIN",
+                "plugin_id": plugin_id,
+                "name": name,
+                "version": version,
+                "component": to_component(matched),
+            }),
+        })
+    } else {
+        let components: Vec<serde_json::Value> = rows.iter().map(to_component).collect();
+        Ok(LoadedBookPayload {
+            book_id: meta.book_id,
+            title: meta.title.clone(),
+            kind: Some(BookKind::Plugin),
+            book_type: meta.book_type,
+            trust: meta.trust,
+            revision: meta.revision,
+            loaded_chars: 0,
+            tools_discovered: components.len(),
+            tools_loaded: 0,
+            payload: serde_json::json!({
+                "kind": "PLUGIN",
+                "plugin_id": plugin_id,
+                "name": name,
+                "version": version,
+                "components": components,
+            }),
+        })
+    }
+}
+
+fn mcp_error_to_app(error: crate::mcp_client::McpClientError) -> AppError {
+    use crate::mcp_client::McpClientError;
+    match error {
+        McpClientError::NotFound => AppError::NotFound,
+        McpClientError::AuthRequired => {
+            AppError::Validation("MCP server requires OAuth authorization (auth_required)".into())
+        }
+        McpClientError::Disabled => AppError::Validation("MCP server is disabled".into()),
+        McpClientError::UnsupportedTransport(transport) => AppError::Validation(format!(
+            "MCP transport '{transport}' is not supported yet (only stdio)"
+        )),
+        McpClientError::SecretUnavailable => {
+            AppError::Validation("MCP server authentication secret is missing or unreadable".into())
+        }
+        McpClientError::SpawnFailed(_) => {
+            AppError::ServiceUnavailable("MCP server process could not be started")
+        }
+        McpClientError::Timeout => {
+            AppError::ServiceUnavailable("MCP server did not respond within 30 seconds")
+        }
+        McpClientError::Transport(_)
+        | McpClientError::Wire(_)
+        | McpClientError::ProtocolViolation(_) => {
+            AppError::ServiceUnavailable("MCP server transport failed")
+        }
+        McpClientError::ToolsLimitExceeded { .. }
+        | McpClientError::SchemaTooLarge
+        | McpClientError::InvalidResponse
+        | McpClientError::Handshake(_)
+        | McpClientError::Rpc { .. } => AppError::Validation(error.to_string()),
+        McpClientError::Database(_) => AppError::Database(sqlx::Error::Protocol(
+            "MCP server configuration read failed".into(),
+        )),
+    }
+}
+
+/// POST /library/books/{id}/load — progressive loading for the UI. Returns
+/// the full body (SOURCE/AUTOBIOGRAPHY), the active skill revision, the MCP
+/// tool list (or one tool schema via `?component=`), or the plugin component
+/// manifest. Same resolution and authorization as the `library_load` tool.
+pub async fn load_book(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(query): Query<LoadBookQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let loaded = load_book_content(
+        &state,
+        user.profile_id,
+        user.id,
+        &user.role,
+        id,
+        query.component.as_deref(),
+    )
+    .await?;
+    let mut value = loaded.payload;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("book_id".into(), serde_json::json!(loaded.book_id));
+        object.insert("title".into(), serde_json::json!(loaded.title));
+        object.insert("kind".into(), serde_json::json!(loaded.kind));
+        object.insert("book_type".into(), serde_json::json!(loaded.book_type));
+        object.insert("trust".into(), serde_json::json!(loaded.trust));
+        object.insert("revision".into(), serde_json::json!(loaded.revision));
+    }
+    Ok(Json(value))
+}
+
 pub async fn search_books(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -234,8 +680,20 @@ pub async fn search_books(
     authorize_workspace(&state, &user, query.workspace_id, false).await?;
     let limit = query.limit.unwrap_or(20).clamp(1, 100);
     let candidate_limit = (limit * 3).min(300);
+    let kind_filter = match query.kind.as_deref() {
+        None => None,
+        Some("SOURCE") | Some("SKILL") | Some("MCP") | Some("PLUGIN") | Some("AUTOBIOGRAPHY") => {
+            Some(query.kind.clone().expect("checked above"))
+        }
+        Some(other) => {
+            return Err(AppError::Validation(format!(
+                "kind filter must be one of SOURCE, SKILL, MCP, PLUGIN, AUTOBIOGRAPHY (got '{other}')"
+            )));
+        }
+    };
     let lexical_rows = sqlx::query(
-        "SELECT id, title, ts_headline('english', body, websearch_to_tsquery('english', $1), \
+        "SELECT id, title, kind, metadata, \
+             ts_headline('english', body, websearch_to_tsquery('english', $1), \
              'MaxWords=32, MinWords=8, ShortWord=3') AS snippet, book_type, scope, tags, provenance, trust, revision, \
              ts_rank_cd(search_document, websearch_to_tsquery('english', $1)) AS relevance, workspace_id, updated_at \
          FROM books WHERE profile_id = $2 \
@@ -249,6 +707,7 @@ pub async fn search_books(
                 SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$6)) \
            AND ($3::uuid IS NULL OR scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR workspace_id=$3 \
                 OR (scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND c.workspace_id=$3))) \
+           AND ($7::text IS NULL OR ($7::text='SOURCE' AND (kind IS NULL OR kind='SOURCE')) OR kind = $7::text) \
            AND search_document @@ websearch_to_tsquery('english', $1) \
          ORDER BY relevance DESC, updated_at DESC LIMIT $4",
     )
@@ -258,6 +717,7 @@ pub async fn search_books(
     .bind(candidate_limit)
     .bind(&user.role)
     .bind(user.id)
+    .bind(&kind_filter)
     .fetch_all(&state.pool)
     .await?;
     let mut candidates = HashMap::new();
@@ -272,7 +732,7 @@ pub async fn search_books(
     if let Some((model_id, vector)) = embedding::embed_query(&state, user.profile_id, text).await? {
         let vector = embedding::vector_literal(&vector);
         let semantic_rows = sqlx::query(
-            "SELECT * FROM (SELECT DISTINCT ON (b.id) b.id,b.title,left(c.text,400) AS snippet,b.book_type,b.scope,b.tags, \
+            "SELECT * FROM (SELECT DISTINCT ON (b.id) b.id,b.title,b.kind,b.metadata,left(c.text,400) AS snippet,b.book_type,b.scope,b.tags, \
                  b.provenance,b.trust,b.revision,b.workspace_id,b.updated_at, \
                  (1-(e.embedding <=> ($1::text)::vector))::real AS relevance, \
                  e.embedding <=> ($1::text)::vector AS distance \
@@ -290,7 +750,9 @@ pub async fn search_books(
                AND ($4::uuid IS NULL OR b.scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR b.workspace_id=$4 \
                     OR (b.scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations conversation \
                         WHERE conversation.id=b.conversation_id AND conversation.workspace_id=$4))) \
-             ORDER BY b.id, distance) ranked ORDER BY distance,id LIMIT $7",
+             ORDER BY b.id, distance) ranked WHERE \
+             ($8::text IS NULL OR ($8::text='SOURCE' AND (kind IS NULL OR kind='SOURCE')) OR kind = $8::text) \
+             ORDER BY distance,id LIMIT $7",
         )
         .bind(vector)
         .bind(model_id)
@@ -299,6 +761,7 @@ pub async fn search_books(
         .bind(&user.role)
         .bind(user.id)
         .bind(candidate_limit)
+        .bind(&kind_filter)
         .fetch_all(&state.pool)
         .await?;
         for row in semantic_rows {
@@ -372,7 +835,7 @@ pub async fn list_books(
 ) -> Result<Json<Vec<BookSummary>>, AppError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, title, left(body, 240) AS snippet, book_type, scope, tags, provenance, trust, revision, \
+        "SELECT id, title, kind, metadata, left(body, 240) AS snippet, book_type, scope, tags, provenance, trust, revision, \
          0.0::real AS relevance, updated_at FROM books WHERE profile_id=$1 \
          AND ($2 IN ('OWNER','ADMIN') OR security_classification <> 'RESTRICTED') \
          AND ($2 IN ('OWNER','ADMIN') OR scope <> 'AGENT') \
@@ -391,21 +854,26 @@ pub async fn list_books(
     .await?;
     Ok(Json(
         rows.into_iter()
-            .map(|row| BookSummary {
-                id: row.get("id"),
-                title: row.get("title"),
-                snippet: row.get("snippet"),
-                book_type: row.get("book_type"),
-                scope: row.get("scope"),
-                tags: row.get("tags"),
-                provenance: row.get("provenance"),
-                trust: row.get("trust"),
-                revision: row.get("revision"),
-                relevance: row.get("relevance"),
-                retrieval_mode: "recent".into(),
-                lexical_score: None,
-                semantic_score: None,
-                updated_at: row.get("updated_at"),
+            .map(|row| {
+                let metadata: serde_json::Value = row.get("metadata");
+                BookSummary {
+                    id: row.get("id"),
+                    title: row.get("title"),
+                    kind: row.get("kind"),
+                    capabilities: capabilities_from_metadata(&metadata),
+                    snippet: row.get("snippet"),
+                    book_type: row.get("book_type"),
+                    scope: row.get("scope"),
+                    tags: row.get("tags"),
+                    provenance: row.get("provenance"),
+                    trust: row.get("trust"),
+                    revision: row.get("revision"),
+                    relevance: row.get("relevance"),
+                    retrieval_mode: "recent".into(),
+                    lexical_score: None,
+                    semantic_score: None,
+                    updated_at: row.get("updated_at"),
+                }
             })
             .collect(),
     ))
@@ -833,10 +1301,13 @@ fn search_candidate(
     lexical_score: Option<f32>,
     semantic_score: Option<f32>,
 ) -> SearchCandidate {
+    let metadata: serde_json::Value = row.get("metadata");
     SearchCandidate {
         summary: BookSummary {
             id: row.get("id"),
             title: row.get("title"),
+            kind: row.get("kind"),
+            capabilities: capabilities_from_metadata(&metadata),
             snippet: row.get("snippet"),
             book_type: row.get("book_type"),
             scope: row.get("scope"),
@@ -852,4 +1323,19 @@ fn search_candidate(
         },
         workspace_id: row.get("workspace_id"),
     }
+}
+
+/// Extracts the `capabilities` array (component/tool names) from book
+/// metadata. Missing or malformed values yield an empty list.
+fn capabilities_from_metadata(metadata: &serde_json::Value) -> Vec<String> {
+    metadata
+        .get("capabilities")
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }

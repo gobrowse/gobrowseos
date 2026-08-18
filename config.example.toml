@@ -43,6 +43,13 @@ local_models = false
 # sandbox_auth_token = "must match sandboxd --auth-token-file"
 # sandbox_socket_timeout_seconds = 30
 # sandbox_plugin_image = "localhost/gobrowse-workspace:v1"
+# Root directory for plugin artifacts + staging areas (created at startup):
+# plugins_dir = "./data/plugins"
+# Plugin source test overrides (normally unset -> api.github.com /
+# raw.githubusercontent.com). The optional GITHUB_TOKEN env var raises GitHub
+# API rate limits for plugin preview/install/search; it is never required.
+# github_api_base_url = "https://api.github.com"
+# github_raw_base_url = "https://raw.githubusercontent.com"
 
 [observability]
 json_logs = false

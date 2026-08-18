@@ -24,6 +24,10 @@ pub struct ToolContext {
     pub profile_id: Uuid,
     pub workspace_id: Option<Uuid>,
     pub run_id: Uuid,
+    /// Requester's profile-level role (`OWNER`/`ADMIN`/`EDITOR`/`VIEWER`),
+    /// used by tools for the same authorization predicates the HTTP layer
+    /// enforces (e.g. RESTRICTED-content access).
+    pub role: String,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

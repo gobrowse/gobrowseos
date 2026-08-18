@@ -11,11 +11,15 @@ pub mod embedding_api;
 pub mod error;
 pub mod library_api;
 pub mod mcp_api;
+pub mod mcp_client;
 pub mod model_api;
 pub mod outbound_http;
+pub mod plugin_api;
+pub mod plugin_github;
 pub mod realtime;
 pub mod run_api;
 pub mod run_tools;
+pub mod sandbox_api;
 pub mod sandbox_client;
 pub mod skills_api;
 pub mod task_api;
@@ -54,6 +58,7 @@ use crate::{
     auth::PasswordRuntime,
     config::Settings,
     error::AppError,
+    plugin_github::{GitHubMarketplace, GitHubReleaseSource},
     sandbox_client::{SandboxClient, SandboxConfig},
     vault::Vault,
 };
@@ -69,6 +74,13 @@ pub struct AppState {
     /// daemon socket/token are not configured. A down daemon never fails
     /// startup: failures surface lazily at call time.
     pub sandbox: Option<SandboxClient>,
+    /// GitHub release plugin source (honors test base-URL overrides).
+    pub plugin_source: GitHubReleaseSource,
+    /// GitHub marketplace adapter for `POST /plugins/search`.
+    pub plugin_marketplace: GitHubMarketplace,
+    /// Per-server MCP client pool (Lane E). Connections are created lazily on
+    /// first `library_load` for an MCP book.
+    pub mcp_clients: mcp_client::McpClientPool,
 }
 
 impl AppState {
@@ -96,6 +108,8 @@ impl AppState {
         } else {
             None
         };
+        let plugin_source = GitHubReleaseSource::from_settings(&settings.features);
+        let plugin_marketplace = GitHubMarketplace::from_settings(&settings.features);
         Ok(Self {
             pool,
             settings: Arc::new(settings),
@@ -103,7 +117,21 @@ impl AppState {
             vault,
             run_cancellations: Arc::new(RwLock::new(HashMap::new())),
             sandbox,
+            plugin_source,
+            plugin_marketplace,
+            mcp_clients: mcp_client::McpClientPool::new(),
         })
+    }
+
+    /// Returns the plugin source implementation for a `source_type` string,
+    /// rejecting unsupported types with an actionable error.
+    pub fn plugin_source_for(&self, source_type: &str) -> Result<&GitHubReleaseSource, AppError> {
+        match source_type {
+            "github_release" => Ok(&self.plugin_source),
+            other => Err(AppError::Validation(format!(
+                "unsupported plugin source type `{other}`; supported: github_release"
+            ))),
+        }
     }
 }
 
@@ -227,6 +255,27 @@ pub fn router(state: AppState) -> Router {
             "/library/books/{id}/history",
             get(library_api::book_history),
         )
+        // --- Lane C: plugin install server flow -----------------------------
+        // Preview never installs; install requires approve + matching digest.
+        // Upgrade stages with a permission diff; activate/rollback serialize
+        // per plugin via SELECT ... FOR UPDATE on the plugins row.
+        .route("/plugins/preview", post(plugin_api::preview))
+        .route("/plugins/install", post(plugin_api::install))
+        .route("/plugins/search", post(plugin_api::search))
+        .route("/plugins", get(plugin_api::list))
+        .route(
+            "/plugins/{id}",
+            get(plugin_api::get)
+                .patch(plugin_api::patch)
+                .delete(plugin_api::delete_plugin),
+        )
+        .route("/plugins/{id}/upgrade", post(plugin_api::upgrade))
+        .route(
+            "/plugins/{id}/upgrade/{version}/activate",
+            post(plugin_api::activate),
+        )
+        .route("/plugins/{id}/rollback", post(plugin_api::rollback))
+        // --- End Lane C ------------------------------------------------------
         .route(
             "/skills",
             get(skills_api::list_skills).post(skills_api::create_skill),
@@ -280,6 +329,45 @@ pub fn router(state: AppState) -> Router {
             post(autobiography_api::review_proposal),
         )
         .route("/autobiography/rollback", post(autobiography_api::rollback))
+        // ── Lane E: progressive loading + sandbox API ───────────────────
+        // Library progressive loading (full body / skill revision / MCP
+        // tools / plugin components; `?component=` resolves one schema).
+        .route("/library/books/{id}/load", post(library_api::load_book))
+        // Sandbox backend for the browser terminal + file manager.
+        .route("/sandbox/exec", post(sandbox_api::exec))
+        .route("/sandbox/files/read", post(sandbox_api::read_file))
+        .route("/sandbox/files/write", post(sandbox_api::write_file))
+        .route("/sandbox/files/list", post(sandbox_api::list_files))
+        .route("/sandbox/files/stat", post(sandbox_api::stat_file))
+        .route("/sandbox/files/mkdir", post(sandbox_api::mkdir))
+        .route("/sandbox/files/remove", post(sandbox_api::remove))
+        .route("/sandbox/terminal/start", post(sandbox_api::terminal_start))
+        .route(
+            "/sandbox/terminal/{id}/write",
+            post(sandbox_api::terminal_write),
+        )
+        .route(
+            "/sandbox/terminal/{id}/read",
+            post(sandbox_api::terminal_read),
+        )
+        .route(
+            "/sandbox/terminal/{id}/resize",
+            post(sandbox_api::terminal_resize),
+        )
+        .route(
+            "/sandbox/terminal/{id}/interrupt",
+            post(sandbox_api::terminal_interrupt),
+        )
+        .route(
+            "/sandbox/terminal/{id}/close",
+            post(sandbox_api::terminal_close),
+        )
+        .route("/sandbox/processes", post(sandbox_api::processes))
+        .route(
+            "/sandbox/processes/{pid}/kill",
+            post(sandbox_api::kill_process),
+        )
+        // ── end Lane E ───────────────────────────────────────────────────
         .route("/runs/{id}/realtime", get(realtime::upgrade));
 
     Router::new()

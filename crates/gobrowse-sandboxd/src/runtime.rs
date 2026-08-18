@@ -238,6 +238,11 @@ pub trait SandboxRuntime: Send + Sync {
     async fn resume_workspace(&self, pause: &WorkspacePause) -> Result<(), RuntimeError>;
     async fn reconcile_recoveries(&self) -> Result<(), RuntimeError>;
     async fn ensure_workspace_recovered(&self, workspace_id: Uuid) -> Result<(), RuntimeError>;
+    /// Register the workspace named volume with the runtime so Start's
+    /// `verify_workspace_volume` can attest it. Idempotent.
+    async fn provision_workspace(&self, _workspace_id: Uuid) -> Result<(), RuntimeError> {
+        Err(RuntimeError::InvalidConfiguration)
+    }
     async fn shutdown(&self) -> Result<(), RuntimeError> {
         Ok(())
     }
@@ -697,6 +702,17 @@ impl PodmanRuntime {
                 "inspect".into(),
                 "--format".into(),
                 "{{.Name}}|{{.Driver}}|{{json .Options}}|{{.Mountpoint}}".into(),
+                workspace_volume_name(workspace_id),
+            ],
+        }
+    }
+
+    pub fn volume_create_spec(&self, workspace_id: Uuid) -> ProcessSpec {
+        ProcessSpec {
+            program: self.config.executable.clone(),
+            args: vec![
+                "volume".into(),
+                "create".into(),
                 workspace_volume_name(workspace_id),
             ],
         }
@@ -1815,6 +1831,29 @@ impl SandboxRuntime for PodmanRuntime {
             .await?;
         }
         self.remove_workspace_orphans(workspace_id).await
+    }
+
+    async fn provision_workspace(&self, workspace_id: Uuid) -> Result<(), RuntimeError> {
+        let (status, _) = self
+            .run_output_bounded(self.volume_inspect_spec(workspace_id), 16 * 1024)
+            .await?;
+        if status.success() {
+            return Ok(());
+        }
+        // Register the named volume; the daemon's `_data` directory already exists
+        // under the trusted root (created by Filesystem::ensure_workspace), so podman
+        // adopts it as the volume mountpoint. Ignore the benign "already exists" case.
+        let (status, output) = self
+            .run_output_bounded(self.volume_create_spec(workspace_id), 16 * 1024)
+            .await?;
+        if status.success() {
+            return Ok(());
+        }
+        let message = String::from_utf8_lossy(&output).to_string();
+        if message.contains("already exists") || message.contains("already in use") {
+            return Ok(());
+        }
+        Err(RuntimeError::PodmanFailed)
     }
 
     async fn shutdown(&self) -> Result<(), RuntimeError> {

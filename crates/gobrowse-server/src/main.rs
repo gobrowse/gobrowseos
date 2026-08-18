@@ -128,6 +128,9 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         .await
         .context("connect to database")?;
     db::migrate(&pool).await.context("apply migrations")?;
+    tokio::fs::create_dir_all(&settings.features.plugins_dir)
+        .await
+        .context("create plugins directory")?;
     let bind = settings.http.bind;
     let state = AppState::new(pool, settings)
         .await

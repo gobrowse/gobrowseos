@@ -36,6 +36,37 @@ struct RunLease {
     takeover: bool,
 }
 
+/// Per-run progressive-loading counters (Lane E). Mutated by `build_messages`
+/// (searches/considerations) and the `library_load` tool (loads/discoveries),
+/// then persisted as a single `token_metrics` run_event at run completion.
+#[derive(Debug, Clone, Default)]
+pub struct RunTokenMetrics {
+    /// How many times the Phase-2 unified library search ran for this run.
+    pub book_searches: u32,
+    /// How many book summaries were shown to the model.
+    pub books_considered: u32,
+    /// How many Books had full body+schemas loaded via `library_load`.
+    pub books_loaded: u32,
+    /// Total characters loaded from book bodies/skill content.
+    pub book_tokens_loaded: u64,
+    /// SKILL books specifically loaded.
+    pub skill_book_loads: u32,
+    /// PLUGIN books specifically loaded.
+    pub plugin_book_loads: u32,
+    /// MCP books specifically loaded.
+    pub mcp_book_loads: u32,
+    /// SOURCE (and AUTOBIOGRAPHY) books specifically loaded.
+    pub source_book_loads: u32,
+    /// Tools/components discovered from plugin-embedded MCP books.
+    pub plugin_tools_discovered: u32,
+    /// Plugin tool/component schemas loaded (Stage-4 component loads).
+    pub plugin_tools_loaded: u32,
+    /// Tools discovered from standalone MCP books.
+    pub mcp_tools_discovered: u32,
+    /// MCP tool schemas loaded (Stage-4 component loads).
+    pub mcp_tools_loaded: u32,
+}
+
 #[derive(Deserialize)]
 pub struct StartRunRequest {
     pub input_message_id: Uuid,
@@ -601,7 +632,7 @@ async fn execute_inner(
     .await
     .map_err(database_failure)?;
     let row = sqlx::query(
-        "SELECT run.profile_id,run.conversation_id,run.input_message_id,run.requested_model_id,run.requested_by \
+        "SELECT run.profile_id,run.conversation_id,run.input_message_id,run.requested_model_id,run.requested_by,requester.role \
          FROM agent_runs run JOIN users requester ON requester.id=run.requested_by \
          JOIN conversations conversation ON conversation.id=run.conversation_id \
          WHERE run.id=$1 AND requester.disabled_at IS NULL AND requester.role<>'VIEWER' AND ( \
@@ -618,6 +649,7 @@ async fn execute_inner(
     let conversation_id: Uuid = row.get("conversation_id");
     let requested_model_id: Option<String> = row.get("requested_model_id");
     let requested_by: Uuid = row.get("requested_by");
+    let requester_role: String = row.get("role");
     let workspace_id: Option<Uuid> =
         sqlx::query_scalar("SELECT workspace_id FROM conversations WHERE id=$1")
             .bind(conversation_id)
@@ -632,11 +664,14 @@ async fn execute_inner(
                 "chat model configuration is unavailable",
             )
         })?;
+    let token_metrics = std::sync::Arc::new(std::sync::Mutex::new(RunTokenMetrics::default()));
     let (messages, context_snapshot) = build_messages(
         &state.pool,
         profile_id,
         conversation_id,
+        requested_by,
         limits.context_window.saturating_sub(limits.output_limit),
+        &token_metrics,
     )
     .await
     .map_err(|_| {
@@ -695,7 +730,7 @@ async fn execute_inner(
         routes
     };
     let tool_defs = if supports_tools {
-        crate::run_tools::tool_definitions()
+        crate::run_tools::tool_definitions(state.sandbox.is_some())
     } else {
         vec![]
     };
@@ -886,6 +921,7 @@ async fn execute_inner(
                 &selected,
                 &output,
                 usage,
+                &token_metrics,
             )
             .await
             .map_err(database_failure)?;
@@ -917,6 +953,7 @@ async fn execute_inner(
                         profile_id,
                         workspace_id,
                         run_id,
+                        role: requester_role.clone(),
                     };
                     tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
                         .await
@@ -932,12 +969,53 @@ async fn execute_inner(
                         profile_id,
                         workspace_id,
                         run_id,
+                        role: requester_role.clone(),
                     };
                     tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
                         .await
                         .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
                 }
-                _ => Err(gobrowse_core::tools::ToolError::InvalidInput),
+                "library_load" => {
+                    let tool = crate::run_tools::LibraryLoadTool {
+                        state: state.clone(),
+                        metrics: std::sync::Arc::clone(&token_metrics),
+                    };
+                    let ctx = gobrowse_core::tools::ToolContext {
+                        call_id: Uuid::now_v7(),
+                        user_id: requested_by,
+                        profile_id,
+                        workspace_id,
+                        run_id,
+                        role: requester_role.clone(),
+                    };
+                    tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
+                        .await
+                        .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
+                }
+                _ => {
+                    if let Some(kind) = crate::run_tools::sandbox_tool_kind(name) {
+                        let tool = crate::run_tools::SandboxTool {
+                            state: state.clone(),
+                            kind,
+                        };
+                        let ctx = gobrowse_core::tools::ToolContext {
+                            call_id: Uuid::now_v7(),
+                            user_id: requested_by,
+                            profile_id,
+                            workspace_id,
+                            run_id,
+                            role: requester_role.clone(),
+                        };
+                        tokio::time::timeout(
+                            Duration::from_secs(10),
+                            tool.execute(&ctx, input.clone()),
+                        )
+                        .await
+                        .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
+                    } else {
+                        Err(gobrowse_core::tools::ToolError::InvalidInput)
+                    }
+                }
             };
 
             let (output_value, is_error) = match result {
@@ -1095,7 +1173,9 @@ async fn build_messages(
     pool: &PgPool,
     profile_id: Uuid,
     conversation_id: Uuid,
+    user_id: Uuid,
     budget: u32,
+    metrics: &std::sync::Arc<std::sync::Mutex<RunTokenMetrics>>,
 ) -> Result<(Vec<NeutralMessage>, serde_json::Value), AppError> {
     let policy_tokens = estimate_tokens(SYSTEM_POLICY);
     if policy_tokens >= budget {
@@ -1145,35 +1225,68 @@ async fn build_messages(
         .find(|message| message.role == MessageRole::User)
         .map(|message| content_text(&message.content))
         .unwrap_or_default();
+    // Phase 2 (always): unified Library search — bounded snippets only, never
+    // full bodies. This is the *implicit* retrieval context, so it is
+    // deliberately conservative (A3): RESTRICTED/AGENT/PRIVATE/USER scopes are
+    // never injected into model context implicitly, WORKSPACE/PROJECT books
+    // require workspace membership, and NULL-kind legacy books are included
+    // (treated as SOURCE). AUTOBIOGRAPHY books are excluded from agent
+    // retrieval. Explicit loads via `library_load` use the regular
+    // `library_api` authorization predicates.
     let library_rows = sqlx::query(
-        "SELECT id,title,left(body,3000) AS body,trust FROM books WHERE profile_id=$1 \
-         AND book_type NOT IN ('AUTOBIOGRAPHY','CONVERSATION') \
-          AND security_classification IN ('PUBLIC','INTERNAL') \
-          AND scope IN ('GLOBAL','PROFILE','WORKSPACE','PROJECT') \
-          AND (($3::uuid IS NULL AND scope NOT IN ('WORKSPACE','PROJECT')) \
-               OR ($3::uuid IS NOT NULL AND (scope IN ('GLOBAL','PROFILE') OR workspace_id=$3))) \
-         AND search_document @@ websearch_to_tsquery('english',$2) \
-         ORDER BY ts_rank_cd(search_document,websearch_to_tsquery('english',$2)) DESC LIMIT 5",
+        "SELECT b.id, b.title, b.kind, b.book_type, b.trust, b.provenance, b.tags, b.revision, \
+             ts_headline('english', \
+               CASE WHEN b.kind IN ('SKILL','MCP','PLUGIN') THEN b.body ELSE left(b.body,500) END, \
+               websearch_to_tsquery('english', $1), 'MaxWords=24, MinWords=6, ShortWord=3') AS snippet \
+         FROM books b WHERE b.profile_id = $2 \
+           AND b.security_classification <> 'RESTRICTED' \
+           AND b.scope <> 'AGENT' \
+           AND b.scope NOT IN ('USER','PRIVATE') \
+           AND b.scope IN ('GLOBAL','PROFILE','WORKSPACE','PROJECT') \
+           AND (b.scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
+               SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=b.workspace_id AND member.user_id=$4)) \
+           AND ($3::uuid IS NULL OR b.scope IN ('GLOBAL','PROFILE') OR b.workspace_id=$3) \
+           AND (b.kind IS NULL OR b.kind IN ('SOURCE','SKILL','MCP','PLUGIN')) \
+           AND b.search_document @@ websearch_to_tsquery('english', $1) \
+         ORDER BY ts_rank_cd(b.search_document, websearch_to_tsquery('english', $1)) DESC, b.updated_at DESC \
+         LIMIT 12",
     )
-    .bind(profile_id)
     .bind(&query)
+    .bind(profile_id)
     .bind(workspace_id)
+    .bind(user_id)
     .fetch_all(pool)
     .await?;
     let mut candidates = Vec::new();
     for row in library_rows {
+        let id: Uuid = row.get("id");
         let title: String = row.get("title");
-        let body: String = row.get("body");
-        let content = format!("Book: {title}\n{body}");
+        let kind: Option<String> = row.get("kind");
+        let snippet: String = row.get("snippet");
+        let trust: String = row.get("trust");
+        let tags: Vec<String> = row.get("tags");
+        let kind_label = kind.as_deref().unwrap_or("SOURCE");
+        let tag_list = if tags.is_empty() {
+            String::new()
+        } else {
+            format!(" Tags: {}", tags.join(", "))
+        };
+        let content = format!("[{kind_label}] {title}\n{snippet}\nTrust: {trust}{tag_list}");
         candidates.push(ContextCandidate {
             source: ContextSource::LibraryRetrieval,
-            stable_id: row.get::<Uuid, _>("id").to_string(),
+            stable_id: id.to_string(),
             token_estimate: estimate_tokens(&content),
             content,
             priority: 300,
             required: false,
-            trust_label: row.get("trust"),
+            trust_label: trust,
         });
+    }
+    if let Ok(mut metrics) = metrics.lock() {
+        metrics.book_searches = metrics.book_searches.saturating_add(1);
+        metrics.books_considered = metrics
+            .books_considered
+            .saturating_add(u32::try_from(candidates.len()).unwrap_or(u32::MAX));
     }
 
     // Feature 1: PinnedBook candidates (priority 400)
@@ -1309,6 +1422,7 @@ async fn build_messages(
     Ok((messages, snapshot))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn complete_run(
     state: &AppState,
     run_id: Uuid,
@@ -1317,6 +1431,7 @@ async fn complete_run(
     selected: &gobrowse_core::model::ModelIdentity,
     output: &str,
     usage: Option<serde_json::Value>,
+    metrics: &std::sync::Arc<std::sync::Mutex<RunTokenMetrics>>,
 ) -> Result<(), sqlx::Error> {
     let mut tx = state.pool.begin().await?;
     lock_event_sequence(&mut tx, lease.profile_id).await?;
@@ -1404,6 +1519,8 @@ async fn complete_run(
         serde_json::json!({"message_id":message_id}),
     )
     .await?;
+    let metrics_payload = metrics_event_payload(metrics);
+    append_event_tx(&mut tx, run_id, "token_metrics", metrics_payload).await?;
     sqlx::query("UPDATE conversations SET updated_at=now() WHERE id=$1")
         .bind(conversation_id)
         .execute(&mut *tx)
@@ -1780,6 +1897,31 @@ fn parse_role(role: String) -> MessageRole {
     }
 }
 
+/// Serializes the per-run token metrics into the `token_metrics` run_event
+/// payload. A poisoned metrics lock yields an empty object (the run itself
+/// still completes).
+fn metrics_event_payload(
+    metrics: &std::sync::Arc<std::sync::Mutex<RunTokenMetrics>>,
+) -> serde_json::Value {
+    let Ok(metrics) = metrics.lock() else {
+        return serde_json::json!({});
+    };
+    serde_json::json!({
+        "book_searches": metrics.book_searches,
+        "books_considered": metrics.books_considered,
+        "books_loaded": metrics.books_loaded,
+        "book_tokens_loaded": metrics.book_tokens_loaded,
+        "skill_book_loads": metrics.skill_book_loads,
+        "plugin_book_loads": metrics.plugin_book_loads,
+        "mcp_book_loads": metrics.mcp_book_loads,
+        "source_book_loads": metrics.source_book_loads,
+        "plugin_tools_discovered": metrics.plugin_tools_discovered,
+        "plugin_tools_loaded": metrics.plugin_tools_loaded,
+        "mcp_tools_discovered": metrics.mcp_tools_discovered,
+        "mcp_tools_loaded": metrics.mcp_tools_loaded,
+    })
+}
+
 fn estimate_tokens(text: &str) -> u32 {
     u32::try_from(text.chars().count().div_ceil(4)).unwrap_or(u32::MAX)
 }
@@ -1888,6 +2030,34 @@ pub async fn test_fail_run(
 mod concurrency_tests {
     use super::*;
     use crate::db;
+
+    #[test]
+    fn token_metrics_event_payload_serializes_all_counters() {
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(RunTokenMetrics {
+            book_searches: 1,
+            books_considered: 12,
+            books_loaded: 2,
+            book_tokens_loaded: 5_000,
+            skill_book_loads: 1,
+            plugin_book_loads: 0,
+            mcp_book_loads: 1,
+            source_book_loads: 0,
+            plugin_tools_discovered: 0,
+            plugin_tools_loaded: 0,
+            mcp_tools_discovered: 16,
+            mcp_tools_loaded: 1,
+        }));
+        let payload = metrics_event_payload(&metrics);
+        assert_eq!(payload["book_searches"], 1);
+        assert_eq!(payload["books_considered"], 12);
+        assert_eq!(payload["books_loaded"], 2);
+        assert_eq!(payload["book_tokens_loaded"], 5_000);
+        assert_eq!(payload["skill_book_loads"], 1);
+        assert_eq!(payload["mcp_book_loads"], 1);
+        assert_eq!(payload["mcp_tools_discovered"], 16);
+        assert_eq!(payload["mcp_tools_loaded"], 1);
+        assert_eq!(payload["plugin_tools_discovered"], 0);
+    }
 
     #[test]
     fn text_event_chunks_preserve_unicode_boundaries() {
@@ -2125,20 +2295,32 @@ mod concurrency_tests {
                 .bind(Uuid::now_v7()).bind(profile_id).bind(title).bind(body).bind(book_type).bind(scope).bind(classification).bind(user_id)
                 .execute(&pool).await.expect("insert context book");
         }
-        let (messages, _) = build_messages(&pool, profile_id, conversation_id, 4096)
-            .await
-            .expect("build context");
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(RunTokenMetrics::default()));
+        let (messages, _) =
+            build_messages(&pool, profile_id, conversation_id, user_id, 4096, &metrics)
+                .await
+                .expect("build context");
         let rendered = messages
             .iter()
             .map(|message| content_text(&message.content))
             .collect::<Vec<_>>()
             .join("\n");
+        // Phase-2 implicit context surfaces the safe book's snippet.
         assert!(rendered.contains("SAFE_REFERENCE"));
+        // Snippets only: no full bodies (and no raw/escaped body markup).
         assert!(!rendered.contains("</context_data>"));
-        assert!(rendered.contains("\\u003c/context_data\\u003e"));
+        assert!(!rendered.contains("\\u003c/context_data\\u003e"));
+        // Restricted / private / autobiography content never leaks into the
+        // implicit context.
         assert!(!rendered.contains("AUTOBIOGRAPHY_SECRET"));
         assert!(!rendered.contains("RESTRICTED_SECRET"));
         assert!(!rendered.contains("PRIVATE_SECRET"));
+        // Token metrics record the search and considered candidates.
+        {
+            let metrics = metrics.lock().unwrap();
+            assert_eq!(metrics.book_searches, 1);
+            assert!(metrics.books_considered >= 1);
+        }
         sqlx::query("DELETE FROM conversations WHERE id=$1")
             .bind(conversation_id)
             .execute(&pool)

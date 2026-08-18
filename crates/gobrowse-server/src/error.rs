@@ -20,6 +20,8 @@ pub enum AppError {
     Conflict(&'static str),
     #[error("invalid request: {0}")]
     Validation(String),
+    #[error("service unavailable: {0}")]
+    ServiceUnavailable(&'static str),
     #[error("too many requests")]
     RateLimited,
     #[error("database operation failed")]
@@ -39,6 +41,11 @@ impl IntoResponse for AppError {
             Self::Validation(_) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation",
+                self.to_string(),
+            ),
+            Self::ServiceUnavailable(_) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
                 self.to_string(),
             ),
             Self::RateLimited => (
@@ -98,6 +105,11 @@ mod tests {
                 AppError::Validation("field x is required".into()),
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "validation",
+            ),
+            (
+                AppError::ServiceUnavailable("plugin source unreachable"),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "service_unavailable",
             ),
             (
                 AppError::RateLimited,

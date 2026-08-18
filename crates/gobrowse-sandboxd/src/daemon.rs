@@ -528,6 +528,7 @@ impl Daemon {
                     return Err(DaemonError::InvalidRequest);
                 }
                 self.filesystem.ensure_workspace(workspace_id)?;
+                self.runtime.provision_workspace(workspace_id).await?;
                 Ok(SandboxResult::Provisioned { workspace_id })
             }
             SandboxOperation::Start {
