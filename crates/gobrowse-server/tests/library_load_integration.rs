@@ -203,7 +203,9 @@ async fn search_supports_kind_filter_and_never_returns_bodies() {
         &pool,
         profile_id,
         "Deploy Runbook",
-        "STEP_BY_STEP deploy the fixture to production",
+        "STEP_BY_STEP context filler context filler context filler context filler context filler \
+         context filler context filler context filler context filler context filler context filler \
+         context filler context filler deploy the fixture to production",
     )
     .await;
     let (_skill_id, skill_book_id) =
