@@ -1572,19 +1572,32 @@ impl SandboxRuntime for PodmanRuntime {
             // and the RUNNING transition — the monitor owns the EXITED state
             // and the output is journaled for the drain.
             Ok(()) if session.lifecycle().is_terminal() || self.exited_normally(&session) => Ok(()),
-            Ok(()) => self
-                .run_checked(self.resize_spec(
-                    session.terminal_id,
-                    start.request.cols,
-                    start.request.rows,
-                ))
-                .await
-                .and_then(|()| {
+            Ok(()) => {
+                if self
+                    .run_checked(self.resize_spec(
+                        session.terminal_id,
+                        start.request.cols,
+                        start.request.rows,
+                    ))
+                    .await
+                    .is_err()
+                {
+                    // One-shot exec race: the container exited between the
+                    // readiness probe and the resize. A container that is no
+                    // longer running means the command completed (the monitor
+                    // records EXITED and the output is journaled). A resize
+                    // failure on a still-running container remains fatal.
+                    match self.inspect_ready(session.terminal_id).await {
+                        Ok(false) => Ok(()),
+                        _ => Err(RuntimeError::PodmanFailed),
+                    }
+                } else {
                     session
                         .transition(LifecycleState::Running)
                         .then_some(())
                         .ok_or(RuntimeError::ReadinessFailed)
-                }),
+                }
+            }
             Err(error) => Err(error),
         };
         if let Err(error) = initialized {
@@ -2832,6 +2845,7 @@ while :; do sleep 0.1; done"#;
             let unpause_failures = root.join("unpause-failures");
             let output_trigger = root.join("output-trigger");
             let network_info = root.join("network-info");
+            let flash = root.join("flash");
             let volume_mountpoint = test_filesystem()
                 .resolver()
                 .expected_mountpoint(Uuid::from_u128(1));
@@ -2851,6 +2865,7 @@ pause_inspect_entered="{}"
 unpause_failures="{}"
 output_trigger="{}"
 network_info="{}"
+flash="{}"
 printf '%s\n' "$*" >> "$log"
 case "$1" in
   volume)
@@ -2876,6 +2891,7 @@ case "$1" in
       [ "$argument" = natural ] && mode=natural
       [ "$argument" = never-ready ] && mode=never-ready
       [ "$argument" = instant-exit ] && mode=instant-exit
+      [ "$argument" = flash ] && mode=flash
       [ "$argument" = control-recover ] && printf '2\n' > "$control_failures"
       [ "$argument" = control-persistent ] && printf 'persistent\n' > "$control_failures"
       [ "$argument" = resize-fail ] && : > "$resize_failure"
@@ -2887,6 +2903,9 @@ case "$1" in
     # Completes before the daemon's readiness probe can ever observe the
     # container running (one-shot exec race).
     if [ "$mode" = instant-exit ]; then printf 'instant-exit-output\n'; exit 0; fi
+    # Observed running by the FIRST readiness probe only (flash marker), then
+    # dies before the resize lands — the one-shot exec resize race.
+    if [ "$mode" = flash ]; then : > "$flash"; : > "$marker"; rm -f "$marker"; printf 'flash-output\n'; exit 0; fi
     : > "$marker"
     if [ "$mode" = natural ]; then sleep 0.20; rm -f "$marker"; exit 0; fi
     if [ "$mode" = output-overflow ]; then
@@ -2910,7 +2929,9 @@ case "$1" in
       exit 0
     fi
     if [ -e "$slow_readiness" ]; then sleep 0.20; rm -f "$slow_readiness"; fi
-    [ -e "$marker" ] && printf 'true\n' || exit 1
+    if [ -e "$flash" ]; then rm -f "$flash"; printf 'true\n'; exit 0; fi
+    [ -e "$marker" ] && printf 'true\n' || printf 'false\n'
+    exit 0
     ;;
   pause)
     [ -e "$marker" ] || exit 1
@@ -2931,6 +2952,7 @@ case "$1" in
     ;;
   exec)
     [ ! -e "$resize_failure" ] || exit 1
+    [ -e "$marker" ] || exit 1
     ;;
   stop|rm)
     if [ -e "$control_failures" ]; then
@@ -2959,6 +2981,7 @@ esac
                 unpause_failures.display(),
                 output_trigger.display(),
                 network_info.display(),
+                flash.display(),
                 volume_mountpoint.display(),
             );
             let mut file = fs::File::create(&temporary_executable).unwrap();
@@ -3148,6 +3171,38 @@ esac
             "instant-exit-output\n"
         );
         assert_eq!(read.record.state, TerminalState::Exited);
+    }
+
+    #[tokio::test]
+    async fn start_accepts_a_command_that_exits_between_readiness_and_resize() {
+        let _recovery_lock = recovery_test_lock().await;
+        let fake = FakePodman::new();
+        let runtime = fake.runtime(Duration::from_millis(500));
+        let terminal_id = Uuid::new_v4();
+        // The fake is observed running by the first readiness probe (flash
+        // marker), then dies before the resize lands.
+        runtime
+            .start(ValidatedStart {
+                terminal_id,
+                ..start(vec!["flash".into()], "none")
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if runtime.inspect(terminal_id).await.unwrap().state == TerminalState::Exited {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let read = runtime
+            .read_output(terminal_id, 0, 64, Duration::from_millis(50))
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&read.bytes).contains("flash-output"));
     }
 
     #[tokio::test]
