@@ -371,7 +371,14 @@ impl Filesystem {
     pub fn mkdir(&self, workspace_id: Uuid, path: &str) -> Result<(), FilesystemError> {
         let workspace = self.workspace(workspace_id)?;
         let (parent, name) = open_parent(&workspace, path)?;
-        mkdirat(&parent, &name, Mode::RWXU).map_err(map_errno)?;
+        // Group/other rx: the sandbox container (subuid-mapped uid) must be
+        // able to traverse directories the daemon creates.
+        mkdirat(
+            &parent,
+            &name,
+            Mode::RWXU | Mode::RGRP | Mode::ROTH | Mode::XGRP | Mode::XOTH,
+        )
+        .map_err(map_errno)?;
         let validation = openat2(&parent, &name, METADATA_FLAGS, Mode::empty(), RESOLVE)
             .map_err(map_errno)
             .and_then(|fd| {
@@ -471,7 +478,12 @@ impl Filesystem {
                 .map(|(_, identity)| identity)
             }
             FilesystemEntryKind::Directory => {
-                mkdirat(&self.staging_fd, &stage_name, Mode::RWXU).map_err(map_errno)?;
+                mkdirat(
+                    &self.staging_fd,
+                    &stage_name,
+                    Mode::RWXU | Mode::RGRP | Mode::ROTH | Mode::XGRP | Mode::XOTH,
+                )
+                .map_err(map_errno)?;
                 (|| {
                     let source = open_beneath(&workspace, &source_path, DIRECTORY_FLAGS)?;
                     let destination = openat2(
@@ -611,7 +623,10 @@ impl Filesystem {
             &stage_name,
             bytes,
             MAX_FILE_PAYLOAD_BYTES,
-            Mode::RUSR | Mode::WUSR,
+            // Group/other-read: the sandbox container runs as a subuid-mapped
+            // uid (not the daemon user), so it reaches daemon-written files
+            // through the "other" class.
+            Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::ROTH,
         )?;
         if let Err(error) = verify_published(
             &self.staging_fd,
@@ -990,7 +1005,9 @@ fn identity(stat: &rustix::fs::Stat) -> FileIdentity {
 }
 
 fn safe_copy_mode(mode: u32) -> Mode {
-    Mode::from_raw_mode(0o600 | (mode & 0o111))
+    // Group/other-read (plus preserved exec bits): the sandbox container runs
+    // as a subuid-mapped uid and must be able to read copied files.
+    Mode::from_raw_mode(0o644 | (mode & 0o111))
 }
 
 #[derive(Default)]
@@ -1234,7 +1251,12 @@ fn copy_directory(
             }
             FilesystemEntryKind::Directory => {
                 budget.add_entry()?;
-                mkdirat(&destination, name, Mode::RWXU).map_err(map_errno)?;
+                mkdirat(
+                    &destination,
+                    name,
+                    Mode::RWXU | Mode::RGRP | Mode::ROTH | Mode::XGRP | Mode::XOTH,
+                )
+                .map_err(map_errno)?;
                 let source_child = openat2(
                     source.fd().map_err(map_errno)?,
                     name,
