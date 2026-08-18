@@ -239,7 +239,9 @@ pub async fn update(
         .map(str::trim)
         .map(ToOwned::to_owned)
         .unwrap_or_else(|| row.get("name"));
-    let configuration = input.configuration.unwrap_or_else(|| row.get("configuration"));
+    let configuration = input
+        .configuration
+        .unwrap_or_else(|| row.get("configuration"));
     let enabled = input.enabled.unwrap_or_else(|| row.get("enabled"));
     let auth_secret_reference: Option<String> = match input.auth_secret_reference {
         Some(val) => val,
@@ -358,10 +360,7 @@ mod tests {
             enabled: true,
         };
         let err = validate_create(&input).unwrap_err();
-        assert!(
-            err.to_string().contains("200"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("200"), "got: {err}");
     }
 
     #[test]
@@ -373,10 +372,7 @@ mod tests {
             enabled: true,
         };
         let err = validate_create(&input).unwrap_err();
-        assert!(
-            err.to_string().contains("invalid transport"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("invalid transport"), "got: {err}");
     }
 
     #[test]
@@ -389,7 +385,8 @@ mod tests {
         };
         let err = validate_create(&input).unwrap_err();
         assert!(
-            err.to_string().contains("configuration must be a JSON object"),
+            err.to_string()
+                .contains("configuration must be a JSON object"),
             "got: {err}"
         );
     }
@@ -440,10 +437,7 @@ mod tests {
             auth_secret_reference: None,
         };
         let err = validate_update(&input).unwrap_err();
-        assert!(
-            err.to_string().contains("200"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("200"), "got: {err}");
     }
 
     #[test]

@@ -700,7 +700,10 @@ async fn execute_inner(
         vec![]
     };
     if tool_routes.is_empty() {
-        return Err(("model_unavailable", "no compatible chat model with tool support is available"));
+        return Err((
+            "model_unavailable",
+            "no compatible chat model with tool support is available",
+        ));
     }
 
     // Re-entrant agent loop: up to 8 rounds, 16 total tool calls.
@@ -710,7 +713,11 @@ async fn execute_inner(
     let mut output = String::new();
     let mut usage = None;
     let mut in_flight_messages = messages;
-    let mut request = chat::request(in_flight_messages.clone(), tool_defs.clone(), limits.output_limit);
+    let mut request = chat::request(
+        in_flight_messages.clone(),
+        tool_defs.clone(),
+        limits.output_limit,
+    );
 
     for round in 0..max_rounds {
         let opened = {
@@ -822,7 +829,11 @@ async fn execute_inner(
                     )
                     .await?;
                 }
-                ModelEvent::Usage { input_tokens, output_tokens, cached_tokens } => {
+                ModelEvent::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cached_tokens,
+                } => {
                     flush_text_events(
                         &state.pool,
                         run_id,
@@ -891,15 +902,9 @@ async fn execute_inner(
                 "tool_name": name,
                 "tool_input": input,
             });
-            append_event_owned(
-                &state.pool,
-                run_id,
-                lease,
-                "tool.call",
-                tool_event,
-            )
-            .await
-            .map_err(database_failure)?;
+            append_event_owned(&state.pool, run_id, lease, "tool.call", tool_event)
+                .await
+                .map_err(database_failure)?;
 
             let result = match name.as_str() {
                 "library_search" => {
@@ -1007,7 +1012,11 @@ async fn execute_inner(
         });
 
         // Rebuild request with accumulated messages and tools for next round.
-        request = chat::request(in_flight_messages.clone(), tool_defs.clone(), limits.output_limit);
+        request = chat::request(
+            in_flight_messages.clone(),
+            tool_defs.clone(),
+            limits.output_limit,
+        );
     }
 
     // Exceeded max rounds without a text response.

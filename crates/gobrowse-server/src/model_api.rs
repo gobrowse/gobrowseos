@@ -307,7 +307,9 @@ pub struct AutoDetectResponse {
 
 /// Detect providers from environment variables only (sync, no network).
 /// Suitable for unit tests.
-pub fn detect_providers_from_env(env: &std::collections::HashMap<String, String>) -> Vec<DetectedProvider> {
+pub fn detect_providers_from_env(
+    env: &std::collections::HashMap<String, String>,
+) -> Vec<DetectedProvider> {
     let mut detected = Vec::new();
 
     // Known API-key env vars — presence means "available".
@@ -536,19 +538,34 @@ mod tests {
         let mut env = std::collections::HashMap::new();
         env.insert("OPENAI_API_KEY".into(), "sk-test123".into());
         let result = detect_providers_from_env(&env);
-        let openai = result.iter().find(|p| p.provider_type == "openai").expect("openai entry");
+        let openai = result
+            .iter()
+            .find(|p| p.provider_type == "openai")
+            .expect("openai entry");
         assert!(openai.available, "OPENAI_API_KEY present");
-        let openrouter = result.iter().find(|p| p.provider_type == "openrouter").expect("openrouter entry");
+        let openrouter = result
+            .iter()
+            .find(|p| p.provider_type == "openrouter")
+            .expect("openrouter entry");
         assert!(!openrouter.available, "OPENROUTER_API_KEY absent");
     }
 
     #[test]
     fn detect_providers_from_env_detects_gobrowse_provider() {
         let mut env = std::collections::HashMap::new();
-        env.insert("GOBROWSE__PROVIDER__CHAT_BASE_URL".into(), "http://localhost:8080".into());
+        env.insert(
+            "GOBROWSE__PROVIDER__CHAT_BASE_URL".into(),
+            "http://localhost:8080".into(),
+        );
         let result = detect_providers_from_env(&env);
-        let override_provider = result.iter().find(|p| p.provider_type == "gobrowse_provider_override").expect("gobrowse override entry");
-        assert!(override_provider.available, "GOBROWSE__PROVIDER__ prefixed env var present");
+        let override_provider = result
+            .iter()
+            .find(|p| p.provider_type == "gobrowse_provider_override")
+            .expect("gobrowse override entry");
+        assert!(
+            override_provider.available,
+            "GOBROWSE__PROVIDER__ prefixed env var present"
+        );
     }
 
     #[test]
@@ -564,7 +581,11 @@ mod tests {
             if provider.provider_type == "gobrowse_provider_override" {
                 assert!(!provider.available, "prefix var absent");
             } else {
-                assert!(provider.available, "{} should be available", provider.provider_type);
+                assert!(
+                    provider.available,
+                    "{} should be available",
+                    provider.provider_type
+                );
             }
         }
     }

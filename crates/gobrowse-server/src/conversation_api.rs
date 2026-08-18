@@ -717,13 +717,11 @@ pub async fn unpin_book(
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
     authorize_conversation(&state, &user, conversation_id, true).await?;
-    sqlx::query(
-        "DELETE FROM conversation_pinned_books WHERE conversation_id=$1 AND book_id=$2",
-    )
-    .bind(conversation_id)
-    .bind(book_id)
-    .execute(&state.pool)
-    .await?;
+    sqlx::query("DELETE FROM conversation_pinned_books WHERE conversation_id=$1 AND book_id=$2")
+        .bind(conversation_id)
+        .bind(book_id)
+        .execute(&state.pool)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

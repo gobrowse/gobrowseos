@@ -13,13 +13,7 @@ use sqlx::Row;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use crate::{
-    AppState,
-    auth::audit,
-    embedding,
-    error::AppError,
-    library_api,
-};
+use crate::{AppState, auth::audit, embedding, error::AppError, library_api};
 
 // ---------------------------------------------------------------------------
 // Tool definitions (exported for the run loop)
@@ -161,11 +155,17 @@ pub fn tool_descriptors() -> Vec<ToolDescriptor> {
 
 // Keep static descriptors so we can return references.
 static LIBRARY_SEARCH_DESC: std::sync::LazyLock<ToolDescriptor> = std::sync::LazyLock::new(|| {
-    tool_descriptors().into_iter().next().expect("search descriptor")
+    tool_descriptors()
+        .into_iter()
+        .next()
+        .expect("search descriptor")
 });
 
 static LIBRARY_ADD_DESC: std::sync::LazyLock<ToolDescriptor> = std::sync::LazyLock::new(|| {
-    tool_descriptors().into_iter().nth(1).expect("add descriptor")
+    tool_descriptors()
+        .into_iter()
+        .nth(1)
+        .expect("add descriptor")
 });
 
 pub struct LibrarySearchTool {
@@ -178,11 +178,7 @@ impl Tool for LibrarySearchTool {
         &LIBRARY_SEARCH_DESC
     }
 
-    async fn execute(
-        &self,
-        context: &ToolContext,
-        input: Value,
-    ) -> Result<Value, ToolError> {
+    async fn execute(&self, context: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let q = input
             .get("q")
             .and_then(|v| v.as_str())
@@ -245,11 +241,7 @@ impl Tool for LibraryAddTool {
         &LIBRARY_ADD_DESC
     }
 
-    async fn execute(
-        &self,
-        context: &ToolContext,
-        input: Value,
-    ) -> Result<Value, ToolError> {
+    async fn execute(&self, context: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let title = input
             .get("title")
             .and_then(|v| v.as_str())

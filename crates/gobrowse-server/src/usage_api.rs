@@ -264,7 +264,8 @@ pub async fn usage_summary(
             )));
         }
     };
-    let since = window_days.map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(days));
+    let since =
+        window_days.map(|days| time::OffsetDateTime::now_utc() - time::Duration::days(days));
 
     let rows = sqlx::query_as::<_, (String, String, serde_json::Value, time::OffsetDateTime)>(
         "SELECT provider, model, usage, created_at \
@@ -287,8 +288,14 @@ pub async fn usage_summary(
     let mut unpriced = 0_i64;
 
     for (provider, model, usage, created_at) in rows {
-        let input = usage.get("input_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
-        let output = usage.get("output_tokens").and_then(|v| v.as_i64()).unwrap_or(0);
+        let input = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let output = usage
+            .get("output_tokens")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
         let (in_price, out_price) = reference_pricing(&provider, &model);
         let spend = input as f64 / 1_000_000.0 * in_price + output as f64 / 1_000_000.0 * out_price;
         if spend == 0.0 {
@@ -298,23 +305,27 @@ pub async fn usage_summary(
         total_input += input;
         total_output += output;
         let key = format!("{provider}::{model}");
-        let entry = per_model.entry(key.clone()).or_insert_with(|| ModelCostRow {
-            provider: provider.clone(),
-            model: model.clone(),
-            input_tokens: 0,
-            output_tokens: 0,
-            runs: 0,
-            spend: 0.0,
-        });
+        let entry = per_model
+            .entry(key.clone())
+            .or_insert_with(|| ModelCostRow {
+                provider: provider.clone(),
+                model: model.clone(),
+                input_tokens: 0,
+                output_tokens: 0,
+                runs: 0,
+                spend: 0.0,
+            });
         entry.input_tokens += input;
         entry.output_tokens += output;
         entry.runs += 1;
         entry.spend += spend;
-        let pentry = per_provider.entry(provider.clone()).or_insert_with(|| ProviderCostRow {
-            provider: provider.clone(),
-            spend: 0.0,
-            runs: 0,
-        });
+        let pentry = per_provider
+            .entry(provider.clone())
+            .or_insert_with(|| ProviderCostRow {
+                provider: provider.clone(),
+                spend: 0.0,
+                runs: 0,
+            });
         pentry.spend += spend;
         pentry.runs += 1;
         let day = created_at
@@ -325,10 +336,21 @@ pub async fn usage_summary(
     }
 
     let mut per_model_vec = per_model.into_values().collect::<Vec<_>>();
-    per_model_vec.sort_by(|a, b| b.spend.partial_cmp(&a.spend).unwrap_or(std::cmp::Ordering::Equal));
+    per_model_vec.sort_by(|a, b| {
+        b.spend
+            .partial_cmp(&a.spend)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let mut per_provider_vec = per_provider.into_values().collect::<Vec<_>>();
-    per_provider_vec.sort_by(|a, b| b.spend.partial_cmp(&a.spend).unwrap_or(std::cmp::Ordering::Equal));
-    let per_day_vec = per_day_map.into_iter().map(|(day, spend)| DailyCostRow { day, spend }).collect();
+    per_provider_vec.sort_by(|a, b| {
+        b.spend
+            .partial_cmp(&a.spend)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let per_day_vec = per_day_map
+        .into_iter()
+        .map(|(day, spend)| DailyCostRow { day, spend })
+        .collect();
 
     let total_runs = per_model_vec.iter().map(|r| r.runs).sum::<i64>();
 

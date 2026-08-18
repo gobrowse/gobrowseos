@@ -12,13 +12,13 @@ pub mod error;
 pub mod library_api;
 pub mod mcp_api;
 pub mod model_api;
-pub mod usage_api;
 pub mod outbound_http;
 pub mod realtime;
 pub mod run_api;
 pub mod run_tools;
 pub mod skills_api;
 pub mod task_api;
+pub mod usage_api;
 pub mod vault;
 pub mod vault_api;
 pub mod webhook_scheduler;
@@ -149,10 +149,7 @@ pub fn router(state: AppState) -> Router {
             "/embeddings/jobs/{id}/retry",
             post(embedding_api::retry_job),
         )
-        .route(
-            "/models/auto-detect",
-            get(model_api::auto_detect_providers),
-        )
+        .route("/models/auto-detect", get(model_api::auto_detect_providers))
         .route(
             "/models/chat",
             get(model_api::list_chat_models).post(model_api::create_chat_model),
@@ -161,14 +158,8 @@ pub fn router(state: AppState) -> Router {
             "/models/chat/{id}/activate",
             post(model_api::activate_chat_model),
         )
-        .route(
-            "/providers/catalog",
-            get(usage_api::list_provider_catalog),
-        )
-        .route(
-            "/usage/summary",
-            get(usage_api::usage_summary),
-        )
+        .route("/providers/catalog", get(usage_api::list_provider_catalog))
+        .route("/usage/summary", get(usage_api::usage_summary))
         .route(
             "/conversations/{id}/runs",
             get(run_api::get_active_run).post(run_api::start_run),
@@ -233,10 +224,7 @@ pub fn router(state: AppState) -> Router {
             post(skills_api::promote_skill),
         )
         .route("/skills/{skill_id}/rollback", post(skills_api::rollback))
-        .route(
-            "/mcp/servers",
-            get(mcp_api::list).post(mcp_api::create),
-        )
+        .route("/mcp/servers", get(mcp_api::list).post(mcp_api::create))
         .route(
             "/mcp/servers/{id}",
             patch(mcp_api::update).delete(mcp_api::delete),

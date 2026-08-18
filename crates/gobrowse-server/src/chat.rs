@@ -111,7 +111,10 @@ impl ModelProvider for HttpChatProvider {
                     MessageRole::Tool => {
                         // Tool result messages: extract call_id and output
                         let tool_call_result = message.content.iter().find_map(|part| {
-                            if let ContentPart::ToolResult { call_id, output, .. } = part {
+                            if let ContentPart::ToolResult {
+                                call_id, output, ..
+                            } = part
+                            {
                                 Some((call_id.clone(), output.clone()))
                             } else {
                                 None
@@ -536,10 +539,7 @@ fn parse_provider_line(
     // Check for tool_calls in the delta
     if let Some(tool_calls) = value["choices"][0]["delta"]["tool_calls"].as_array() {
         for tc in tool_calls {
-            if let (Some(id), Some(name)) = (
-                tc["id"].as_str(),
-                tc["function"]["name"].as_str(),
-            ) {
+            if let (Some(id), Some(name)) = (tc["id"].as_str(), tc["function"]["name"].as_str()) {
                 let input: serde_json::Value = tc["function"]["arguments"]
                     .as_str()
                     .and_then(|s| serde_json::from_str(s).ok())

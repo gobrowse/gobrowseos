@@ -1579,7 +1579,9 @@ fn LibraryPage() -> impl IntoView {
                         show_create.set(false);
                         load_books(books, status, None);
                     }
-                    Ok(response) => create_status.set(format!("Create rejected: HTTP {}", response.status())),
+                    Ok(response) => {
+                        create_status.set(format!("Create rejected: HTTP {}", response.status()))
+                    }
                     Err(_) => create_status.set("Library service did not answer.".into()),
                 },
                 Err(_) => create_status.set("Create request could not be encoded.".into()),
@@ -1607,14 +1609,18 @@ fn LibraryPage() -> impl IntoView {
                         edit_status.set("Could not decode book".into());
                     }
                 }
-                Ok(response) => edit_status.set(format!("Book rejected: HTTP {}", response.status())),
+                Ok(response) => {
+                    edit_status.set(format!("Book rejected: HTTP {}", response.status()))
+                }
                 Err(_) => edit_status.set("Library service did not answer.".into()),
             }
         });
     };
     let save_book = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        let Some(detail) = selected.get_untracked() else { return };
+        let Some(detail) = selected.get_untracked() else {
+            return;
+        };
         let book_id = detail.id.clone();
         let title = edit_title.get_untracked();
         let body = edit_body.get_untracked();
@@ -1636,7 +1642,9 @@ fn LibraryPage() -> impl IntoView {
                         selected.set(None);
                         load_books(books, status, None);
                     }
-                    Ok(response) => edit_status.set(format!("Save rejected: HTTP {}", response.status())),
+                    Ok(response) => {
+                        edit_status.set(format!("Save rejected: HTTP {}", response.status()))
+                    }
                     Err(_) => edit_status.set("Library service did not answer.".into()),
                 },
                 Err(_) => edit_status.set("Edit request could not be encoded.".into()),
@@ -1768,37 +1776,37 @@ fn ModelsPage() -> impl IntoView {
         }
     });
     let on_provider_select = move |event: leptos::ev::Event| {
-            let provider_type = event_target_value(&event);
-            chat_provider.set(provider_type.clone());
-            if let Some(provider) = catalog
-                .get_untracked()
-                .into_iter()
-                .find(|entry| entry.provider_type == provider_type)
-            {
-                chat_base_url.set(provider.base_url.clone());
-                catalog_models.set(provider.models.clone());
-                chat_status.set(String::new());
-                if let Some(first) = provider.models.first() {
-                    chat_model.set(first.reference.clone());
-                    chat_context.set(first.context_window.to_string());
-                    chat_output.set(first.output_limit.to_string());
-                }
-            } else {
-                catalog_models.set(Vec::new());
-                chat_status.set("Choose a provider and model from the catalog".into());
+        let provider_type = event_target_value(&event);
+        chat_provider.set(provider_type.clone());
+        if let Some(provider) = catalog
+            .get_untracked()
+            .into_iter()
+            .find(|entry| entry.provider_type == provider_type)
+        {
+            chat_base_url.set(provider.base_url.clone());
+            catalog_models.set(provider.models.clone());
+            chat_status.set(String::new());
+            if let Some(first) = provider.models.first() {
+                chat_model.set(first.reference.clone());
+                chat_context.set(first.context_window.to_string());
+                chat_output.set(first.output_limit.to_string());
             }
+        } else {
+            catalog_models.set(Vec::new());
+            chat_status.set("Choose a provider and model from the catalog".into());
+        }
     };
     let on_model_select = move |event: leptos::ev::Event| {
-            let model_reference = event_target_value(&event);
-            chat_model.set(model_reference.clone());
-            if let Some(model) = catalog_models
-                .get_untracked()
-                .into_iter()
-                .find(|entry| entry.reference == model_reference)
-            {
-                chat_context.set(model.context_window.to_string());
-                chat_output.set(model.output_limit.to_string());
-            }
+        let model_reference = event_target_value(&event);
+        chat_model.set(model_reference.clone());
+        if let Some(model) = catalog_models
+            .get_untracked()
+            .into_iter()
+            .find(|entry| entry.reference == model_reference)
+        {
+            chat_context.set(model.context_window.to_string());
+            chat_output.set(model.output_limit.to_string());
+        }
     };
     let detect = move |_| {
         if !detecting.get_untracked() {
@@ -2107,9 +2115,12 @@ fn load_usage(
     let status = *status;
     let window = *window;
     spawn_local(async move {
-        let response = Request::get(&format!("/api/v1/usage/summary?window={}", window.get_untracked()))
-            .send()
-            .await;
+        let response = Request::get(&format!(
+            "/api/v1/usage/summary?window={}",
+            window.get_untracked()
+        ))
+        .send()
+        .await;
         if !lifecycle_is_active(&lifecycle) {
             return;
         }
@@ -2121,7 +2132,10 @@ fn load_usage(
                     status.set("Could not decode usage summary".into());
                 }
             }
-            Ok(response) => status.set(format!("Usage endpoint rejected: HTTP {}", response.status())),
+            Ok(response) => status.set(format!(
+                "Usage endpoint rejected: HTTP {}",
+                response.status()
+            )),
             Err(_) => status.set("Usage endpoint did not answer.".into()),
         }
     });
