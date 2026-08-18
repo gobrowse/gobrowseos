@@ -356,6 +356,19 @@ impl GitHubReleaseSource {
         version: Option<&str>,
     ) -> Result<String, GitHubError> {
         if let Some(version) = version {
+            // The canonical version (e.g. "1.1.0") may lack the release tag's
+            // "v" prefix; the digest check downstream still guards integrity.
+            if !version.starts_with('v') {
+                let prefixed = format!("v{version}");
+                if self
+                    .api
+                    .get_json(&format!("/repos/{owner}/{repo}/git/ref/tags/{prefixed}"))
+                    .await
+                    .is_ok()
+                {
+                    return Ok(prefixed);
+                }
+            }
             return Ok(version.to_owned());
         }
         let latest = self
