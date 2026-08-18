@@ -115,7 +115,7 @@ pub async fn create_chat_model(
     .await?;
     sqlx::query(
         "INSERT INTO models (id,provider_id,model_reference,display_name,context_window,output_limit,capabilities,priority) \
-         VALUES ($1,$2,$3,$4,$5,$6,ARRAY['text'],$7)",
+         VALUES ($1,$2,$3,$4,$5,$6,ARRAY['text','tool_calls'],$7)",
     )
     .bind(&model_id)
     .bind(&provider_id)

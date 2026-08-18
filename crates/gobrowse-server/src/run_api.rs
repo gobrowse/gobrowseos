@@ -1061,17 +1061,19 @@ async fn execute_inner(
             .await
             .map_err(database_failure)?;
 
-            // Persist tool_calls row.
+            // Persist tool_calls row (schema: tool_id/risk_class/input/output/status).
+            let tool_status = if is_error { "failed" } else { "completed" };
             sqlx::query(
-                "INSERT INTO tool_calls (id, run_id, tool_name, tool_input, tool_output, is_error, idempotency_key) \
-                 VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (idempotency_key) DO NOTHING",
+                "INSERT INTO tool_calls (id, run_id, tool_id, risk_class, input, output, status, idempotency_key, started_at, finished_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now(),now()) ON CONFLICT (idempotency_key) DO NOTHING",
             )
             .bind(Uuid::now_v7())
             .bind(run_id)
             .bind(name)
+            .bind(risk_class_for_tool(name))
             .bind(input)
             .bind(&output_value)
-            .bind(is_error)
+            .bind(tool_status)
             .bind(format!("{run_id}-{call_id}"))
             .execute(&state.pool)
             .await
@@ -1906,6 +1908,13 @@ fn row_to_run(row: &sqlx::postgres::PgRow) -> RunResponse {
         error_code: row.get("error_code"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
+    }
+}
+
+fn risk_class_for_tool(name: &str) -> &'static str {
+    match name {
+        "library_search" | "library_add" | "library_load" => "read",
+        _ => "high",
     }
 }
 
