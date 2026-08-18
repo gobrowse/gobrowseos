@@ -1913,8 +1913,16 @@ fn row_to_run(row: &sqlx::postgres::PgRow) -> RunResponse {
 
 fn risk_class_for_tool(name: &str) -> &'static str {
     match name {
-        "library_search" | "library_add" | "library_load" => "read",
-        _ => "high",
+        // Read-only tools: aligned with the RiskClass declared in run_tools.rs.
+        "library_search"
+        | "library_load"
+        | "sandbox_read_file"
+        | "sandbox_list_files"
+        | "sandbox_stat"
+        | "terminal_read_output"
+        | "process_list" => "read",
+        // Everything else mutates state (writes, lifecycle, process control).
+        _ => "write",
     }
 }
 
