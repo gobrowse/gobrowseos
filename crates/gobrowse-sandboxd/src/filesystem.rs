@@ -178,7 +178,6 @@ impl Filesystem {
         })
     }
 
-    #[cfg(test)]
     pub(crate) fn ensure_workspace(&self, workspace_id: Uuid) -> Result<PathBuf, FilesystemError> {
         let name = workspace_volume_name(workspace_id);
         match mkdirat(self.root_fd.as_fd(), &name, Mode::RWXU) {
@@ -1413,6 +1412,9 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("gobrowse-sandboxd-{}", Uuid::new_v4()));
             fs::create_dir(&path).unwrap();
+            // Filesystem::new requires a private root; pin the mode so the
+            // tests are immune to the ambient umask.
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self(path)
         }
     }

@@ -1,10 +1,14 @@
-use std::{path::Path, process::Stdio, time::Instant};
+use std::{path::Path, process::Stdio, time::Duration, time::Instant};
 
 use serde::Serialize;
 use sqlx::{PgPool, Row};
 use tokio::process::Command;
 
-use crate::{config::Settings, vault};
+use crate::{
+    config::Settings,
+    sandbox_client::{SandboxClient, SandboxConfig},
+    vault,
+};
 
 const VAULT_FAILURE_DETAIL: &str = "configured vault key material is invalid or unavailable";
 const MCP_METADATA_QUERY_FAILURE_DETAIL: &str = "MCP OAuth metadata is unavailable";
@@ -216,20 +220,58 @@ pub async fn run(settings: &Settings, pool: Option<&PgPool>) -> Vec<Check> {
         )
         .await,
     );
-    checks.push(Check {
-        name: "Sandbox",
-        status: if settings.features.sandbox {
-            Status::Warn
-        } else {
-            Status::Pass
-        },
-        detail: if settings.features.sandbox {
-            "enabled; sandboxd connectivity is validated when configured".into()
-        } else {
-            "disabled by feature policy".into()
-        },
-        latency_ms: None,
-    });
+    let sandbox_start = Instant::now();
+    let sandbox_check = async {
+        if !settings.features.sandbox {
+            return Check {
+                name: "Sandbox",
+                status: Status::Pass,
+                detail: "disabled by feature policy".into(),
+                latency_ms: None,
+            };
+        }
+        let (Some(socket_path), Some(auth_token)) = (
+            &settings.features.sandbox_socket_path,
+            &settings.features.sandbox_auth_token,
+        ) else {
+            return Check {
+                name: "Sandbox",
+                status: Status::Warn,
+                detail: "enabled; sandboxd connectivity is validated when configured".into(),
+                latency_ms: None,
+            };
+        };
+        match SandboxClient::connect(SandboxConfig {
+            socket_path: socket_path.clone(),
+            auth_token: auth_token.clone(),
+            timeout: Duration::from_secs(settings.features.sandbox_socket_timeout_seconds),
+        })
+        .await
+        {
+            Ok(client) => match client.health().await {
+                Ok(status) => Check {
+                    name: "Sandbox",
+                    status: Status::Pass,
+                    detail: format!("sandboxd health check returned {status:?}"),
+                    latency_ms: Some(sandbox_start.elapsed().as_millis()),
+                },
+                Err(error) => Check {
+                    name: "Sandbox",
+                    status: Status::Fail,
+                    detail: format!("sandboxd unreachable: {error}"),
+                    latency_ms: Some(sandbox_start.elapsed().as_millis()),
+                },
+            },
+            Err(error) => Check {
+                name: "Sandbox",
+                status: Status::Fail,
+                detail: format!("sandbox configuration invalid: {error}"),
+                latency_ms: None,
+            },
+        }
+    }
+    .await;
+    checks.push(sandbox_check);
     checks
 }
 

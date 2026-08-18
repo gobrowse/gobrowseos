@@ -1111,6 +1111,7 @@ dependencies = [
  "gobrowse-core",
  "http",
  "http-body-util",
+ "parking_lot",
  "rand 0.9.5",
  "reqwest",
  "ring",

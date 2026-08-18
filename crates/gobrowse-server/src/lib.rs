@@ -16,6 +16,7 @@ pub mod outbound_http;
 pub mod realtime;
 pub mod run_api;
 pub mod run_tools;
+pub mod sandbox_client;
 pub mod skills_api;
 pub mod task_api;
 pub mod usage_api;
@@ -49,7 +50,13 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{auth::PasswordRuntime, config::Settings, error::AppError, vault::Vault};
+use crate::{
+    auth::PasswordRuntime,
+    config::Settings,
+    error::AppError,
+    sandbox_client::{SandboxClient, SandboxConfig},
+    vault::Vault,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -58,18 +65,44 @@ pub struct AppState {
     pub passwords: PasswordRuntime,
     pub vault: Vault,
     pub run_cancellations: Arc<RwLock<HashMap<uuid::Uuid, (uuid::Uuid, CancellationToken)>>>,
+    /// Configured sandbox client. `None` when sandboxing is disabled or the
+    /// daemon socket/token are not configured. A down daemon never fails
+    /// startup: failures surface lazily at call time.
+    pub sandbox: Option<SandboxClient>,
 }
 
 impl AppState {
     pub async fn new(pool: PgPool, settings: Settings) -> Result<Self, AppError> {
         let passwords = PasswordRuntime::new(settings.auth.clone()).await?;
         let vault = Vault::from_settings(&settings.vault).await?;
+        let sandbox = if settings.features.sandbox {
+            match (
+                &settings.features.sandbox_socket_path,
+                &settings.features.sandbox_auth_token,
+            ) {
+                (Some(socket_path), Some(auth_token)) => Some(
+                    SandboxClient::connect(SandboxConfig {
+                        socket_path: socket_path.clone(),
+                        auth_token: auth_token.clone(),
+                        timeout: Duration::from_secs(
+                            settings.features.sandbox_socket_timeout_seconds,
+                        ),
+                    })
+                    .await
+                    .map_err(|error| AppError::Internal(error.into()))?,
+                ),
+                _ => None,
+            }
+        } else {
+            None
+        };
         Ok(Self {
             pool,
             settings: Arc::new(settings),
             passwords,
             vault,
             run_cancellations: Arc::new(RwLock::new(HashMap::new())),
+            sandbox,
         })
     }
 }

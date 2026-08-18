@@ -38,6 +38,11 @@ lsp = false
 otel = false
 local_embeddings = false
 local_models = false
+# When sandbox = true, wire a SandboxClient into the app when both are set:
+# sandbox_socket_path = "/tmp/gbsbx/sandboxd.sock"
+# sandbox_auth_token = "must match sandboxd --auth-token-file"
+# sandbox_socket_timeout_seconds = 30
+# sandbox_plugin_image = "localhost/gobrowse-workspace:v1"
 
 [observability]
 json_logs = false

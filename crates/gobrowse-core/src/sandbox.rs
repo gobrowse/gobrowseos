@@ -204,6 +204,9 @@ pub struct RequestEnvelope {
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SandboxOperation {
     Health,
+    ProvisionWorkspace {
+        workspace_id: Uuid,
+    },
     Start {
         terminal_id: Uuid,
         request: TerminalStartRequest,
@@ -308,6 +311,9 @@ pub struct ResponseEnvelope {
 pub enum SandboxResult {
     Health {
         status: String,
+    },
+    Provisioned {
+        workspace_id: Uuid,
     },
     Started {
         terminal_id: Uuid,
@@ -726,6 +732,46 @@ mod tests {
         let request = format!(
             r#"{{"version":1,"request_id":"{}","token":"token","operation":{{"op":"health"}},"extra":true}}"#,
             Uuid::nil()
+        );
+        assert!(serde_json::from_str::<RequestEnvelope>(&request).is_err());
+    }
+
+    #[test]
+    fn provision_workspace_round_trips_with_snake_case_op_tag() {
+        let workspace_id = Uuid::new_v4();
+        let envelope = RequestEnvelope {
+            version: SANDBOX_PROTOCOL_VERSION,
+            request_id: Uuid::new_v4(),
+            token: "token".into(),
+            operation: SandboxOperation::ProvisionWorkspace { workspace_id },
+        };
+        let encoded = serde_json::to_string(&envelope).unwrap();
+        assert!(encoded.contains(r#""op":"provision_workspace""#));
+        let decoded: RequestEnvelope = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(
+            decoded.operation,
+            SandboxOperation::ProvisionWorkspace { workspace_id: echoed } if echoed == workspace_id
+        ));
+
+        let response = ResponseEnvelope {
+            version: SANDBOX_PROTOCOL_VERSION,
+            request_id: envelope.request_id,
+            result: Ok(SandboxResult::Provisioned { workspace_id }),
+        };
+        let decoded: ResponseEnvelope =
+            serde_json::from_str(&serde_json::to_string(&response).unwrap()).unwrap();
+        assert_eq!(
+            decoded.result,
+            Ok(SandboxResult::Provisioned { workspace_id })
+        );
+    }
+
+    #[test]
+    fn provision_workspace_rejects_unknown_fields() {
+        let request = format!(
+            r#"{{"version":2,"request_id":"{}","token":"token","operation":{{"op":"provision_workspace","workspace_id":"{}","extra":true}}}}"#,
+            Uuid::new_v4(),
+            Uuid::new_v4()
         );
         assert!(serde_json::from_str::<RequestEnvelope>(&request).is_err());
     }

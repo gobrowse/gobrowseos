@@ -132,6 +132,25 @@ pub struct FeatureSettings {
     pub webhook_scheduler_enabled: bool,
     #[serde(default = "default_webhook_scheduler_max_attempts")]
     pub webhook_scheduler_max_attempts: u32,
+    /// Unix socket path of the sandboxd instance to talk to. When set together
+    /// with `sandbox_auth_token` while `sandbox` is enabled, the server wires a
+    /// `SandboxClient` into `AppState`.
+    #[serde(default)]
+    pub sandbox_socket_path: Option<PathBuf>,
+    /// Shared-secret token that must match sandboxd's `--auth-token-file`.
+    #[serde(default)]
+    pub sandbox_auth_token: Option<SecretString>,
+    /// Per-operation timeout for sandbox socket I/O.
+    #[serde(default = "default_sandbox_socket_timeout_seconds")]
+    pub sandbox_socket_timeout_seconds: u64,
+    /// Default sandbox image for plugin execution (informational for Lane D;
+    /// consumed by plugin install flows).
+    #[serde(default)]
+    pub sandbox_plugin_image: Option<String>,
+}
+
+const fn default_sandbox_socket_timeout_seconds() -> u64 {
+    30
 }
 
 impl Default for FeatureSettings {
@@ -148,6 +167,10 @@ impl Default for FeatureSettings {
             local_models: false,
             webhook_scheduler_enabled: false,
             webhook_scheduler_max_attempts: default_webhook_scheduler_max_attempts(),
+            sandbox_socket_path: None,
+            sandbox_auth_token: None,
+            sandbox_socket_timeout_seconds: default_sandbox_socket_timeout_seconds(),
+            sandbox_plugin_image: None,
         }
     }
 }
@@ -252,6 +275,8 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    use secrecy::ExposeSecret;
+
     use super::*;
 
     /// Build a `Settings` with all required fields set to sane defaults
@@ -284,6 +309,50 @@ mod tests {
         }))
         .expect("deserialize Milestone 2 feature settings");
         assert!(!features.local_models);
+    }
+
+    #[test]
+    fn sandbox_feature_settings_default_to_unconfigured_with_thirty_second_timeout() {
+        let features: FeatureSettings = serde_json::from_value(serde_json::json!({
+            "sandbox": true, "browser": false, "messaging": false, "voice": false,
+            "media": false, "lsp": false, "otel": false, "local_embeddings": false
+        }))
+        .expect("sandbox-only feature settings deserialize");
+        assert!(features.sandbox);
+        assert!(features.sandbox_socket_path.is_none());
+        assert!(features.sandbox_auth_token.is_none());
+        assert_eq!(features.sandbox_socket_timeout_seconds, 30);
+        assert!(features.sandbox_plugin_image.is_none());
+        assert_eq!(
+            FeatureSettings::default().sandbox_socket_timeout_seconds,
+            30
+        );
+    }
+
+    #[test]
+    fn sandbox_feature_settings_deserialize_socket_and_token() {
+        let features: FeatureSettings = serde_json::from_value(serde_json::json!({
+            "sandbox": true, "browser": false, "messaging": false, "voice": false,
+            "media": false, "lsp": false, "otel": false, "local_embeddings": false,
+            "sandbox_socket_path": "/tmp/gbsbx/sandboxd.sock",
+            "sandbox_auth_token": "opaque-token",
+            "sandbox_socket_timeout_seconds": 7,
+            "sandbox_plugin_image": "localhost/gobrowse-workspace:v1"
+        }))
+        .expect("full sandbox feature settings deserialize");
+        assert_eq!(
+            features.sandbox_socket_path,
+            Some(PathBuf::from("/tmp/gbsbx/sandboxd.sock"))
+        );
+        assert_eq!(
+            features.sandbox_auth_token.unwrap().expose_secret(),
+            "opaque-token"
+        );
+        assert_eq!(features.sandbox_socket_timeout_seconds, 7);
+        assert_eq!(
+            features.sandbox_plugin_image.as_deref(),
+            Some("localhost/gobrowse-workspace:v1")
+        );
     }
 
     #[test]

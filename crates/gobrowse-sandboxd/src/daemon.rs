@@ -523,6 +523,13 @@ impl Daemon {
             SandboxOperation::Health => Ok(SandboxResult::Health {
                 status: "ok".into(),
             }),
+            SandboxOperation::ProvisionWorkspace { workspace_id } => {
+                if workspace_id.is_nil() {
+                    return Err(DaemonError::InvalidRequest);
+                }
+                self.filesystem.ensure_workspace(workspace_id)?;
+                Ok(SandboxResult::Provisioned { workspace_id })
+            }
             SandboxOperation::Start {
                 terminal_id,
                 mut request,
@@ -892,6 +899,7 @@ fn terminal_id(operation: &SandboxOperation) -> Option<Uuid> {
         | SandboxOperation::Inspect { terminal_id }
         | SandboxOperation::Reconnect { terminal_id } => Some(*terminal_id),
         SandboxOperation::Health
+        | SandboxOperation::ProvisionWorkspace { .. }
         | SandboxOperation::FsList { .. }
         | SandboxOperation::FsRead { .. }
         | SandboxOperation::FsMetadata { .. }
@@ -928,6 +936,7 @@ fn valid_wire_shape(value: &serde_json::Value) -> bool {
     };
     let allowed: &[&str] = match name {
         "health" => &["op"],
+        "provision_workspace" => &["op", "workspace_id"],
         "start" => &["op", "terminal_id", "request"],
         "input" => &["op", "terminal_id", "input_id", "data_base64"],
         "read_output" => &["op", "terminal_id", "after_cursor", "max_bytes", "wait_ms"],
@@ -1233,6 +1242,9 @@ mod tests {
         let uid = effective_uid_from_proc_status(&fs::read_to_string("/proc/self/status").unwrap())
             .unwrap();
         fs::create_dir(root.join("workspaces")).unwrap();
+        // Filesystem::new requires a private workspace root; pin the mode so the
+        // tests are immune to the ambient umask.
+        fs::set_permissions(root.join("workspaces"), fs::Permissions::from_mode(0o700)).unwrap();
         Daemon::new(
             DaemonConfig {
                 socket: SocketConfig {
@@ -1922,6 +1934,94 @@ mod tests {
             SandboxErrorCode::NotFound
         );
         assert!(runtime.starts.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provision_workspace_provisions_storage_and_is_idempotent() {
+        let root = TestDirectory::new();
+        let daemon = daemon(
+            &root.0,
+            NetworkPolicyConfig {
+                restricted_network: Some("gobrowse-restricted-test".into()),
+                allow_full: false,
+            },
+            HARD_RESOURCE_LIMITS,
+            Arc::new(MockRuntime::default()),
+        );
+        let workspace_id = Uuid::new_v4();
+        for _ in 0..2 {
+            let response = daemon
+                .handle_line(&envelope(
+                    "correct opaque daemon token",
+                    SandboxOperation::ProvisionWorkspace { workspace_id },
+                ))
+                .await;
+            assert!(matches!(
+                response.result,
+                Ok(SandboxResult::Provisioned { workspace_id: echoed })
+                    if echoed == workspace_id
+            ));
+        }
+        // Provisioning made the workspace volume attestable, which is what
+        // `Start` requires before it will acquire a lifecycle lock.
+        assert_eq!(
+            daemon
+                .filesystem
+                .workspace_storage(workspace_id)
+                .unwrap()
+                .volume_name,
+            gobrowse_core::sandbox::workspace_volume_name(workspace_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_workspace_rejects_nil_workspace() {
+        let root = TestDirectory::new();
+        let daemon = daemon(
+            &root.0,
+            NetworkPolicyConfig {
+                restricted_network: Some("gobrowse-restricted-test".into()),
+                allow_full: false,
+            },
+            HARD_RESOURCE_LIMITS,
+            Arc::new(MockRuntime::default()),
+        );
+        let response = daemon
+            .handle_line(&envelope(
+                "correct opaque daemon token",
+                SandboxOperation::ProvisionWorkspace {
+                    workspace_id: Uuid::nil(),
+                },
+            ))
+            .await;
+        assert_eq!(
+            response.result.unwrap_err().code,
+            SandboxErrorCode::InvalidRequest
+        );
+    }
+
+    #[tokio::test]
+    async fn provision_workspace_rejects_unknown_wire_fields() {
+        let root = TestDirectory::new();
+        let daemon = daemon(
+            &root.0,
+            NetworkPolicyConfig {
+                restricted_network: Some("gobrowse-restricted-test".into()),
+                allow_full: false,
+            },
+            HARD_RESOURCE_LIMITS,
+            Arc::new(MockRuntime::default()),
+        );
+        let request = format!(
+            r#"{{"version":2,"request_id":"{}","token":"correct opaque daemon token","operation":{{"op":"provision_workspace","workspace_id":"{}","extra":true}}}}"#,
+            Uuid::new_v4(),
+            Uuid::new_v4()
+        );
+        let response = daemon.handle_line(request.as_bytes()).await;
+        assert_eq!(
+            response.result.unwrap_err().code,
+            SandboxErrorCode::InvalidRequest
+        );
     }
 
     #[tokio::test]

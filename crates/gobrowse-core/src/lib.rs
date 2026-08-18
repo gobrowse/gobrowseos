@@ -7,6 +7,7 @@ pub mod fake_model;
 pub mod library;
 pub mod mcp;
 pub mod model;
+pub mod plugin;
 pub mod policy;
 pub mod redaction;
 pub mod sandbox;

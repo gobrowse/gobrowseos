@@ -632,16 +632,19 @@ impl PodmanRuntime {
     }
 
     pub fn resize_spec(&self, terminal_id: Uuid, cols: u16, rows: u16) -> ProcessSpec {
+        // podman >= 5 removed the `container resize` subcommand; resize the
+        // container TTY from inside via stty (present in the workspace image).
         ProcessSpec {
             program: self.config.executable.clone(),
             args: vec![
-                "container".into(),
-                "resize".into(),
-                "--width".into(),
-                cols.to_string(),
-                "--height".into(),
-                rows.to_string(),
+                "exec".into(),
+                "-t".into(),
                 container_name(terminal_id),
+                "/bin/stty".into(),
+                "cols".into(),
+                cols.to_string(),
+                "rows".into(),
+                rows.to_string(),
             ],
         }
     }
@@ -2768,8 +2771,7 @@ case "$1" in
     fi
     rm -f "$paused"
     ;;
-  container)
-    [ "$2" = resize ] || exit 1
+  exec)
     [ ! -e "$resize_failure" ] || exit 1
     ;;
   stop|rm)
@@ -2930,10 +2932,7 @@ esac
             runtime.inspect(terminal_id).await.unwrap().state,
             TerminalState::Running
         );
-        assert!(
-            fake.command_log()
-                .contains("container resize --width 80 --height 24")
-        );
+        assert!(fake.command_log().contains("/bin/stty cols 80 rows 24"));
         runtime.terminate(terminal_id).await.unwrap();
         assert_eq!(
             runtime.inspect(terminal_id).await.unwrap().state,
@@ -3226,7 +3225,7 @@ esac
             .await;
         assert!(matches!(result, Err(RuntimeError::PodmanFailed)));
         let log = fake.command_log();
-        assert!(log.contains("container resize --width 80 --height 24"));
+        assert!(log.contains("/bin/stty cols 80 rows 24"));
         assert!(log.contains("stop --ignore --time 1"));
     }
 

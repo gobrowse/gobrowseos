@@ -1220,3 +1220,21 @@ resolutions; lanes consume these as authoritative corrections to the sections ab
   per A5 + token metrics; search per A3).
 - Wave 4: Lane F (UI) after C+E routes exist.
 - Lane A must incorporate A2 (text comparison guards) and A4 (sync triggers) in 0020.
+
+### A8. ProvisionWorkspace protocol op (found in daemon verification — MUST-FIX)
+- Verified: daemon Start requires `filesystem.workspace_storage(id)` to pre-exist
+  (daemon.rs:537-541) and `start_spec` requires `WorkspaceProvisioning::NamedVolume`
+  (runtime.rs:520-541). `ensure_workspace` is test-only; NO production provisioning path
+  exists. The app must provision workspace storage through the protocol, never by
+  touching the shared FS.
+- Add to `gobrowse_core::sandbox::SandboxOperation`:
+  `ProvisionWorkspace { workspace_id: Uuid }` → `SandboxResult::Provisioned { workspace_id }`.
+  Daemon handler (daemon.rs, next to Health): `filesystem.ensure_workspace(workspace_id)?;
+  Ok(SandboxResult::Provisioned{..})`. Idempotent (ensure_workspace handles EXIST).
+  Validated by `workspace_id.is_nil()` rejection + bounded payload (already guaranteed).
+- Lane D owns: core enum variant + SandboxResult variant + daemon handler + client
+  `provision_workspace()` method + audit + tests. Deployed sandboxd must run with
+  `--quota-managed-workspaces`.
+- Server flow: workspace creation in the app → on first sandbox use (or eagerly at
+  workspace create when sandbox enabled) call ProvisionWorkspace once; failure surfaces
+  as actionable error ("sandbox unavailable — daemon not reachable or not provisioned").
