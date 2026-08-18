@@ -63,6 +63,12 @@ pub enum WorkspaceProvisioning {
 #[derive(Debug, Clone)]
 pub struct PodmanConfig {
     pub executable: PathBuf,
+    /// Real home of the daemon user; rootless podman resolves its storage from
+    /// this. Falls back to a fixed temp home when unset (previous behavior).
+    pub home: PathBuf,
+    /// XDG_RUNTIME_DIR for the daemon user (rootless podman uses it for
+    /// sockets/locks); `/run/user/<uid>` when present, else unset.
+    pub runtime_dir: Option<PathBuf>,
     pub image: String,
     pub readiness_timeout: Duration,
     pub control_timeout: Duration,
@@ -84,14 +90,17 @@ pub struct ProcessSpec {
 }
 
 impl ProcessSpec {
-    fn command(&self) -> Command {
+    fn command(&self, home: &std::path::Path, runtime_dir: Option<&std::path::Path>) -> Command {
         let mut command = Command::new(&self.program);
         command
             .args(&self.args)
             .env_clear()
             .env("PATH", MINIMAL_PATH)
-            .env("HOME", CONTAINER_HOME)
+            .env("HOME", home)
             .kill_on_drop(true);
+        if let Some(runtime_dir) = runtime_dir {
+            command.env("XDG_RUNTIME_DIR", runtime_dir);
+        }
         command
     }
 
@@ -798,7 +807,7 @@ impl PodmanRuntime {
     async fn run_checked(&self, spec: ProcessSpec) -> Result<(), RuntimeError> {
         let status = tokio::time::timeout(
             self.config.control_timeout,
-            spec.command()
+            spec.command(&self.config.home, self.config.runtime_dir.as_deref())
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -820,7 +829,7 @@ impl PodmanRuntime {
         maximum: usize,
     ) -> Result<(std::process::ExitStatus, Vec<u8>), RuntimeError> {
         let mut child = spec
-            .command()
+            .command(&self.config.home, self.config.runtime_dir.as_deref())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -1075,7 +1084,7 @@ impl PodmanRuntime {
 async fn run_checked_with(config: &PodmanConfig, spec: ProcessSpec) -> Result<(), RuntimeError> {
     let status = tokio::time::timeout(
         config.control_timeout,
-        spec.command()
+        spec.command(&config.home, config.runtime_dir.as_deref())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2365,6 +2374,8 @@ while :; do sleep 0.1; done"#;
         let filesystem = test_filesystem();
         PodmanConfig {
             executable: PathBuf::from("/usr/bin/podman"),
+            home: PathBuf::from("/tmp"),
+            runtime_dir: None,
             image: "registry.example/gobrowse/sandbox@sha256:abc123".into(),
             readiness_timeout: Duration::from_secs(5),
             control_timeout: Duration::from_secs(5),
@@ -2639,7 +2650,7 @@ while :; do sleep 0.1; done"#;
         let spec = runtime()
             .start_spec(&start(vec!["true".into()], "none"))
             .unwrap();
-        let command = spec.command();
+        let command = spec.command(&std::path::Path::new("/tmp"), None);
         let environment = command
             .as_std()
             .get_envs()

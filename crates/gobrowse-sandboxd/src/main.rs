@@ -11,6 +11,8 @@ use gobrowse_sandboxd::{
 };
 use zeroize::Zeroizing;
 
+const CONTAINER_HOME_FALLBACK: &str = "/tmp";
+
 #[derive(Debug, Parser)]
 #[command(name = "gobrowse-sandboxd")]
 struct Args {
@@ -74,6 +76,23 @@ struct Args {
     quota_managed_workspaces: bool,
 }
 
+/// Resolves the daemon user's home directory from /etc/passwd (the daemon
+/// must run with a sanitized env where $HOME may be bogus — rootless podman
+/// resolves its storage from the real home).
+fn user_home(uid: u32) -> Option<String> {
+    let passwd = std::fs::read_to_string("/etc/passwd").ok()?;
+    passwd.lines().find_map(|line| {
+        let mut fields = line.split(':');
+        let _name = fields.next()?;
+        let _password = fields.next()?;
+        let parsed_uid = fields.next()?.parse::<u32>().ok()?;
+        let _gid = fields.next()?;
+        let _gecos = fields.next()?;
+        let home = fields.next()?;
+        (parsed_uid == uid).then(|| home.to_owned())
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -85,6 +104,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if effective_uid == 0 {
         return Err("gobrowse-sandboxd refuses to run as root".into());
     }
+
+    let home = user_home(effective_uid)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(CONTAINER_HOME_FALLBACK));
+    let runtime_dir = std::path::Path::new("/run/user")
+        .join(effective_uid.to_string())
+        .is_dir()
+        .then(|| std::path::Path::new("/run/user").join(effective_uid.to_string()));
 
     let token = Zeroizing::new(std::fs::read_to_string(&args.auth_token_file)?);
     let auth = Authenticator::new(token.trim())?;
@@ -98,6 +125,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let restricted_network = args.restricted_network.clone();
     let runtime = Arc::new(PodmanRuntime::new(PodmanConfig {
         executable: args.podman,
+        home,
+        runtime_dir,
         image: args.image,
         readiness_timeout: Duration::from_secs(args.podman_readiness_seconds),
         control_timeout: Duration::from_secs(args.podman_control_seconds),
