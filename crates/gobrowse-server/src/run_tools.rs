@@ -1263,14 +1263,11 @@ pub(crate) async fn lexical_search(
          FROM books WHERE profile_id = $2 \
            AND (security_classification <> 'RESTRICTED') \
            AND (scope <> 'AGENT') \
+           AND (scope <> 'CONVERSATION') \
            AND (scope NOT IN ('USER','PRIVATE') OR owner_user_id=$3) \
-           AND (scope<>'CONVERSATION' OR EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND ( \
-               (c.workspace_id IS NULL AND c.created_by_user_id=$3) OR EXISTS( \
-               SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=c.workspace_id AND member.user_id=$3)))) \
            AND (scope NOT IN ('WORKSPACE','PROJECT') OR EXISTS( \
                SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=books.workspace_id AND member.user_id=$3)) \
-           AND ($4::uuid IS NULL OR scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR workspace_id=$4 \
-                OR (scope='CONVERSATION' AND EXISTS(SELECT 1 FROM conversations c WHERE c.id=books.conversation_id AND c.workspace_id=$4))) \
+           AND ($4::uuid IS NULL OR scope IN ('GLOBAL','PROFILE','USER','PRIVATE','AGENT') OR workspace_id=$4) \
            AND search_document @@ websearch_to_tsquery('english', $1) \
          ORDER BY ts_rank_cd(search_document, websearch_to_tsquery('english', $1)) DESC, updated_at DESC LIMIT $5",
     )

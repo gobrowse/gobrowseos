@@ -707,8 +707,9 @@ impl Daemon {
                 data_base64,
             } => {
                 let bytes = decode_bounded(&data_base64, MAX_FILE_PAYLOAD_BYTES)?;
+                let parent = Self::parent_of(&path).to_owned();
                 let sha256 = self
-                    .mutate_workspace(workspace_id, || {
+                    .mutate_workspace(workspace_id, Some((parent, false)), None, || {
                         self.filesystem.write(workspace_id, &path, &bytes)
                     })
                     .await?;
@@ -724,8 +725,9 @@ impl Daemon {
                 data_base64,
             } => {
                 let bytes = decode_bounded(&data_base64, MAX_FILE_PAYLOAD_BYTES)?;
+                let parent = Self::parent_of(&path).to_owned();
                 let sha256 = self
-                    .mutate_workspace(workspace_id, || {
+                    .mutate_workspace(workspace_id, Some((parent, false)), None, || {
                         self.filesystem
                             .patch(workspace_id, &path, &expected_sha256, &bytes)
                     })
@@ -736,8 +738,14 @@ impl Daemon {
                 })
             }
             SandboxOperation::FsMkdir { workspace_id, path } => {
-                self.mutate_workspace(workspace_id, || self.filesystem.mkdir(workspace_id, &path))
-                    .await?;
+                let parent = Self::parent_of(&path).to_owned();
+                self.mutate_workspace(
+                    workspace_id,
+                    Some((parent, false)),
+                    Some((path.clone(), false)),
+                    || self.filesystem.mkdir(workspace_id, &path),
+                )
+                .await?;
                 Ok(SandboxResult::FsCreated)
             }
             SandboxOperation::FsMove {
@@ -745,9 +753,13 @@ impl Daemon {
                 from,
                 to,
             } => {
-                self.mutate_workspace(workspace_id, || {
-                    self.filesystem.move_entry(workspace_id, &from, &to)
-                })
+                let parent = Self::parent_of(&to).to_owned();
+                self.mutate_workspace(
+                    workspace_id,
+                    Some((parent, false)),
+                    Some((to.clone(), false)),
+                    || self.filesystem.move_entry(workspace_id, &from, &to),
+                )
                 .await?;
                 Ok(SandboxResult::FsMoved)
             }
@@ -756,15 +768,22 @@ impl Daemon {
                 from,
                 to,
             } => {
-                self.mutate_workspace(workspace_id, || {
-                    self.filesystem.copy(workspace_id, &from, &to)
-                })
+                let parent = Self::parent_of(&to).to_owned();
+                self.mutate_workspace(
+                    workspace_id,
+                    Some((parent, false)),
+                    Some((to.clone(), true)),
+                    || self.filesystem.copy(workspace_id, &from, &to),
+                )
                 .await?;
                 Ok(SandboxResult::FsCopied)
             }
             SandboxOperation::FsDelete { workspace_id, path } => {
-                self.mutate_workspace(workspace_id, || self.filesystem.delete(workspace_id, &path))
-                    .await?;
+                let parent = Self::parent_of(&path).to_owned();
+                self.mutate_workspace(workspace_id, Some((parent, false)), None, || {
+                    self.filesystem.delete(workspace_id, &path)
+                })
+                .await?;
                 Ok(SandboxResult::FsDeleted)
             }
         }
@@ -780,15 +799,34 @@ impl Daemon {
         )
     }
 
+    /// Workspace-relative parent of a path ("." when the path has no parent).
+    fn parent_of(path: &str) -> &str {
+        match path.rsplit_once('/') {
+            Some((parent, _)) if !parent.is_empty() => parent,
+            _ => ".",
+        }
+    }
+
     async fn mutate_workspace<T>(
         &self,
         workspace_id: Uuid,
+        pre_chown: Option<(String, bool)>,
+        post_chown: Option<(String, bool)>,
         operation: impl FnOnce() -> Result<T, FilesystemError>,
     ) -> Result<T, DaemonError> {
         self.filesystem.require_directory(workspace_id, ".")?;
         let workspace_lock = self.workspace_lock(workspace_id).await;
         let _workspace_guard = workspace_lock.lock().await;
         let pause = self.runtime.pause_workspace(workspace_id).await?;
+        // Pre-op ownership fix (e.g. writing into a container-created dir).
+        // Best-effort: the filesystem op is authoritative; a volume-less
+        // workspace still operates.
+        if let Some((path, recursive)) = &pre_chown {
+            let _ = self
+                .runtime
+                .chown_workspace_path(workspace_id, path, *recursive)
+                .await;
+        }
         let mut resume = WorkspaceResumeGuard {
             runtime: Arc::clone(&self.runtime),
             pause: Some(pause),
@@ -806,6 +844,15 @@ impl Daemon {
                 let _ = self.runtime.terminate(terminal_id).await;
             }
             return result;
+        }
+        // Post-op ownership fix (e.g. a new directory both sides must use) while
+        // the workspace is still paused so no container write races it.
+        // Best-effort, mirrors the pre-op fix.
+        if let Some((path, recursive)) = &post_chown {
+            let _ = self
+                .runtime
+                .chown_workspace_path(workspace_id, path, *recursive)
+                .await;
         }
         let resumed = resume.resume().await;
         match (result, resumed) {
@@ -1037,6 +1084,7 @@ mod tests {
     #[derive(Default)]
     struct MockRuntime {
         starts: TokioMutex<Vec<ValidatedStart>>,
+        chowns: TokioMutex<Vec<(Uuid, String, bool)>>,
         start_delay: std::time::Duration,
     }
 
@@ -1116,6 +1164,19 @@ mod tests {
             &self,
             _workspace_id: Uuid,
         ) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn chown_workspace_path(
+            &self,
+            workspace_id: Uuid,
+            relative: &str,
+            recursive: bool,
+        ) -> Result<(), RuntimeError> {
+            self.chowns
+                .lock()
+                .await
+                .push((workspace_id, relative.to_owned(), recursive));
             Ok(())
         }
     }
@@ -1737,6 +1798,7 @@ mod tests {
         let root = TestDirectory::new();
         let runtime = Arc::new(MockRuntime {
             starts: TokioMutex::new(Vec::new()),
+            chowns: TokioMutex::new(Vec::new()),
             start_delay: Duration::from_millis(100),
         });
         let daemon = with_connections(
@@ -1802,6 +1864,7 @@ mod tests {
         let root = TestDirectory::new();
         let runtime = Arc::new(MockRuntime {
             starts: TokioMutex::new(Vec::new()),
+            chowns: TokioMutex::new(Vec::new()),
             start_delay: Duration::from_secs(1),
         });
         let daemon = daemon(
@@ -2189,6 +2252,7 @@ mod tests {
         let root = TestDirectory::new();
         let runtime = Arc::new(MockRuntime {
             starts: TokioMutex::new(Vec::new()),
+            chowns: TokioMutex::new(Vec::new()),
             start_delay: std::time::Duration::from_millis(25),
         });
         let daemon = daemon(
@@ -2362,5 +2426,47 @@ mod tests {
         assert!(auth.verify("correct opaque daemon token"));
         assert!(!auth.verify("correct opaque daemon tokeN"));
         assert!(!auth.verify(&"x".repeat(MAX_TOKEN_BYTES + 1)));
+    }
+
+    #[tokio::test]
+    async fn fs_mkdir_invokes_pre_and_post_chown_hooks() {
+        let root = TestDirectory::new();
+        let runtime = Arc::new(MockRuntime::default());
+        let daemon = daemon(
+            &root.0,
+            NetworkPolicyConfig {
+                restricted_network: Some("gobrowse-restricted-test".into()),
+                allow_full: false,
+            },
+            HARD_RESOURCE_LIMITS,
+            Arc::clone(&runtime),
+        );
+        let workspace_id = Uuid::new_v4();
+        daemon.filesystem.ensure_workspace(workspace_id).unwrap();
+        for path in ["out", "out/sub"] {
+            let response = daemon
+                .handle_line(&envelope(
+                    "correct opaque daemon token",
+                    SandboxOperation::FsMkdir {
+                        workspace_id,
+                        path: path.into(),
+                    },
+                ))
+                .await;
+            assert!(response.result.is_ok(), "{:?}", response.result);
+        }
+        let chowns = runtime.chowns.lock().await;
+        // Each mkdir runs a pre hook on its parent (fixing a container-created
+        // dir) and a post hook on the freshly created dir so both sides can
+        // write into it.
+        assert_eq!(
+            chowns.as_slice(),
+            &[
+                (workspace_id, ".".to_owned(), false),
+                (workspace_id, "out".to_owned(), false),
+                (workspace_id, "out".to_owned(), false),
+                (workspace_id, "out/sub".to_owned(), false),
+            ]
+        );
     }
 }

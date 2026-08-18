@@ -16,7 +16,7 @@ use gobrowse_core::sandbox::{
     MAX_TERMINAL_OUTPUT_CHUNK_BYTES, MAX_TERMINAL_PROCESS_BYTES,
     MAX_TERMINAL_PROCESS_COMMAND_BYTES, MAX_TERMINAL_PROCESSES, NetworkPolicy,
     RestrictedNetworkAttestation, SandboxProcess, TerminalStartRequest, TerminalState,
-    WorkspaceStorageIdentity, workspace_volume_name,
+    WorkspaceStorageIdentity, validate_workspace_path, workspace_volume_name,
 };
 use pty_process::{OwnedWritePty, Size};
 use sha2::{Digest, Sha256};
@@ -263,6 +263,19 @@ pub trait SandboxRuntime: Send + Sync {
     async fn resume_workspace(&self, pause: &WorkspacePause) -> Result<(), RuntimeError>;
     async fn reconcile_recoveries(&self) -> Result<(), RuntimeError>;
     async fn ensure_workspace_recovered(&self, workspace_id: Uuid) -> Result<(), RuntimeError>;
+    /// Fixes ownership/mode of a workspace-relative directory so BOTH the
+    /// container (subuid-mapped uid) and the daemon's filesystem layer can
+    /// operate on it: `container_uid:<daemon primary gid>` + setgid 2775.
+    /// `recursive` applies to a whole subtree (copy destinations). Callers
+    /// treat failures as best-effort: the filesystem op is authoritative.
+    async fn chown_workspace_path(
+        &self,
+        _workspace_id: Uuid,
+        _relative: &str,
+        _recursive: bool,
+    ) -> Result<(), RuntimeError> {
+        Ok(())
+    }
     /// Register the workspace named volume with the runtime so Start's
     /// `verify_workspace_volume` can attest it. Idempotent.
     async fn provision_workspace(&self, _workspace_id: Uuid) -> Result<(), RuntimeError> {
@@ -742,18 +755,16 @@ impl PodmanRuntime {
         }
     }
 
-    fn unshare_chown_spec(&self, mountpoint: &str) -> ProcessSpec {
+    fn unshare_chown_spec(&self, mountpoint: &str, recursive: bool) -> ProcessSpec {
+        let mut args = vec!["unshare".into(), "chown".into()];
+        if recursive {
+            args.push("-R".into());
+        }
+        args.push(format!("{}:0", self.config.container_uid));
+        args.push(mountpoint.into());
         ProcessSpec {
             program: self.config.executable.clone(),
-            args: vec![
-                "unshare".into(),
-                "chown".into(),
-                // gid 0 maps to the daemon user's primary group inside the
-                // rootless userns; the uid maps to the container's host uid
-                // in the default (non-keep-id) namespace.
-                format!("{}:0", self.config.container_uid),
-                mountpoint.into(),
-            ],
+            args,
         }
     }
 
@@ -1582,14 +1593,27 @@ impl SandboxRuntime for PodmanRuntime {
                     .await
                     .is_err()
                 {
-                    // One-shot exec race: the container exited between the
-                    // readiness probe and the resize. A container that is no
-                    // longer running means the command completed (the monitor
-                    // records EXITED and the output is journaled). A resize
-                    // failure on a still-running container remains fatal.
-                    match self.inspect_ready(session.terminal_id).await {
-                        Ok(false) => Ok(()),
-                        _ => Err(RuntimeError::PodmanFailed),
+                    // One-shot exec race: the container may have exited between
+                    // the readiness probe and the resize. Wait briefly for the
+                    // monitor to record the normal exit; a still-running
+                    // container (or a transient podman hiccup) means the resize
+                    // failure is genuine and remains fatal.
+                    let mut terminal_state = session.state.subscribe();
+                    let _ = tokio::time::timeout(Duration::from_millis(1_000), async {
+                        loop {
+                            if terminal_state.changed().await.is_err() {
+                                break;
+                            }
+                            if terminal_state.borrow_and_update().is_terminal() {
+                                break;
+                            }
+                        }
+                    })
+                    .await;
+                    if self.exited_normally(&session) {
+                        Ok(())
+                    } else {
+                        Err(RuntimeError::PodmanFailed)
                     }
                 } else {
                     session
@@ -1963,10 +1987,37 @@ impl SandboxRuntime for PodmanRuntime {
         // setgid 775 so both sides can read/write the shared workspace.
         let mountpoint =
             workspace_volume_mountpoint(&output).ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
-        self.run_checked(self.unshare_chown_spec(&mountpoint))
+        self.run_checked(self.unshare_chown_spec(&mountpoint, false))
             .await?;
         self.run_checked(self.unshare_chmod_spec(&mountpoint))
             .await?;
+        Ok(())
+    }
+
+    async fn chown_workspace_path(
+        &self,
+        workspace_id: Uuid,
+        relative: &str,
+        recursive: bool,
+    ) -> Result<(), RuntimeError> {
+        validate_workspace_path(relative).map_err(|_| RuntimeError::InvalidConfiguration)?;
+        let (status, output) = self
+            .run_output_bounded(self.volume_inspect_spec(workspace_id), 16 * 1024)
+            .await?;
+        if !status.success() {
+            return Err(RuntimeError::PodmanFailed);
+        }
+        let mountpoint =
+            workspace_volume_mountpoint(&output).ok_or(RuntimeError::WorkspaceVolumeInvalid)?;
+        let target = std::path::Path::new(&mountpoint)
+            .join(relative)
+            .to_string_lossy()
+            .into_owned();
+        self.run_checked(self.unshare_chown_spec(&target, recursive))
+            .await?;
+        if !recursive {
+            self.run_checked(self.unshare_chmod_spec(&target)).await?;
+        }
         Ok(())
     }
 

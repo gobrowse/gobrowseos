@@ -10,3 +10,4 @@
 coverage/
 backups/
 .osgrep
+/target-bookworm

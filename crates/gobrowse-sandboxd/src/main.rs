@@ -97,6 +97,10 @@ fn user_home_and_gid(uid: u32) -> Option<(String, u32)> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Pin the process umask so the 0644/0755 (with implicit group/other modes
+    // the container relies on) that Filesystem and chown_workspace_path create
+    // are NOT filtered by an ambient umask inherited from the launcher.
+    rustix::process::umask(rustix::fs::Mode::from_bits_truncate(0o022));
     let args = Args::parse();
     if args.terminal_input_timeout_seconds >= args.operation_timeout_seconds {
         return Err("terminal input timeout must be shorter than operation timeout".into());
