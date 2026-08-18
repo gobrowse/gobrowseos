@@ -129,12 +129,17 @@ async fn insert_skill_with_book(
 ) -> (Uuid, Uuid) {
     let skill_id = Uuid::now_v7();
     let book_id = Uuid::now_v7();
-    sqlx::query("INSERT INTO skills (id,profile_id,name,description,active_revision,promotion_policy) VALUES ($1,$2,$3,'fixture skill',1,'manual')")
+    sqlx::query("INSERT INTO skills (id,profile_id,name,description,active_revision,promotion_policy) VALUES ($1,$2,$3,'fixture skill',NULL,'manual')")
         .bind(skill_id).bind(profile_id).bind(name)
         .execute(pool).await.expect("insert skill");
     sqlx::query("INSERT INTO skill_revisions (id,skill_id,revision,content,author,reason,promoted) VALUES ($1,$2,1,$3,'fixture','initial',true)")
         .bind(Uuid::now_v7()).bind(skill_id).bind(content)
         .execute(pool).await.expect("insert skill revision");
+    sqlx::query("UPDATE skills SET active_revision = 1 WHERE id = $1")
+        .bind(skill_id)
+        .execute(pool)
+        .await
+        .expect("activate skill revision");
     sqlx::query(
         "INSERT INTO books (id,profile_id,title,body,book_type,scope,tags,provenance,trust,source,author,security_classification,kind,metadata) \
          VALUES ($1,$2,$3,$4,'INSTRUCTION','PROFILE','{}','SKILL','USER_PROVIDED','{}','system','INTERNAL','SKILL',jsonb_build_object('skill_id',$5::uuid))",
