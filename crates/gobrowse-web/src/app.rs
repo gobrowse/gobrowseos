@@ -1777,10 +1777,8 @@ fn ModelsPage() -> impl IntoView {
                                 chat_output.set(first.output_limit.to_string());
                             }
                         } else {
-                            chat_status.set(format!(
-                                "{} not in catalog",
-                                chat_provider.get_untracked()
-                            ));
+                            chat_status
+                                .set(format!("{} not in catalog", chat_provider.get_untracked()));
                         }
                     }
                     Err(_) => chat_status.set("Could not load provider catalog".into()),
