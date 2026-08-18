@@ -2955,7 +2955,10 @@ esac
         }
 
         fn write_network_info(&self, name: &str, subnet: &str, gateway: &str, dns: &str) {
-            let line = format!("{name}|{subnet}|{gateway}|{dns}\n");
+            // Modern podman exposes the network's subnets as a JSON array under
+            // `.Subnets` (each `{subnet, gateway}`); DNS is not present.
+            let subnets = format!(r#"[{{"subnet":"{subnet}","gateway":"{gateway}"}}]"#);
+            let line = format!("{name}|{subnets}|{dns}\n");
             fs::write(&self.network_info, line.as_bytes()).unwrap();
             let _ = fs::remove_file(&self.marker);
         }
@@ -3427,13 +3430,15 @@ esac
             "expected InvalidConfiguration for private gateway, got {result:?}"
         );
 
-        // Also verify that a metadata address (169.254.169.254) in DNS is rejected.
+        // Also verify that a metadata address (169.254.169.254) used as the
+        // gateway is rejected (podman exposes no per-network DNS in inspect,
+        // so the metadata check is enforced on subnet/gateway).
         let fake2 = FakePodman::new();
         fake2.write_network_info(
             "gobrowse-restricted-md",
-            "93.184.216.0/24",
-            "93.184.216.1",
-            r#"["169.254.169.254"]"#,
+            "169.254.169.0/24",
+            "169.254.169.254",
+            "[]",
         );
         let runtime2 =
             fake2.runtime_restricted(Duration::from_millis(500), "gobrowse-restricted-md");
