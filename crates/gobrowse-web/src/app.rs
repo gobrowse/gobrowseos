@@ -1862,7 +1862,8 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
 
     // ---- search + filter ----
     let run_search = {
-        move |_| {
+        move |event: leptos::ev::SubmitEvent| {
+            event.prevent_default();
             let value = query.get_untracked();
             let trimmed = value.trim().to_owned();
             if trimmed.is_empty() {
@@ -2154,11 +2155,14 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
         move |_| {
             let source_uri = stepper_source.get_untracked().trim().to_owned();
             if source_uri.is_empty() {
-                if let Some(state) = stepper.get_untracked().as_mut() {
-                    state.error = Some(
-                        "Enter a GitHub URL (https://github.com/owner/repo) or owner/repo.".into(),
-                    );
-                }
+                stepper.update(|maybe_state| {
+                    if let Some(state) = maybe_state.as_mut() {
+                        state.error = Some(
+                            "Enter a GitHub URL (https://github.com/owner/repo) or owner/repo."
+                                .into(),
+                        );
+                    }
+                });
                 return;
             }
             let version = {
@@ -2169,15 +2173,17 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                 let value = stepper_workspace.get_untracked();
                 (!value.is_empty()).then_some(value)
             };
-            if let Some(state) = stepper.get_untracked().as_mut() {
-                state.step = StepperStep::Previewing;
-                state.source_type = "github_release".into();
-                state.source_uri = source_uri.clone();
-                state.version = version.clone();
-                state.workspace_id = workspace_id.clone();
-                state.error = None;
-                state.preview = None;
-            }
+            stepper.update(|maybe_state| {
+                if let Some(state) = maybe_state.as_mut() {
+                    state.step = StepperStep::Previewing;
+                    state.source_type = "github_release".into();
+                    state.source_uri = source_uri.clone();
+                    state.version = version.clone();
+                    state.workspace_id = workspace_id.clone();
+                    state.error = None;
+                    state.preview = None;
+                }
+            });
             let stepper = stepper;
             spawn_local(async move {
                 let request =
@@ -2191,10 +2197,12 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                         Ok(response) if response.ok() => {
                             match response.json::<PluginPreview>().await {
                                 Ok(preview) => {
-                                    if let Some(state) = stepper.get_untracked().as_mut() {
-                                        state.preview = Some(preview);
-                                        state.step = StepperStep::Preview;
-                                    }
+                                    stepper.update(|maybe_state| {
+                                        if let Some(state) = maybe_state.as_mut() {
+                                            state.preview = Some(preview);
+                                            state.step = StepperStep::Preview;
+                                        }
+                                    });
                                     Ok(())
                                 }
                                 Err(_) => Err("The preview response was not valid.".to_owned()),
@@ -2205,42 +2213,50 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                     },
                     Err(_) => Err("The preview request could not be encoded.".to_owned()),
                 };
-                if let Err(error) = outcome
-                    && let Some(state) = stepper.get_untracked().as_mut()
-                {
-                    state.error = Some(error);
-                    state.step = StepperStep::Error;
+                if let Err(error) = outcome {
+                    stepper.update(|maybe_state| {
+                        if let Some(state) = maybe_state.as_mut() {
+                            state.error = Some(error);
+                            state.step = StepperStep::Error;
+                        }
+                    });
                 }
             });
         }
     };
     let stepper_to_approve = {
         move |_| {
-            if let Some(state) = stepper.get_untracked().as_mut() {
-                state.step = StepperStep::Approve;
-                state.confirmed = false;
-            }
+            stepper.update(|maybe_state| {
+                if let Some(state) = maybe_state.as_mut() {
+                    state.step = StepperStep::Approve;
+                    state.confirmed = false;
+                }
+            });
         }
     };
     let stepper_back = {
         move |_| {
-            if let Some(state) = stepper.get_untracked().as_mut() {
-                state.step = if state.install.is_some() {
-                    StepperStep::Done
-                } else if state.preview.is_some() {
-                    StepperStep::Preview
-                } else {
-                    StepperStep::Source
-                };
-                state.error = None;
-            }
+            stepper.update(|maybe_state| {
+                if let Some(state) = maybe_state.as_mut() {
+                    state.step = if state.install.is_some() {
+                        StepperStep::Done
+                    } else if state.preview.is_some() {
+                        StepperStep::Preview
+                    } else {
+                        StepperStep::Source
+                    };
+                    state.error = None;
+                }
+            });
         }
     };
     let stepper_confirm = {
         move |checked: bool| {
-            if let Some(state) = stepper.get_untracked().as_mut() {
-                state.confirmed = checked;
-            }
+            stepper.update(|maybe_state| {
+                if let Some(state) = maybe_state.as_mut() {
+                    state.confirmed = checked;
+                }
+            });
         }
     };
     let stepper_install = {
@@ -2249,10 +2265,13 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                 return;
             };
             if !current.confirmed {
-                if let Some(state) = stepper.get_untracked().as_mut() {
-                    state.error =
-                        Some("Confirm that you reviewed the manifest before installing.".into());
-                }
+                stepper.update(|maybe_state| {
+                    if let Some(state) = maybe_state.as_mut() {
+                        state.error = Some(
+                            "Confirm that you reviewed the manifest before installing.".into(),
+                        );
+                    }
+                });
                 return;
             }
             let Some(preview) = current.preview.clone() else {
@@ -2261,11 +2280,13 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
             let source_uri = current.source_uri.clone();
             let version = current.version.clone();
             let workspace_id = current.workspace_id.clone();
-            if let Some(state) = stepper.get_untracked().as_mut() {
-                state.step = StepperStep::Installing;
-                state.phase = "Staging artifact...".into();
-                state.error = None;
-            }
+            stepper.update(|maybe_state| {
+                if let Some(state) = maybe_state.as_mut() {
+                    state.step = StepperStep::Installing;
+                    state.phase = "Staging artifact...".into();
+                    state.error = None;
+                }
+            });
             let stepper = stepper;
             spawn_local(async move {
                 // Staged progress labels while the synchronous install runs.
@@ -2276,11 +2297,13 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                     "Finalizing...",
                 ];
                 for label in labels {
-                    if let Some(state) = stepper.get_untracked().as_mut()
-                        && state.step == StepperStep::Installing
-                    {
-                        state.phase = label.into();
-                    }
+                    stepper.update(|maybe_state| {
+                        if let Some(state) = maybe_state.as_mut()
+                            && state.step == StepperStep::Installing
+                        {
+                            state.phase = label.into();
+                        }
+                    });
                     wait_for_poll(300).await;
                 }
                 let request =
@@ -2297,10 +2320,12 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                         Ok(response) if response.ok() => {
                             match response.json::<InstallResponse>().await {
                                 Ok(installed) => {
-                                    if let Some(state) = stepper.get_untracked().as_mut() {
-                                        state.install = Some(installed);
-                                        state.step = StepperStep::Done;
-                                    }
+                                    stepper.update(|maybe_state| {
+                                        if let Some(state) = maybe_state.as_mut() {
+                                            state.install = Some(installed);
+                                            state.step = StepperStep::Done;
+                                        }
+                                    });
                                     Ok(())
                                 }
                                 Err(_) => Err("The install response was not valid.".to_owned()),
@@ -2311,11 +2336,13 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                     },
                     Err(_) => Err("The install request could not be encoded.".to_owned()),
                 };
-                if let Err(error) = outcome
-                    && let Some(state) = stepper.get_untracked().as_mut()
-                {
-                    state.error = Some(error);
-                    state.step = StepperStep::Error;
+                if let Err(error) = outcome {
+                    stepper.update(|maybe_state| {
+                        if let Some(state) = maybe_state.as_mut() {
+                            state.error = Some(error);
+                            state.step = StepperStep::Error;
+                        }
+                    });
                 }
                 load_library_list(all_books, status, None);
                 plugin_detail_tick.update(|tick| *tick = tick.wrapping_add(1));
@@ -2330,9 +2357,11 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
             else {
                 return;
             };
-            if let Some(state) = stepper.get_untracked().as_mut() {
-                state.phase = "Enabling...".into();
-            }
+            stepper.update(|maybe_state| {
+                if let Some(state) = maybe_state.as_mut() {
+                    state.phase = "Enabling...".into();
+                }
+            });
             let stepper = stepper;
             spawn_local(async move {
                 let request = Request::patch(&format!("/api/v1/plugins/{}", installed.plugin_id))
@@ -2343,10 +2372,12 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                 let outcome = match request {
                     Ok(request) => match request.send().await {
                         Ok(response) if response.ok() => {
-                            if let Some(state) = stepper.get_untracked().as_mut() {
-                                state.step = StepperStep::Done;
-                                state.phase = "Enabled.".into();
-                            }
+                            stepper.update(|maybe_state| {
+                                if let Some(state) = maybe_state.as_mut() {
+                                    state.step = StepperStep::Done;
+                                    state.phase = "Enabled.".into();
+                                }
+                            });
                             Ok(())
                         }
                         Ok(response) => Err(api_error(&response).await),
@@ -2354,11 +2385,13 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                     },
                     Err(_) => Err("The enable request could not be encoded.".to_owned()),
                 };
-                if let Err(error) = outcome
-                    && let Some(state) = stepper.get_untracked().as_mut()
-                {
-                    state.error = Some(error);
-                    state.step = StepperStep::Error;
+                if let Err(error) = outcome {
+                    stepper.update(|maybe_state| {
+                        if let Some(state) = maybe_state.as_mut() {
+                            state.error = Some(error);
+                            state.step = StepperStep::Error;
+                        }
+                    });
                 }
                 load_library_list(all_books, status, None);
                 plugin_detail_tick.update(|tick| *tick = tick.wrapping_add(1));

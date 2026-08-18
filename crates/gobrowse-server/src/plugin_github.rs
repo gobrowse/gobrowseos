@@ -165,8 +165,21 @@ impl GitHubApi {
     fn api_url(&self, path: &str) -> Url {
         let mut url = self.base_url.clone();
         // Merge the path onto the base URL (base has no path in production).
-        let joined = format!("{}{}", self.base_url.path().trim_end_matches('/'), path);
+        // `Url::set_path` percent-encodes `?`/`&`, so split any query string off
+        // and attach it via `set_query` (the marketplace search passes one).
+        let (path_part, query_part) = path
+            .split_once('?')
+            .map(|(path, query)| (path, Some(query)))
+            .unwrap_or((path, None));
+        let joined = format!(
+            "{}{}",
+            self.base_url.path().trim_end_matches('/'),
+            path_part
+        );
         url.set_path(&joined);
+        if let Some(query) = query_part {
+            url.set_query(Some(query));
+        }
         url
     }
 
