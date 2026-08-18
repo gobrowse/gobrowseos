@@ -656,6 +656,20 @@ async fn execute_inner(
             .fetch_one(&state.pool)
             .await
             .map_err(database_failure)?;
+    // Resolve the workspace's configured network policy server-side so sandbox
+    // tools apply the tenant's policy (never a client-supplied value).
+    let workspace_network_policy = match workspace_id {
+        Some(workspace_id) => {
+            let policy: Option<String> =
+                sqlx::query_scalar("SELECT network_policy FROM workspaces WHERE id=$1")
+                    .bind(workspace_id)
+                    .fetch_one(&state.pool)
+                    .await
+                    .map_err(database_failure)?;
+            parse_network_policy(policy.as_deref().unwrap_or("NONE"))
+        }
+        None => gobrowse_core::sandbox::NetworkPolicy::None,
+    };
     let limits = model_limits(state, profile_id, requested_model_id.as_deref())
         .await
         .map_err(|_| {
@@ -954,6 +968,7 @@ async fn execute_inner(
                         workspace_id,
                         run_id,
                         role: requester_role.clone(),
+                        network_policy: workspace_network_policy,
                     };
                     tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
                         .await
@@ -970,6 +985,7 @@ async fn execute_inner(
                         workspace_id,
                         run_id,
                         role: requester_role.clone(),
+                        network_policy: workspace_network_policy,
                     };
                     tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
                         .await
@@ -987,6 +1003,7 @@ async fn execute_inner(
                         workspace_id,
                         run_id,
                         role: requester_role.clone(),
+                        network_policy: workspace_network_policy,
                     };
                     tokio::time::timeout(Duration::from_secs(10), tool.execute(&ctx, input.clone()))
                         .await
@@ -1005,6 +1022,7 @@ async fn execute_inner(
                             workspace_id,
                             run_id,
                             role: requester_role.clone(),
+                            network_policy: workspace_network_policy,
                         };
                         tokio::time::timeout(
                             Duration::from_secs(10),
@@ -1895,6 +1913,16 @@ fn parse_role(role: String) -> MessageRole {
     match role.as_str() {
         "assistant" => MessageRole::Assistant,
         _ => MessageRole::User,
+    }
+}
+
+/// Maps the workspaces.network_policy column to the sandbox NetworkPolicy.
+/// Unknown values degrade to RESTRICTED (the most conservative default).
+fn parse_network_policy(value: &str) -> gobrowse_core::sandbox::NetworkPolicy {
+    match value {
+        "NONE" => gobrowse_core::sandbox::NetworkPolicy::None,
+        "FULL" => gobrowse_core::sandbox::NetworkPolicy::Full,
+        _ => gobrowse_core::sandbox::NetworkPolicy::Restricted,
     }
 }
 

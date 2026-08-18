@@ -853,7 +853,14 @@ impl Tool for SandboxTool {
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<Value, ToolError> {
         let client = self.state.sandbox.as_ref().ok_or(ToolError::Execution)?;
         let workspace_id = context.workspace_id.ok_or(ToolError::Execution)?;
-        execute_sandbox_op(client, workspace_id, self.kind, &input).await
+        execute_sandbox_op(
+            client,
+            workspace_id,
+            self.kind,
+            &input,
+            context.network_policy,
+        )
+        .await
     }
 }
 
@@ -864,6 +871,7 @@ async fn execute_sandbox_op(
     workspace_id: Uuid,
     kind: SandboxToolKind,
     input: &Value,
+    network_policy: NetworkPolicy,
 ) -> Result<Value, ToolError> {
     // Provision once per workspace on first use (idempotent).
     client
@@ -897,6 +905,7 @@ async fn execute_sandbox_op(
                 command,
                 working_directory,
                 timeout_seconds,
+                network_policy,
             )
             .await
         }
@@ -997,7 +1006,16 @@ async fn execute_sandbox_op(
                 .get("rows")
                 .and_then(|value| value.as_u64())
                 .unwrap_or(24);
-            terminal_start(client, workspace_id, command, working_directory, cols, rows).await
+            terminal_start(
+                client,
+                workspace_id,
+                command,
+                working_directory,
+                cols,
+                rows,
+                network_policy,
+            )
+            .await
         }
         SandboxToolKind::TerminalInput => {
             let terminal_id = required_terminal(input)?;
@@ -1123,6 +1141,7 @@ async fn sandbox_exec(
     command: Vec<String>,
     working_directory: &str,
     timeout_seconds: u64,
+    network_policy: NetworkPolicy,
 ) -> Result<Value, ToolError> {
     validate_command(&command).map_err(|_| ToolError::InvalidInput)?;
     validate_workspace_path(working_directory).map_err(|_| ToolError::InvalidInput)?;
@@ -1133,7 +1152,7 @@ async fn sandbox_exec(
         working_directory: working_directory.to_owned(),
         cols: 80,
         rows: 24,
-        network_policy: NetworkPolicy::Restricted,
+        network_policy,
         limits: HARD_RESOURCE_LIMITS,
     };
     let _started = client
@@ -1192,6 +1211,7 @@ async fn terminal_start(
     working_directory: &str,
     cols: u64,
     rows: u64,
+    network_policy: NetworkPolicy,
 ) -> Result<Value, ToolError> {
     validate_command(&command).map_err(|_| ToolError::InvalidInput)?;
     validate_workspace_path(working_directory).map_err(|_| ToolError::InvalidInput)?;
@@ -1205,7 +1225,7 @@ async fn terminal_start(
         working_directory: working_directory.to_owned(),
         cols: cols as u16,
         rows: rows as u16,
-        network_policy: NetworkPolicy::Restricted,
+        network_policy,
         limits: HARD_RESOURCE_LIMITS,
     };
     let started = client

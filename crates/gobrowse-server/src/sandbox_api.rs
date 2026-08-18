@@ -16,7 +16,7 @@ use axum::{
     http::HeaderMap,
 };
 use gobrowse_core::sandbox::{
-    HARD_RESOURCE_LIMITS, NetworkPolicy, TerminalStartRequest, validate_command,
+    HARD_RESOURCE_LIMITS, TerminalStartRequest, validate_command,
     validate_workspace_path,
 };
 use serde::{Deserialize, Serialize};
@@ -181,6 +181,7 @@ pub async fn exec(
         AppError::Validation("working_directory must be a workspace-relative path".into())
     })?;
     let timeout = input.timeout_seconds.unwrap_or(10).clamp(1, 10);
+    let network_policy = workspace_network_policy(&state, input.workspace_id).await?;
     let outcome = run_sandbox_op(&state, &user, input.workspace_id, "sandbox.exec", async {
         let client = sandbox_client(&state)?;
         let terminal_id = Uuid::now_v7();
@@ -193,7 +194,7 @@ pub async fn exec(
                     working_directory: input.working_directory,
                     cols: input.cols.unwrap_or(80),
                     rows: input.rows.unwrap_or(24),
-                    network_policy: NetworkPolicy::Restricted,
+                    network_policy,
                     limits: HARD_RESOURCE_LIMITS,
                 },
             )
@@ -390,6 +391,7 @@ pub async fn terminal_start(
             "terminal dimensions are outside the supported range".into(),
         ));
     }
+    let network_policy = workspace_network_policy(&state, input.workspace_id).await?;
     let response = run_sandbox_op(
         &state,
         &user,
@@ -407,7 +409,7 @@ pub async fn terminal_start(
                         working_directory: input.working_directory,
                         cols,
                         rows,
-                        network_policy: NetworkPolicy::Restricted,
+                        network_policy,
                         limits: HARD_RESOURCE_LIMITS,
                     },
                 )
@@ -654,6 +656,24 @@ async fn authorize_sandbox_workspace(
         return Err(AppError::Forbidden);
     }
     Ok(())
+}
+
+/// Loads the workspace's configured network policy (server-side authoritative).
+async fn workspace_network_policy(
+    state: &AppState,
+    workspace_id: Uuid,
+) -> Result<gobrowse_core::sandbox::NetworkPolicy, AppError> {
+    let policy: Option<String> =
+        sqlx::query_scalar("SELECT network_policy FROM workspaces WHERE id=$1")
+            .bind(workspace_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(AppError::Database)?;
+    Ok(match policy.as_deref() {
+        Some("NONE") => gobrowse_core::sandbox::NetworkPolicy::None,
+        Some("FULL") => gobrowse_core::sandbox::NetworkPolicy::Full,
+        _ => gobrowse_core::sandbox::NetworkPolicy::Restricted,
+    })
 }
 
 fn validated_path(path: &str) -> Result<String, AppError> {

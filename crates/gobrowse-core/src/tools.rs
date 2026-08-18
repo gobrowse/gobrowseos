@@ -28,6 +28,10 @@ pub struct ToolContext {
     /// used by tools for the same authorization predicates the HTTP layer
     /// enforces (e.g. RESTRICTED-content access).
     pub role: String,
+    /// The workspace's configured network policy (NONE/RESTRICTED/FULL),
+    /// resolved server-side. Sandbox tools apply it verbatim; a run without
+    /// a workspace defaults to NONE (tools that need a workspace fail anyway).
+    pub network_policy: crate::sandbox::NetworkPolicy,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
