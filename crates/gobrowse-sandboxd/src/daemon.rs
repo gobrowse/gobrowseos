@@ -1048,6 +1048,10 @@ mod tests {
             Ok(())
         }
 
+        async fn provision_workspace(&self, _workspace_id: Uuid) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
         async fn input(
             &self,
             _terminal_id: Uuid,
