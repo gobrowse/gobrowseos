@@ -148,6 +148,7 @@ impl GitHubApi {
         let http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(20))
+            .no_proxy()
             .user_agent(concat!(
                 "gobrowse-plugin-installer/",
                 env!("CARGO_PKG_VERSION")

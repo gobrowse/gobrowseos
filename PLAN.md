@@ -1238,3 +1238,669 @@ resolutions; lanes consume these as authoritative corrections to the sections ab
 - Server flow: workspace creation in the app → on first sandbox use (or eagerly at
   workspace create when sandbox enabled) call ProvisionWorkspace once; failure surfaces
   as actionable error ("sandbox unavailable — daemon not reachable or not provisioned").
+# PLAN.md — M23: Adaptive Capability Router + Context Intelligence
+
+Authoritative architecture and lane contracts for M23. Prior M22 section and amendments are
+preserved and remain authoritative. This batch covers *architecture design only*; zero
+implementation.
+
+## Goal
+
+Teach Gobrowse WHAT to load and use. Replace the current "search Library → dump all matched
+summaries into context + let the model figure it out" flow with a deliberate, traceable
+routing pipeline:
+
+    request → classify task → search Library → rank capabilities → select minimum
+    required Books → select model → activate plugin/MCP if needed → execute
+
+Every routing decision is explainable to the user in plain language. The UI must display
+context budget per category, why-loaded reasons, model-routing explanation, and activation
+status — all from real state, never fake.
+
+## Current State (observed facts — what M22 delivered that M23 builds on)
+
+### Unified Library (schema 21)
+
+*   `books` table has `kind` column (`SOURCE|SKILL|MCP|PLUGIN|AUTOBIOGRAPHY`; NULL = SOURCE).
+*   Companion Book proxies exist for every Skill (`INSERT` trigger in 0021) and MCP server.
+*   Plugin companion Books created in Lane C install handler (A1 amendment).
+*   `book_links` with `PROVIDES|CONTAINS|...` relations — unused by routing logic today.
+
+### Search and ranking (`library_api.rs`)
+
+*   Hybrid lexical + semantic search via `search_books`: PostgreSQL FTS (`ts_rank_cd`) +
+    optional pgvector cosine similarity, fused with weighted RRF (`RankingWeights`:
+    `lexical: 1.0, semantic: 1.0, recency: 0.004, source: 0.003, workspace: 0.005, rrf_k: 60`).
+*   Recency bonus decays `1/(1+age_days/30)`, trust bonus via enum mapping
+    (`VERIFIED=1.0, USER_PROVIDED=0.8, AGENT_INFERRED=0.5, EXTERNAL=0.3`), workspace
+    match bonus = `1.0` binary.
+*   No capability-match signal, no past-success signal, no token-cost signal.
+*   `BookSummary` DTO includes `capabilities: Vec<String>` (extracted from
+    `metadata->>'capabilities'`), `relevance: f32`, `retrieval_mode: String`,
+    `lexical_score: Option<f32>`, `semantic_score: Option<f32>`.
+
+### Context assembly (`run_api.rs::build_messages`)
+
+*   Bounded by `limits.context_window - limits.output_limit` tokens.
+*   Phase 1: system policy + last 40 recent messages (truncated to 2/3 budget).
+*   Phase 2: unified Library search — `SELECT` with `websearch_to_tsquery`, `ts_rank_cd`
+    ordering, LIMIT 12, snippet-only (never full body). Candidates tagged as
+    `ContextSource::LibraryRetrieval` (priority 300, required: false). Auth predicates
+    applied (A3 amendment).
+*   Phase 3: pinned books (priority 400) + worktree (priority 250).
+*   Context budget allocation: greedy, not per-category. No reserved budgets per source kind.
+*   Context snapshot persisted as `agent_runs.context_snapshot` JSONB: `selected` (array
+    of stable IDs), `omitted` (array of IDs), `used_tokens`, `budget`, `recent_messages`.
+
+### Progressive loading (`run_tools.rs` + `library_api.rs`)
+
+*   `library_load` tool: resolves full body/schemas on demand. Bounded: ≤5 loads/run,
+    ≤24k chars SOURCE, ≤24k chars SKILL content, ≤16 MCP tools, ≤64 KiB total.
+*   Sandbox tools: 10 native tools (`sandbox_exec`, `sandbox_read_file`, …,
+    `terminal_start`) via `SandboxClient`.
+*   `RunTokenMetrics` tracks: `book_searches`, `books_considered`, `books_loaded`,
+    `book_tokens_loaded`, `skill_book_loads`, `plugin_book_loads`, `mcp_book_loads`,
+    `source_book_loads`, `plugin_tools_discovered`, `plugin_tools_loaded`,
+    `mcp_tools_discovered`, `mcp_tools_loaded`.
+*   Persisted as `run_events` row with `event_type = 'token_metrics'` at run completion.
+
+### Model routing (`chat.rs` + `model_api.rs`)
+
+*   `load_routes`: selects primary model (active_chat_model_id or highest priority),
+    attaches `model_fallback_routes` as ordered cascade. Filtered to `'text'`-capable,
+    enabled models, and known provider types (OpenAI-compatible, ollama).
+*   `model_limits`: uses min(context_window) and min(output_limit) across the route
+    chain as the budget.
+*   Model selection is **task-unaware**: same primary model + same fallback chain for
+    every request regardless of task nature (coding, research, shell, general QA).
+*   Selected model persisted as `agent_runs.selected_model_id` +
+    `run.model_selected` event with `{model_id}`.
+
+### Web app (`app.rs`)
+
+*   Chat page with streaming text deltas, tool-call inline rendering, run state
+    (queued → awaiting_model → completed/failed/canceled), cancellation.
+*   Unified Library page with kind filter tabs (ALL|SOURCE|SKILL|PLUGIN|MCP),
+    search, progressive-load detail panel (`LoadedBookDetail`).
+*   Plugin detail + install stepper + sandbox terminal (Lane F).
+*   No context-inspector panel; no budget-breakdown UI; no model-routing explanation.
+
+### Schema version
+
+*   Current schema version: **21** (`0021_companion_book_inserts.sql`).
+*   Test assertions: `postgres_integration.rs` and `worktrees_integration.rs` assert
+    `schema_version == 21`.
+
+### Constraints and invariants
+
+*   Schema version MUST become **22** (one forward migration `0022_router.sql`).
+*   `unsafe_code = "forbid"`, edition 2024, Rust 1.94, nextest, forward-only migrations.
+*   Leptos CSR/WASM — reactive signals, no SSR, `gloo_net` fetch, `localStorage` for
+    cross-page state (pending submission, active run, open terminal).
+*   All HTTP requests through `gloo_net::Request`. WASM binary size budget preserved.
+*   No new native dependencies; model-based classification uses the SAME model
+    pipeline as chat (no separate classifier binary/endpoint).
+*   `token_metrics` run event already exists — M23 extends its payload schema; never
+    creates a new event type.
+*   `context_snapshot` JSONB on `agent_runs` already exists — M23 extends its payload
+    to include per-category budgets and routing decisions.
+*   Library search authorization predicates MUST match existing `search_books` +
+    `build_messages` Phase-2 predicates (A3 amendment); ranking is applied downstream
+    of authorized rows.
+*   Progressive loading bounds (5 loads/run, 24k chars, 16 tools, 64 KiB) remain.
+*   No raw embedding scores, RRF coefficients, or similarity distances in primary UI.
+
+## Architectural Decisions
+
+### 1. Task classification is lightweight and rule-first, with optional model fallback
+
+**Rationale**: A dedicated classifier model/endpoint adds latency, cost, and a new
+failure mode. The dominant case (80%+ of requests) can be classified by a small set of
+deterministic rules on the user message text: presence of code fences/backticks →
+`coding`; shell commands (`$ `, `> `, `curl`, `git`, `npm`, `cargo`) → `shell_automation`;
+URLs + "summarize"/"research"/"find" → `research`; file paths + "create"/"write" →
+`document_creation`; "pay"/"buy"/"purchase"/"checkout" → `ecommerce`; fallback
+`general_qa`. A model-based classifier (one short inference call using the chat model
+pipeline with a classification prompt + constrained output) runs only when rules produce
+`general_qa` or confidence < 0.9. This preserves the simplicity of the existing
+`build_messages` flow while adding task awareness.
+
+**Task classes** (closed set, stable):
+`coding`, `research`, `data_analysis`, `document_creation`, `general_qa`,
+`shell_automation`, `ecommerce`, `system_administration`.
+
+### 2. Capability ranking extends the existing RRF pipeline with task-aware signals
+
+**Rationale**: The existing `rank_fusion` in `library_api.rs` already computes a
+composite score from lexical, semantic, recency, trust, and workspace signals. M23
+extends this to include capability-match and past-success signals — computed entirely
+in-memory (no new DB round-trips beyond the existing search query). The `book_links`
+table is never in the hot path (too slow); capability mapping is driven by the existing
+`metadata->>'capabilities'` JSONB array + a new `task_capability_map` static lookup
+table in `gobrowse_core`.
+
+**New ranking signals** (all computed in-memory after DB search):
+
+| Signal | Weight | Source | Computation |
+|--------|--------|--------|-------------|
+| Capability match | `0.05` | `metadata->>'capabilities'` ∩ `task_capability_map[task_class]` | Jaccard similarity, clamped `[0,1]` |
+| Past success | `0.002` | `book_usage_stats` (new in-memory cache, backed by DB) | Success rate (loads that produced tool usage / total loads), 0.5 default for unseen |
+| Token cost proxy | `-0.001` | Book `kind` + estimated body size | SKILL ≤ SOURCE ≤ PLUGIN ≤ MCP (MCP penalized because activation is expensive) |
+| Permission risk | `-0.003` | `security_classification` + `trust` | RESTRICTED + UNTRUSTED = -1.0 penalty; CONFIDENTIAL + EXTERNAL = -0.5 |
+
+The existing `RankingWeights` struct gains new fields. The existing `rank_fusion`
+function gains a `task_class: Option<TaskClass>` parameter (None = backward-compatible).
+
+### 3. Model selection is task-aware via a new `model_task_routes` table
+
+**Rationale**: The existing `model_fallback_routes` is a profile-wide static
+primary→fallback chain. Different tasks need different models: coding benefits from
+models with strong tool-calling and large context windows; general QA works fine with
+cheaper models. M23 introduces `model_task_routes` — a task-specific override that
+sits between the primary model selection and the existing fallback chain. When the task
+class has a configured route, that preferred model becomes the primary (the existing
+fallback chain is still used if the preferred model fails). When nothing is configured,
+the existing path (active_chat_model_id → priority → fallback routes) is used unchanged.
+
+**Explainable model selection**: The `run.model_selected` event payload gains a
+`routing_reason` field: `"task 'coding' prefers model X over default Y; X is enabled
+and meets capability requirements (tool_calls, context ≥ 128k)"`. In the default case:
+`"no task-specific routing configured; using profile default (highest-priority enabled
+chat model)"`.
+
+### 4. Activation is anticipatory, not reactive
+
+**Rationale**: The current M22 flow is reactive: the model sees book summaries, decides
+to call `library_load`, THEN MCP/plugin activation happens on load. This wastes a
+round-trip. In M23, during the ranking phase (after DB search, before context assembly),
+the system identifies the top-ranked books by kind. If a plugin/MCP book ranks in the
+top 3 and has `kind=PLUGIN|MCP`, the system pre-activates it: resolves tools/schemas
+BEFORE the first model request, attaches tool definitions directly to the initial
+`ModelRequest`. This eliminates one agent round-trip for the common case. Books outside
+the top 3 are still loaded on-demand (existing `library_load` path unchanged).
+
+Activation is bounded: at most 2 pre-activations per run (to prevent runaway startup),
+and only for books with `trust >= USER_PROVIDED` (never auto-activate UNTRUSTED plugins).
+
+### 5. Routing decisions are persisted in the context_snapshot, not a separate table
+
+**Rationale**: The existing `agent_runs.context_snapshot` JSONB column already records
+what was selected and omitted. Rather than adding a new `routing_decisions` table
+(which complicates queries, adds migration risk, and duplicates the run lifecycle),
+M23 extends the `context_snapshot` payload to include routing decisions inline. The
+`run.context_built` event payload also gains routing fields. This means the full routing
+trace is available to the UI via a single `GET /runs/:id` query + `list_run_events`.
+
+Extended `context_snapshot` shape:
+
+```json
+{
+  "task_class": "coding",
+  "task_class_source": "rule",
+  "selected": ["system-policy-v1", "book-uuid-1", "book-uuid-2"],
+  "omitted": ["book-uuid-3"],
+  "budget": {"total": 128000, "used": 8234, "by_category": {
+    "conversation": 3200, "source_books": 1800, "skill_books": 1200,
+    "plugin_books": 0, "mcp_schemas": 0, "workspace": 450, "system_policy": 1584
+  }},
+  "routing": {
+    "books_ranked": 12,
+    "books_selected": 2,
+    "pre_activated": ["plugin-uuid-1"],
+    "decisions": [
+      {"book_id": "book-uuid-1", "action": "selected", "reason": "Capability match (git, repository); workspace-linked; high trust (USER_PROVIDED); recency 2d."},
+      {"book_id": "book-uuid-2", "action": "selected", "reason": "Semantic relevance (deployment runbook); moderate trust (USER_PROVIDED); low token cost (~800 tokens)."},
+      {"book_id": "book-uuid-3", "action": "omitted", "reason": "RESTRICTED classification requires ADMIN role not available in this context."}
+    ],
+    "model": {
+      "selected": "claude-sonnet-4-20250514",
+      "reason": "task 'coding' prefers model 'claude-sonnet-4-20250514' (configured in model_task_routes); meets capability requirements (tool_calls, context 200k); escalation none."
+    },
+    "activation": {
+      "plugin-uuid-1": {"status": "activated", "tools_resolved": 3, "reason": "Top-3 ranked plugin Book; request involved repository operations matching component capabilities (pull_requests, issues)."}
+    }
+  },
+  "used_tokens": 8234,
+  "budget": 128000,
+  "recent_messages": 12
+}
+```
+
+### 6. Context budget accounting is per-category with soft reservations
+
+**Rationale**: The current greedy allocation can starve certain categories (e.g.,
+worktree info pushes out all library content). M23 introduces soft budget reservations:
+conversation history gets ≤67% of budget (existing behavior), library retrieval shares
+the remaining 33% across categories with minimum guarantees: source books ≥10% of
+remaining, skill books ≥10%, plugin books + MCP schemas ≥5% each, workspace ≥5%. These
+are soft floors; when a category has no candidates, its reservation is redistributed.
+
+The per-category token counts are tracked in `RunTokenMetrics` (new fields:
+`source_book_tokens`, `skill_book_tokens`, `plugin_book_tokens`, `mcp_schema_tokens`,
+`workspace_tokens`) and emitted in the `token_metrics` event + included in the
+`context_snapshot`.
+
+### 7. "Why" reasons are machine-generated plain-language strings, not templates
+
+**Rationale**: Template-based reasons ("Book X loaded because it matched your query")
+are stale and unhelpful. M23 generates plain-language `reason` strings at routing time
+by assembling signal-specific clauses. Each clause maps to a concrete, verifiable fact:
+
+| Signal | Clause pattern |
+|--------|---------------|
+| Capability match | "Capability match (pull_requests, issues)" |
+| Semantic relevance | "Semantic relevance (deployment runbook)" |
+| Trust | "high trust (USER_PROVIDED)" / "low trust (EXTERNAL)" |
+| Recency | "recently updated (2d ago)" / "stale (90d)" |
+| Scope | "workspace-linked" / "profile-wide" |
+| Token cost | "low token cost (~800 tokens)" / "high token cost (~6k tokens)" |
+| Permission | "RESTRICTED classification requires ADMIN role" |
+| Past success | "previously used successfully (3/3 loads)" |
+
+Clauses are joined with semicolon separators. No raw scores. The UI renders these
+verbatim. The reason strings live in the `context_snapshot.routing.decisions[].reason`
+field — generated once at routing time, persisted, never recomputed.
+
+### 8. Book usage statistics are lazily maintained in a new lightweight table
+
+**Rationale**: Past-success ranking needs per-book load/use counts. A full-blown
+analytics table is overkill. M23 adds `book_usage_stats` — a compact aggregate table
+updated via a PostgreSQL trigger on `run_events` when `event_type = 'token_metrics'`:
+increment `total_searches`, `total_loads`, `total_tool_uses` for each book. The
+in-memory cache in the server reads this table once per run (a single `SELECT` for all
+candidate book IDs) and computes a simple success rate. No new infrastructure; trigger
+is boring `AFTER INSERT ON run_events FOR EACH ROW`.
+
+### 9. The router is a new `router` module in `gobrowse-server`, not in `gobrowse-core`
+
+**Rationale**: Task classification, capability ranking, and model selection are
+server-side concerns that access the database, model pipeline, and sandbox client.
+They do not belong in `gobrowse-core` (which is shared with WASM). The `router` module
+(`crates/gobrowse-server/src/router.rs`) owns: `TaskClass` enum, `classify_task()`,
+`rank_capabilities()`, `select_model_for_task()`, `generate_routing_reasons()`,
+`pre_activate_capabilities()`. Core only receives: `TaskClass` enum (lightweight,
+serializable), extended `RankingWeights`.
+
+### 10. The UI Context Inspector is a progressive-disclosure panel, not a new page
+
+**Rationale**: A separate "Run Inspector" page fragments the chat experience. M23 adds
+a Context Inspector panel that slides in from the right (or toggles below at ≤768px
+viewport). It is always available during an active run (via a "Context" chip/button in
+the chat header) and remains accessible in the run history view. The panel renders
+directly from `context_snapshot` (via `GET /runs/:id`) and `run_events` (via
+`GET /runs/:id/events`). Three tabs/sections: Budget (bar chart per category + total
+used/limit), Why Loaded (list of decisions with reasons), Model (selected model +
+routing explanation). Quiet by default; details on demand.
+
+## Data Model / Migration Sketch (Schema 21 → 22)
+
+### Migration `0022_router.sql`
+
+```sql
+-- 1. Task-class model routing overrides (sits between primary model and fallback chain)
+CREATE TABLE model_task_routes (
+    id uuid PRIMARY KEY,
+    profile_id uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    task_class text NOT NULL CHECK (task_class IN (
+        'coding','research','data_analysis','document_creation',
+        'general_qa','shell_automation','ecommerce','system_administration'
+    )),
+    preferred_model_id text NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+    position integer NOT NULL DEFAULT 0 CHECK (position >= 0),
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (profile_id, task_class, position),
+    CHECK (position = 0)
+    -- single preferred model per task class; fallback uses model_fallback_routes
+);
+
+-- 2. Book usage statistics (aggregate, maintained by trigger)
+CREATE TABLE book_usage_stats (
+    book_id uuid PRIMARY KEY REFERENCES books(id) ON DELETE CASCADE,
+    total_searches bigint NOT NULL DEFAULT 0,
+    total_loads bigint NOT NULL DEFAULT 0,
+    total_tool_uses bigint NOT NULL DEFAULT 0,
+    last_loaded_at timestamptz,
+    updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+-- Trigger: update book_usage_stats from token_metrics events
+CREATE OR REPLACE FUNCTION book_usage_from_metrics_fn() RETURNS trigger AS $$
+DECLARE
+    rec record;
+BEGIN
+    IF NEW.event_type = 'token_metrics' AND NEW.payload ? 'book_usage' THEN
+        FOR rec IN SELECT * FROM jsonb_to_recordset(NEW.payload->'book_usage')
+            AS x(book_id uuid, searches int, loads int, tool_uses int)
+        LOOP
+            INSERT INTO book_usage_stats (book_id, total_searches, total_loads, total_tool_uses, last_loaded_at)
+            VALUES (rec.book_id, rec.searches, rec.loads, rec.tool_uses,
+                    CASE WHEN rec.loads > 0 THEN now() ELSE NULL END)
+            ON CONFLICT (book_id) DO UPDATE SET
+                total_searches = book_usage_stats.total_searches + rec.searches,
+                total_loads = book_usage_stats.total_loads + rec.loads,
+                total_tool_uses = book_usage_stats.total_tool_uses + rec.tool_uses,
+                last_loaded_at = CASE WHEN rec.loads > 0 THEN now() ELSE book_usage_stats.last_loaded_at END,
+                updated_at = now();
+        END LOOP;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER book_usage_from_metrics
+AFTER INSERT ON run_events
+FOR EACH ROW EXECUTE FUNCTION book_usage_from_metrics_fn();
+
+-- 3. Indexes
+CREATE INDEX model_task_routes_profile_task_idx ON model_task_routes (profile_id, task_class);
+
+-- 4. Bump schema
+UPDATE schema_metadata SET schema_version = 22, updated_at = now() WHERE singleton;
+```
+
+### Core type changes (`gobrowse_core::library`)
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClass {
+    Coding,
+    Research,
+    DataAnalysis,
+    DocumentCreation,
+    GeneralQA,
+    ShellAutomation,
+    Ecommerce,
+    SystemAdministration,
+}
+
+// Extended RankingWeights (new fields appended; Default preserves existing values)
+pub struct RankingWeights {
+    pub lexical: f32,         // 1.0
+    pub semantic: f32,        // 1.0
+    pub recency: f32,         // 0.004
+    pub source: f32,          // 0.003
+    pub workspace: f32,       // 0.005
+    pub rrf_k: f32,           // 60.0
+    // M23 additions:
+    pub capability_match: f32, // 0.05
+    pub past_success: f32,     // 0.002
+    pub token_cost: f32,       // -0.001
+    pub permission_risk: f32,  // -0.003
+}
+```
+
+### Extended RunTokenMetrics (new fields added to existing struct)
+
+```rust
+pub struct RunTokenMetrics {
+    // ... existing M22 fields (book_searches, books_considered, books_loaded, ...) ...
+    // M23 additions:
+    pub task_class: Option<TaskClass>,
+    pub source_book_tokens: u64,
+    pub skill_book_tokens: u64,
+    pub plugin_book_tokens: u64,
+    pub mcp_schema_tokens: u64,
+    pub workspace_tokens: u64,
+    pub pre_activations: u32,
+    pub pre_activation_tools_resolved: u32,
+    pub book_usage: Vec<(Uuid, u32, u32, u32)>, // (book_id, searches, loads, tool_uses)
+}
+```
+
+## API Surface
+
+### New endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/runs/:id/context` | Returns the `context_snapshot` + routing decisions for a completed/active run. Auth: conversation member. |
+| `GET` | `/runs/:id/model-routing` | Returns the model selection explanation for a run (shorthand for the `routing.model` portion of context). |
+| `GET` | `/models/task-routes` | List configured `model_task_routes` for the profile. |
+| `PUT` | `/models/task-routes` | Set/update task-class → preferred model mappings. Body: `{ task_class, model_id }`. Auth: ADMIN/OWNER. |
+| `DELETE` | `/models/task-routes/:task_class` | Remove a task-class routing override. |
+
+### Extended existing endpoints
+
+*   `GET /runs/:id` — `RunResponse` gains optional `task_class` field (string, null when
+    run predates M23 or classification failed).
+*   `GET /runs/:id/events` — No change (routing decisions live in `context_snapshot`,
+    not as separate events).
+*   `POST /conversations/:id/turn` — No change (routing is transparent; the response
+    shape is unchanged — `RunResponse` now carries `task_class`).
+
+### Response shape: `GET /runs/:id/context → 200`
+
+```json
+{
+  "task_class": "coding",
+  "task_class_source": "rule",
+  "budget": {"total": 128000, "used": 8234, "by_category": {
+    "conversation": 3200, "source_books": 1800, "skill_books": 1200,
+    "plugin_books": 0, "mcp_schemas": 0, "workspace": 450, "system_policy": 1584
+  }},
+  "decisions": [
+    {"book_id": "...", "title": "GitHub Plugin", "kind": "PLUGIN", "action": "selected",
+     "reason": "Capability match (pull_requests, issues); workspace-linked; high trust (USER_PROVIDED)."},
+    {"book_id": "...", "title": "Deployment Runbook", "kind": "SOURCE", "action": "selected",
+     "reason": "Semantic relevance; low token cost (~800 tokens); moderate trust (USER_PROVIDED)."},
+    {"book_id": "...", "title": "Secret Admin Script", "kind": "SKILL", "action": "omitted",
+     "reason": "RESTRICTED classification requires ADMIN role not available."}
+  ],
+  "model": {
+    "model_id": "claude-sonnet-4-20250514",
+    "reason": "task 'coding' prefers model 'claude-sonnet-4-20250514'; meets capability requirements (tool_calls, context 200k); escalation none."
+  },
+  "activation": {
+    "plugin-uuid-1": {"status": "activated", "tools_resolved": 3,
+     "reason": "Top-3 ranked plugin Book; request involved repository operations."}
+  }
+}
+```
+
+## UI Contract
+
+### Context Inspector panel (`ChatPage` extension)
+
+The Context Inspector is a slide-in panel accessible from the chat header during an
+active run, and from the run history view after completion. Three tabs:
+
+1.  **Budget tab**: Horizontal stacked bar showing per-category token usage vs total
+    budget. Labels: Conversation, Source Books, Skill Books, Plugin Books, MCP Schemas,
+    Workspace, System Policy. Each segment shows token count (e.g., "1.8k"). The bar
+    fills from 0 to total budget. Percentages underneath.
+
+2.  **Why Loaded tab**: Scrollable list of routing decisions. Each card shows:
+    kind icon + book title, action badge (green="selected", gray="omitted"), and the
+    plain-language reason string. Clicking a selected book navigates to its Library
+    detail.
+
+3.  **Model tab**: Model display name + provider, the routing reason string (plain
+    language), and context window / output limit info.
+
+**Progressive disclosure contract**:
+- Default state: a small "Context: 8.2k / 128k" chip in the chat header (no panel open).
+  The chip is always visible during an active run.
+- Clicking the chip opens the panel (slide from right at ≥1024px; full-width overlay
+  at <1024px).
+- Real state only: if a run has no routing decisions (pre-M23 run), the panel shows
+  "Run predates adaptive routing (M22 or earlier)" with the raw context_snapshot
+  available under an "Advanced" toggle.
+- No raw scores, RRF coefficients, or embedding distances in the normal panel.
+  An "Advanced / Debug" toggle (off by default, persisted per-session in localStorage)
+  reveals lexical_score, semantic_score, and rank position.
+- At 390px viewport: panel is full-width overlay, tabs stack vertically, bar chart
+  switches to a simple text list.
+
+### Routing activity in chat (real observable events)
+
+During an active run, the chat UI emits small "router activity" inline notes between
+the user message and the first assistant text delta. These are NOT fake — they are
+backed by `run_events` of type `run.context_built` (which now carries the routing
+payload). Examples:
+
+```
+🔍 Task classified as "coding" (rule-based)
+📚 Loaded 2 of 12 matching books (GitHub Plugin, Deployment Runbook)
+🧩 Pre-activated GitHub Plugin (3 tools)
+🧠 Selected claude-sonnet-4-20250514 (task routing)
+```
+
+These are rendered as small, muted, collapsible inline notes; they do not block the
+assistant stream. If the user clicks one, the Context Inspector opens to the relevant tab.
+
+### Model chip (persistent in chat header)
+
+The chat header always shows the currently selected model as a small chip:
+`claude-sonnet-4-20250514`. Hovering shows the routing reason tooltip. During a run,
+if the model changes (fallback escalation), the chip updates with a subtle animation
+and the tooltip shows the escalation reason.
+
+### Empty states
+
+- Budget tab when no run is active: "Start a conversation to see context usage."
+- Why Loaded tab when no books were loaded: "No capability books were loaded for this request."
+- Model tab when run predates M23: "Model routing predates adaptive selection (M22 or earlier)."
+- Model task routes not configured: "No task-specific model routing configured. Using profile default."
+
+### Approval UX
+
+Plugin pre-activation requires no user approval (it's deterministic based on ranking +
+trust ≥ USER_PROVIDED). If an UNTRUSTED plugin ranks in the top-3, it is NOT
+pre-activated; the system instead emits a run event `run.approval_required` with the
+plugin details. The UI shows an inline approval card: "GitHub Plugin (UNTRUSTED) could
+help with this task. [Activate] [Ignore]" — clicking Activate triggers the activation
+and the run continues (an `approval` action endpoint resumes the paused run). This is
+a future UX path; the immediate M23 design only specifies the data flow and event type.
+
+### Responsive contract
+
+| Viewport | Panel behavior | Bar chart | Decision cards |
+|----------|---------------|-----------|----------------|
+| ≥1024px | Slide-in right, 380px wide | Horizontal stacked bar | Full cards with kind icons |
+| 768–1023px | Slide-in right, 320px wide | Horizontal stacked bar | Compact cards |
+| 390–767px | Full-width overlay | Text list (no bar) | Compact cards, smaller reason text |
+
+## Implementation Checklist (ordered, batch-sized)
+
+### Batch 1: Core types + migration (schema 21 → 22)
+
+1.  Add `TaskClass` enum to `gobrowse-core/src/library.rs`.
+2.  Extend `RankingWeights` with new fields; update `Default` impl.
+3.  Add `task_capability_map()` static lookup in `gobrowse-core`.
+4.  Write `0022_router.sql` migration: `model_task_routes`, `book_usage_stats`, trigger, bump to 22.
+5.  Extend `RunTokenMetrics` with new fields.
+6.  Bump schema version assertions in `postgres_integration.rs` and `worktrees_integration.rs` (21 → 22).
+7.  Run migration against test DB; verify idempotent re-run.
+
+### Batch 2: Router module (server-side)
+
+1.  Create `crates/gobrowse-server/src/router.rs`: `classify_task()`, `rank_capabilities()`,
+    `select_model_for_task()`, `generate_routing_reasons()`, `pre_activate_capabilities()`.
+2.  Implement rule-based classification (pattern matching on user message text).
+3.  Implement model-based classification fallback (one inference call with classification prompt).
+4.  Extend `build_messages` to call the router:
+    - Classify task before Phase 2 search.
+    - Pass `task_class` to modified `rank_fusion` call.
+    - Pre-activate top-ranked plugin/MCP books.
+    - Select model via `select_model_for_task()`.
+    - Build extended `context_snapshot` with routing decisions.
+5.  Extend `library_load` tool and `search_books` to accept optional `task_class` for ranking.
+6.  Update `RunTokenMetrics` tracking throughout `execute_inner`.
+
+### Batch 3: API endpoints
+
+1.  `GET /runs/:id/context` — read `context_snapshot` from `agent_runs`, parse routing payload.
+2.  `GET /runs/:id/model-routing` — shorthand for routing.model portion.
+3.  `GET /models/task-routes` — list `model_task_routes` rows.
+4.  `PUT /models/task-routes` — upsert a task→model mapping. Auth: ADMIN/OWNER.
+5.  `DELETE /models/task-routes/:task_class` — remove mapping.
+6.  Extend `RunResponse` with `task_class` field.
+7.  Extend `model_limits` to accept optional `task_class` (uses preferred model when configured).
+
+### Batch 4: UI — Context Inspector + routing activity
+
+1.  Add `ContextInspector` component to `app.rs`: slide-in panel with Budget/Why Loaded/Model tabs.
+2.  Context chip in chat header: reads `active_run` → fetches `GET /runs/:id/context` →
+    renders "Context: 8.2k / 128k".
+3.  Routing activity inline notes: listen for `run.context_built` events, render collapsible notes.
+4.  Model chip with tooltip: show selected model + routing reason.
+5.  Progressive disclosure: default quiet, details on demand; Advanced toggle in localStorage.
+6.  Responsive layout: 1440/1024/768/390 breakpoints.
+7.  Empty states for all three tabs.
+8.  Pre-M23 run handling: "predates adaptive routing" message with raw context_snapshot under Advanced toggle.
+
+### Batch 5: Book usage statistics + past-success signal
+
+1.  Wire `book_usage_stats` trigger (already in migration; validate it fires correctly).
+2.  In-memory cache in router: load stats for candidate book IDs, compute success rate.
+3.  Wire past-success signal into `rank_capabilities()`.
+4.  Extend `token_metrics` event payload with `book_usage` array.
+
+### Batch 6: Integration tests + verification
+
+1.  `tests/m23_router_integration.rs`: task classification, capability ranking, model selection,
+    pre-activation, context snapshot shape, budget accounting.
+2.  Test idempotent migration 22.
+3.  Test backward compatibility: pre-M23 run context_snapshot still loads correctly.
+4.  Test model-based classification fallback.
+5.  Test pre-activation bounds (max 2, UNTRUSTED skip).
+6.  CI gate: nextest + fmt + clippy + WASM clippy + migrations.
+
+## Validation Steps
+
+1.  **Migration**: forward from schema-21 DB; `model_task_routes` and `book_usage_stats` tables exist;
+    trigger fires on `token_metrics` insert; schema version = 22.
+2.  **Task classification**: "Write a Rust function to parse JSON" → `coding` (rule, code fences);
+    "Summarize this article https://..." → `research` (rule, URL + summarize);
+    "What's the capital of France?" → `general_qa` (rule, no strong signal).
+3.  **Capability ranking**: seed library with mixed books; verify capability-matched books rank
+    higher than pure-FTS when task class matches.
+4.  **Model selection**: configure `model_task_routes` for `coding` → `claude-sonnet-4`;
+    start coding task; verify selected model is Claude, reason mentions task routing.
+5.  **Pre-activation**: plugin in top-3 + trust ≥ USER_PROVIDED → tools appear in first
+    model request without explicit `library_load`.
+6.  **Context Inspector**: active run → chip shows budget; click → Budget tab bar chart
+    renders; Why Loaded shows decisions with reasons; Model tab shows routing explanation.
+7.  **No fake data**: every fact in the panel is traceable to a DB row or event payload.
+8.  **Backward compatibility**: pre-M23 runs show "predates adaptive routing"; context chip
+    still shows budget from `context_snapshot.used_tokens`.
+9.  **Responsive**: panel works at 390px (full-width overlay, text list).
+10. **No raw scores in primary UI**: verify lexical_score/semantic_score/rank position
+    only visible under Advanced toggle.
+
+## Open Questions
+
+1.  **Model-based classification cost**: one extra inference call per run for ambiguous
+    requests. Mitigation: classify only on the first turn (cache per conversation_id until
+    topic drift detected). If classification fails or times out (5s timeout), fall back to
+    `general_qa` (the existing behavior). Q: is the cost acceptable for the UX improvement?
+    A: classification prompt is ~200 tokens input, ~10 tokens output — negligible vs the
+    main run. Acceptable.
+
+2.  **Topic drift detection**: if a conversation shifts from "coding" to "deployment",
+    should the router reclassify? Initial design: classify once per conversation (cached
+    in `TaskClassCache` HashMap keyed by `conversation_id`, invalidated after 5
+    non-trivial user messages). Future: reclassify on detected topic drift (keyword
+    shift above threshold). Not in M23.
+
+3.  **model_task_routes UI**: where does the operator configure task→model mappings?
+    The existing Models page (`ModelsPage` component) is a natural fit — add a
+    "Task Routing" section below the model list. This is Batch 4 scope.
+
+4.  **Pre-activation of MCP books**: MCP activation requires a transport connection
+    (stdio spawn or streamable HTTP). If this takes >2 seconds, it delays the first
+    model request. Mitigation: pre-activation runs in a `tokio::spawn` with a 5-second
+    timeout; if it doesn't complete before the model request is assembled, the MCP
+    tools are omitted from the first round and loaded on-demand in round 2 (existing
+    `library_load` path). The activation result is then attached to round 2's tool
+    definitions. Silent degradation, not a failure mode.
+
+5.  **WASM bundle size**: adding `TaskClass` enum and extended `RankingWeights` to
+    `gobrowse-core` increases WASM size. Estimate: `<2 KB` (one enum, a few f32 fields,
+    a `HashMap` for capability map — the map is compiled to a static slice). Acceptable.
+
+6.  **Existing M22 runs**: the `context_snapshot` for pre-M23 runs lacks `routing`,
+    `budget.by_category`, and `task_class` fields. The UI handles this with explicit
+    "predates M23" empty states. No migration of old snapshots is required (they are
+    immutable historical records).
