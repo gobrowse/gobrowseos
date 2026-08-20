@@ -5,9 +5,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use sqlx::types::time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
-
 use crate::{
     AppState,
     auth::{AuthenticatedUser, audit, require_user},
@@ -227,6 +227,126 @@ pub async fn activate_chat_model(
     .execute(&state.pool)
     .await?;
     if result.rows_affected() != 1 {
+        return Err(AppError::NotFound);
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaskRouteRequest {
+    pub task_class: String,
+    pub preferred_model_id: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct TaskRouteResponse {
+    pub id: String,
+    pub task_class: String,
+    pub preferred_model_id: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// List all task routes for the current user's profile.
+pub async fn list_task_routes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<TaskRouteResponse>>, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT id, task_class, preferred_model_id, created_at \
+         FROM model_task_routes WHERE profile_id=$1 ORDER BY task_class",
+    )
+    .bind(user.profile_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(
+        rows.into_iter()
+            .map(|row| TaskRouteResponse {
+                id: row.get("id"),
+                task_class: row.get("task_class"),
+                preferred_model_id: row.get("preferred_model_id"),
+                created_at: row.get("created_at"),
+            })
+            .collect(),
+    ))
+}
+
+/// Create or update a task route for the current user's profile.
+/// Requires ADMIN or OWNER role.
+pub async fn upsert_task_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<TaskRouteRequest>,
+) -> Result<(StatusCode, Json<TaskRouteResponse>), AppError> {
+    let user = require_user(&state, &headers).await?;
+    require_admin(&user)?;
+    
+    // Validate task_class
+    let valid_classes = ["coding", "research", "data_analysis", "document_creation",
+        "general_qa", "shell_automation", "ecommerce", "system_administration"];
+    if !valid_classes.contains(&input.task_class.as_str()) {
+        return Err(AppError::Validation(format!(
+            "invalid task_class: {}",
+            input.task_class
+        )));
+    }
+    
+    // Verify the model exists and belongs to the profile
+    let model_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM models m JOIN providers p ON p.id=m.provider_id \
+         WHERE m.id=$1 AND p.profile_id=$2 AND p.enabled AND m.enabled)",
+    )
+    .bind(&input.preferred_model_id)
+    .bind(user.profile_id)
+    .fetch_one(&state.pool)
+    .await?;
+    
+    if !model_exists {
+        return Err(AppError::NotFound);
+    }
+    
+    let route_id = Uuid::new_v4();
+    let row = sqlx::query(
+        "INSERT INTO model_task_routes (id, profile_id, task_class, preferred_model_id, position, created_at) \
+         VALUES ($1, $2, $3, $4, 0, now()) \
+         ON CONFLICT (profile_id, task_class, position) DO UPDATE SET preferred_model_id=$4 \
+         RETURNING id, task_class, preferred_model_id, created_at",
+    )
+    .bind(route_id)
+    .bind(user.profile_id)
+    .bind(&input.task_class)
+    .bind(&input.preferred_model_id)
+    .fetch_one(&state.pool)
+    .await?;
+    
+    let response = TaskRouteResponse {
+        id: row.get("id"),
+        task_class: row.get("task_class"),
+        preferred_model_id: row.get("preferred_model_id"),
+        created_at: row.get("created_at"),
+    };
+    Ok((StatusCode::CREATED, Json(response)))
+}
+
+/// Delete a task route for the current user's profile.
+/// Requires ADMIN or OWNER role.
+pub async fn delete_task_route(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(task_class): Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    require_admin(&user)?;
+    
+    let result = sqlx::query(
+        "DELETE FROM model_task_routes WHERE profile_id=$1 AND task_class=$2",
+    )
+    .bind(user.profile_id)
+    .bind(&task_class)
+    .execute(&state.pool)
+    .await?;
+    
+    if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
     Ok(StatusCode::NO_CONTENT)

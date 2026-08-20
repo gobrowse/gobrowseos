@@ -29,6 +29,7 @@ pub mod vault_api;
 pub mod webhook_scheduler;
 pub mod webhooks;
 pub mod worktree_api;
+pub mod router;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -39,7 +40,7 @@ use axum::{
     http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::Response,
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use sqlx::PgPool;
 use tokio::sync::RwLock;
@@ -219,6 +220,14 @@ pub fn router(state: AppState) -> Router {
             "/models/chat/{id}/activate",
             post(model_api::activate_chat_model),
         )
+        .route(
+            "/models/task-routes",
+            get(model_api::list_task_routes).put(model_api::upsert_task_route),
+        )
+        .route(
+            "/models/task-routes/{task_class}",
+            delete(model_api::delete_task_route),
+        )
         .route("/providers/catalog", get(usage_api::list_provider_catalog))
         .route("/usage/summary", get(usage_api::usage_summary))
         .route(
@@ -235,6 +244,7 @@ pub fn router(state: AppState) -> Router {
             put(conversation_api::pin_book).delete(conversation_api::unpin_book),
         )
         .route("/runs/{id}", get(run_api::get_run))
+        .route("/runs/{id}/context", get(run_api::get_run_context))
         .route("/runs/{id}/events", get(run_api::list_run_events))
         .route("/runs/{id}/cancel", post(run_api::cancel_run))
         .route(

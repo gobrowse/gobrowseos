@@ -215,6 +215,34 @@ pub fn chunk_text(body: &str, max_chars: usize, overlap_chars: usize) -> Vec<Boo
     chunks
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskClass {
+    Coding,
+    Research,
+    DataAnalysis,
+    DocumentCreation,
+    GeneralQA,
+    ShellAutomation,
+    Ecommerce,
+    SystemAdministration,
+}
+
+/// Returns a static mapping of task classes to relevant capability keywords.
+pub fn task_capability_map() -> std::collections::HashMap<TaskClass, Vec<&'static str>> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    map.insert(TaskClass::Coding, vec!["rust", "python", "javascript", "typescript", "go", "code", "debug", "test", "implement"]);
+    map.insert(TaskClass::Research, vec!["search", "find", "lookup", "investigate", "explore", "documentation", "docs"]);
+    map.insert(TaskClass::DataAnalysis, vec!["data", "csv", "json", "analyze", "chart", "graph", "statistics", "pandas"]);
+    map.insert(TaskClass::DocumentCreation, vec!["write", "document", "markdown", "report", "summary", "create"]);
+    map.insert(TaskClass::GeneralQA, vec!["what", "how", "why", "explain", "describe", "tell"]);
+    map.insert(TaskClass::ShellAutomation, vec!["bash", "shell", "command", "script", "terminal", "execute", "run"]);
+    map.insert(TaskClass::Ecommerce, vec!["shop", "buy", "purchase", "cart", "checkout", "payment", "order"]);
+    map.insert(TaskClass::SystemAdministration, vec!["system", "config", "service", "daemon", "log", "monitor", "admin"]);
+    map
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RankingWeights {
     pub lexical: f32,
@@ -223,6 +251,11 @@ pub struct RankingWeights {
     pub source: f32,
     pub workspace: f32,
     pub rrf_k: f32,
+    // M23 additions:
+    pub capability_match: f32,
+    pub past_success: f32,
+    pub token_cost: f32,
+    pub permission_risk: f32,
 }
 
 impl Default for RankingWeights {
@@ -234,6 +267,11 @@ impl Default for RankingWeights {
             source: 0.003,
             workspace: 0.005,
             rrf_k: 60.0,
+            // M23 defaults:
+            capability_match: 0.05,
+            past_success: 0.002,
+            token_cost: -0.001,
+            permission_risk: -0.003,
         }
     }
 }

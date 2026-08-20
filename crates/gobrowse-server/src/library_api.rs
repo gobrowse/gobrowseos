@@ -60,7 +60,7 @@ pub struct SearchQuery {
     pub kind: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct BookSummary {
     pub id: Uuid,
     pub title: String,

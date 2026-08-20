@@ -271,6 +271,47 @@ struct RunEvent {
     event_type: String,
     payload: serde_json::Value,
 }
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct TokenBudgetBreakdown {
+    conversation: u32,
+    source_books: u32,
+    skill_books: u32,
+    plugin_books: u32,
+    mcp_schemas: u32,
+    workspace: u32,
+    system_policy: u32,
+    total_used: u32,
+    budget: u32,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct RoutingDecision {
+    book_id: String,
+    book_title: String,
+    book_kind: String,
+    action: String, // "selected" or "omitted"
+    reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ModelRoutingInfo {
+    model_id: String,
+    routing_reason: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct ContextResponse {
+    run_id: String,
+    schema_version: Option<i32>,
+    token_budget: Option<TokenBudgetBreakdown>,
+    routing_decisions: Option<Vec<RoutingDecision>>,
+    model_routing: Option<ModelRoutingInfo>,
+}
+
 
 #[derive(Debug, Serialize)]
 struct CreateConversationRequest<'a> {
@@ -1164,12 +1205,10 @@ fn ChatPage(user_id: String) -> impl IntoView {
     let open_conversation = move |conversation: ConversationSummary| {
         let conversation_id = conversation.id.clone();
         let task_generation = advance_generation(generation);
-        let stored_run =
-            load_active_run(&open_user_id).filter(|run| run.conversation_id == conversation_id);
         selected.set(Some(conversation));
         messages.set(Vec::new());
         streamed.set(String::new());
-        active_run.set(stored_run.map(|run| run.run_id));
+        active_run.set(None);
         resolving_run.set(true);
         submitting.set(false);
         status.set("Checking for an active run...".into());
@@ -1207,7 +1246,10 @@ fn ChatPage(user_id: String) -> impl IntoView {
     view! {
         <div class="page-heading">
             <div><p class="utility">"CONVERSATIONS / DURABLE"</p><h1>{move || selected.get().map_or_else(|| "What are we working on?".into(), |conversation| conversation.title)}</h1></div>
-            <span class="model-chip">{move || chat_models.get().into_iter().find(|model| model.active).map_or_else(|| "NO ACTIVE MODEL".into(), |model| format!("{} / {}", model.provider_type.to_uppercase(), model.model_reference))}</span>
+            <div class="header-chips">
+                <span class="model-chip">{move || chat_models.get().into_iter().find(|model| model.active).map_or_else(|| "NO ACTIVE MODEL".into(), |model| format!("{} / {}", model.provider_type.to_uppercase(), model.model_reference))}</span>
+                {ContextInspector(ContextInspectorProps { active_run })}
+            </div>
         </div>
         {move || if let Some(conversation) = selected.get() {
             let conversation_id = conversation.id.clone();
@@ -1302,6 +1344,337 @@ fn ChatPage(user_id: String) -> impl IntoView {
         }}
     }
 }
+
+/// Context Inspector panel for displaying routing and token budget information.
+#[component]
+fn ContextInspector(
+    active_run: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let context_data = RwSignal::new(None::<ContextResponse>);
+    let is_open = RwSignal::new(false);
+    let active_tab = RwSignal::new(0u8);
+    let loading = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+
+    // Fetch context data when panel opens
+    let fetch_context = move || {
+        let run_id = match active_run.get() {
+            Some(id) => id,
+            None => return,
+        };
+        loading.set(true);
+        error.set(None);
+        context_data.set(None);
+
+        spawn_local(async move {
+            match Request::get(&format!("/api/v1/runs/{}/context", run_id)).send().await {
+                Ok(response) if response.ok() => {
+                    match response.json::<ContextResponse>().await {
+                        Ok(data) => {
+                            context_data.set(Some(data));
+                            loading.set(false);
+                        }
+                        Err(e) => {
+                            error.set(Some(format!("Failed to parse response: {}", e)));
+                            loading.set(false);
+                        }
+                    }
+                }
+                Ok(response) => {
+                    error.set(Some(format!("HTTP {}", response.status())));
+                    loading.set(false);
+                }
+                Err(e) => {
+                    error.set(Some(format!("Request failed: {}", e)));
+                    loading.set(false);
+                }
+            }
+        });
+    };
+
+    let toggle_panel = move |_| {
+        let new_state = !is_open.get();
+        is_open.set(new_state);
+        if new_state && context_data.get().is_none() && active_run.get().is_some() {
+            fetch_context();
+        }
+    };
+
+    let set_tab = move |tab: u8| {
+        active_tab.set(tab);
+    };
+
+    view! {
+        <div class="context-inspector">
+            // Toggle chip in header
+            <button
+                class="context-chip"
+                on:click=toggle_panel
+                title="Toggle context inspector"
+            >
+                {move || {
+                    let run_id = active_run.get();
+                    if run_id.is_none() {
+                        "Context: —".into()
+                    } else if let Some(data) = context_data.get() {
+                        if let Some(budget) = &data.token_budget {
+                            format!("Context: {}k / {}k", budget.total_used / 1000, budget.budget / 1000)
+                        } else {
+                            "Context: …".into()
+                        }
+                    } else {
+                        "Context: …".into()
+                    }
+                }}
+            </button>
+
+            // Panel
+            <div class="context-panel" class:open=move || is_open.get()>
+                <div class="context-panel-header">
+                    <h3>"Context Inspector"</h3>
+                    <button class="text-button" on:click=toggle_panel>"✕"</button>
+                </div>
+
+                // Tab navigation
+                <div class="context-tabs">
+                    <button
+                        class="context-tab"
+                        class:active=move || active_tab.get() == 0
+                        on:click=move |_| set_tab(0)
+                    >"Budget"</button>
+                    <button
+                        class="context-tab"
+                        class:active=move || active_tab.get() == 1
+                        on:click=move |_| set_tab(1)
+                    >"Why Loaded"</button>
+                    <button
+                        class="context-tab"
+                        class:active=move || active_tab.get() == 2
+                        on:click=move |_| set_tab(2)
+                    >"Model"</button>
+                </div>
+
+                // Content area
+                <div class="context-content">
+                    // Loading state
+                    {move || loading.get().then(|| view! {
+                        <div class="context-empty">
+                            <p>"Loading context data..."</p>
+                        </div>
+                    })}
+
+                    // Error state
+                    {move || error.get().map(|err| view! {
+                        <div class="context-empty">
+                            <p class="error-note">{err}</p>
+                        </div>
+                    })}
+
+                    // No run active
+                    {move || (!loading.get() && error.get().is_none() && active_run.get().is_none()).then(|| view! {
+                        <div class="context-empty">
+                            <p>"No active run. Start a conversation to inspect context."</p>
+                        </div>
+                    })}
+
+                    // Pre-M23 runs
+                    {move || {
+                        let data = context_data.get();
+                        match data {
+                            Some(ctx) => {
+                                if ctx.schema_version.is_some() && ctx.schema_version.unwrap_or(0) < 23 {
+                                    return Some(view! {
+                                        <div class="context-empty">
+                                            <p>"Run predates adaptive routing (M22 or earlier)"</p>
+                                        </div>
+                                    }.into_any());
+                                }
+                                // Check if we should show budget tab content
+                                if active_tab.get() == 0 && ctx.token_budget.is_some() {
+                                    return None; // Let budget tab render
+                                }
+                                if active_tab.get() == 1 && ctx.routing_decisions.is_some() {
+                                    return None; // Let why loaded tab render
+                                }
+                                if active_tab.get() == 2 && ctx.model_routing.is_some() {
+                                    return None; // Let model tab render
+                                }
+                                // No data for current tab
+                                    Some(view! {
+                                        <div class="context-empty">
+                                            <p>"No data available for this tab"</p>
+                                        </div>
+                                    }.into_any())
+                            }
+                            None => None,
+                        }
+                    }}
+
+                    // Budget tab
+                    {move || {
+                        if active_tab.get() != 0 || loading.get() || error.get().is_some() || active_run.get().is_none() {
+                            return None;
+                        }
+                        let data = context_data.get();
+                        let budget = data.and_then(|d| d.token_budget);
+
+                        if budget.is_none() {
+                            return Some(view! {
+                                <div class="context-empty">
+                                    <p>"No budget data available"</p>
+                                </div>
+                            }.into_any());
+                        }
+
+                        let b = budget.unwrap();
+                        Some(view! {
+                            <div class="budget-tab">
+                                <div class="budget-summary">
+                                    <div class="budget-row">
+                                        <span>"Used"</span>
+                                        <strong>{format!("{} tokens", b.total_used)}</strong>
+                                    </div>
+                                    <div class="budget-row">
+                                        <span>"Budget"</span>
+                                        <strong>{format!("{} tokens", b.budget)}</strong>
+                                    </div>
+                                    <div class="budget-bar">
+                                        <div
+                                            class="budget-bar-fill"
+                                            style=move || {
+                                                let pct = if b.budget > 0 {
+                                                    (b.total_used as f32 / b.budget as f32 * 100.0).min(100.0)
+                                                } else { 0.0 };
+                                                format!("width: {}%", pct)
+                                            }
+                                        ></div>
+                                    </div>
+                                </div>
+                                <div class="budget-breakdown">
+                                    <h4>"Token Usage by Category"</h4>
+                                    <div class="budget-item">
+                                        <span>"Conversation"</span>
+                                        <span>{format!("{}", b.conversation)}</span>
+                                    </div>
+                                    <div class="budget-item">
+                                        <span>"Source Books"</span>
+                                        <span>{format!("{}", b.source_books)}</span>
+                                    </div>
+                                    <div class="budget-item">
+                                        <span>"Skill Books"</span>
+                                        <span>{format!("{}", b.skill_books)}</span>
+                                    </div>
+                                    <div class="budget-item">
+                                        <span>"Plugin Books"</span>
+                                        <span>{format!("{}", b.plugin_books)}</span>
+                                    </div>
+                                    <div class="budget-item">
+                                        <span>"MCP Schemas"</span>
+                                        <span>{format!("{}", b.mcp_schemas)}</span>
+                                    </div>
+                                    <div class="budget-item">
+                                        <span>"Workspace"</span>
+                                        <span>{format!("{}", b.workspace)}</span>
+                                    </div>
+                                    <div class="budget-item">
+                                        <span>"System Policy"</span>
+                                        <span>{format!("{}", b.system_policy)}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        }.into_any())
+                    }}
+
+                    // Why Loaded tab
+                    {move || {
+                        if active_tab.get() != 1 || loading.get() || error.get().is_some() || active_run.get().is_none() {
+                            return None;
+                        }
+                        let data = context_data.get();
+                        let decisions = data.and_then(|d| d.routing_decisions);
+
+                        if decisions.is_none() {
+                            return Some(view! {
+                                <div class="context-empty">
+                                    <p>"No routing decisions available"</p>
+                                </div>
+                            }.into_any());
+                        }
+
+                        let decs = decisions.unwrap();
+                        Some(view! {
+                            <div class="why-loaded-tab">
+                                <div class="routing-list">
+                                    {decs.into_iter().map(|decision| {
+                                        let action_class = if decision.action == "selected" { "selected" } else { "omitted" };
+                                        let kind = decision.book_kind.clone();
+                                        let kind2 = kind.clone();
+                                        let kind3 = kind.clone();
+                                        let kind4 = kind.clone();
+                                        let title = decision.book_title.clone();
+                                        let action = decision.action.clone();
+                                        let reason = decision.reason.clone();
+                                        view! {
+                                            <div class="routing-item">
+                                                <div class="routing-item-header">
+                                                    <strong>{title}</strong>
+                                                    <span class="kind-badge" class:source=move || kind == "source"
+                                                          class:skill=move || kind2 == "skill"
+                                                          class:plugin=move || kind3 == "plugin"
+                                                          class:mcp=move || kind4 == "mcp">
+                                                        {decision.book_kind}
+                                                    </span>
+                                                    <span class=format!("action-badge {}", action_class)>
+                                                        {action}
+                                                    </span>
+                                                </div>
+                                                <p class="routing-reason">{reason}</p>
+                                            </div>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            </div>
+                        }.into_any())
+                    }}
+
+                    // Model tab
+                    {move || {
+                        if active_tab.get() != 2 || loading.get() || error.get().is_some() || active_run.get().is_none() {
+                            return None;
+                        }
+                        let data = context_data.get();
+                        let model_info = data.and_then(|d| d.model_routing);
+
+                        if model_info.is_none() {
+                            return Some(view! {
+                                <div class="context-empty">
+                                    <p>"No model routing data available"</p>
+                                </div>
+                            }.into_any());
+                        }
+
+                        let info = model_info.unwrap();
+                        Some(view! {
+                            <div class="model-tab">
+                                <div class="model-info">
+                                    <div class="model-info-row">
+                                        <span>"Selected Model"</span>
+                                        <strong>{info.model_id}</strong>
+                                    </div>
+                                    <div class="model-routing-reason">
+                                        <h4>"Routing Reason"</h4>
+                                        <p>{info.routing_reason}</p>
+                                    </div>
+                                </div>
+                            </div>
+                        }.into_any())
+                    }}
+                </div>
+            </div>
+        </div>
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Workspace + MCP page types
