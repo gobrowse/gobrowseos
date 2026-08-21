@@ -18,13 +18,13 @@ use time::OffsetDateTime;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     AppState,
     auth::{audit, require_user},
-    chat, conversation_api,
+    chat, conversation_api, embedding,
     error::AppError,
     router::classify_task,
 };
@@ -417,8 +417,16 @@ pub async fn get_run_context(
         Some(row) => {
             let context_snapshot: Option<serde_json::Value> = row.get("context_snapshot");
             match context_snapshot {
-                Some(snapshot) => Ok(Json(snapshot)),
-                None => Ok(Json(serde_json::json!({}))),
+                Some(snapshot) => {
+                    // Merge run_id so the frontend context inspector can
+                    // identify the run even when the snapshot lacks it.
+                    let mut value = snapshot;
+                    if value.get("run_id").is_none() {
+                        value["run_id"] = serde_json::json!(id);
+                    }
+                    Ok(Json(value))
+                }
+                None => Ok(Json(serde_json::json!({ "run_id": id }))),
             }
         }
         None => Err(AppError::NotFound),
@@ -910,15 +918,7 @@ async fn execute_inner(
                     output.push_str(&text);
                     round_output.push_str(&text);
                     pending_delta.push_str(&text);
-                    flush_text_events(
-                        &state.pool,
-                        run_id,
-                        lease,
-                        &mut pending_delta,
-                        &mut delta_event_count,
-                        false,
-                    )
-                    .await?;
+                    // Flushed by delta_flush timer or Usage/Completed events.
                 }
                 ModelEvent::Usage {
                     input_tokens,
@@ -981,6 +981,20 @@ async fn execute_inner(
             )
             .await
             .map_err(database_failure)?;
+            // Best-effort: seed default OpenRouter embedding model on first run.
+            let _ = embedding::seed_default_embedding_model(&state.pool, lease.profile_id).await;
+            // Best-effort: auto-update autobiography after a completed turn.
+            if let Err(error) = crate::autobiography_update::auto_update_after_run(
+                state,
+                lease.profile_id,
+                requested_by,
+                conversation_id,
+                &output,
+            )
+            .await
+            {
+                warn!(%run_id, %error, "autobiography auto-update failed");
+            }
             info!(%run_id, "conversation run completed");
             return Ok(());
         }
@@ -1207,8 +1221,11 @@ async fn flush_text_events(
     event_count: &mut usize,
     force: bool,
 ) -> Result<(), (&'static str, &'static str)> {
-    const DELTA_EVENT_BYTES: usize = 1024;
+    const DELTA_EVENT_BYTES: usize = 4096;
     const MAX_DELTA_EVENTS: usize = 8192;
+    const BATCH_SIZE: usize = 8;
+
+    let mut batch: Vec<(String, serde_json::Value)> = Vec::with_capacity(BATCH_SIZE);
 
     while pending.len() >= DELTA_EVENT_BYTES || (force && !pending.is_empty()) {
         if *event_count >= MAX_DELTA_EVENTS {
@@ -1218,16 +1235,19 @@ async fn flush_text_events(
             ));
         }
         let text = take_text_chunk(pending, DELTA_EVENT_BYTES);
-        append_event_owned(
-            pool,
-            run_id,
-            lease,
-            "model.text_delta",
-            serde_json::json!({"text":text}),
-        )
-        .await
-        .map_err(database_failure)?;
+        batch.push(("model.text_delta".into(), serde_json::json!({"text": text})));
         *event_count += 1;
+        if batch.len() >= BATCH_SIZE {
+            append_events_batched(pool, run_id, lease, &batch)
+                .await
+                .map_err(database_failure)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        append_events_batched(pool, run_id, lease, &batch)
+            .await
+            .map_err(database_failure)?;
     }
     Ok(())
 }
@@ -1918,6 +1938,44 @@ async fn append_event_owned(
     .bind(run_id)
     .bind(event_type)
     .bind(payload)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await
+}
+
+/// Batch-insert multiple run events in one round-trip.
+async fn append_events_batched(
+    pool: &PgPool,
+    run_id: Uuid,
+    lease: RunLease,
+    events: &[(String, serde_json::Value)],
+) -> Result<(), sqlx::Error> {
+    if events.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    lock_event_sequence(&mut tx, lease.profile_id).await?;
+    let owns_lease: Option<bool> = sqlx::query_scalar(
+        "SELECT true FROM agent_runs WHERE id=$1 AND execution_token=$2 \
+         AND lease_expires_at>now() AND cancellation_requested_at IS NULL FOR KEY SHARE",
+    )
+    .bind(run_id)
+    .bind(lease.token)
+    .fetch_optional(&mut *tx)
+    .await?;
+    require_lease(u64::from(owns_lease.unwrap_or(false)))?;
+    // UNNEST arrays into rows for a single multi-row INSERT.
+    let event_types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
+    let payloads: Vec<serde_json::Value> = events.iter().map(|(_, p)| p.clone()).collect();
+    sqlx::query(
+        "INSERT INTO run_events (run_id, event_type, payload, profile_id) \
+         SELECT $1, t.event_type, t.payload, $2 \
+         FROM unnest($3::text[], $4::jsonb[]) AS t(event_type, payload)",
+    )
+    .bind(run_id)
+    .bind(lease.profile_id)
+    .bind(&event_types)
+    .bind(&payloads)
     .execute(&mut *tx)
     .await?;
     tx.commit().await

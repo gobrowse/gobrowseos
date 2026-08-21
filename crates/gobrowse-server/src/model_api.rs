@@ -524,6 +524,105 @@ pub async fn auto_detect_providers(
     Ok(Json(AutoDetectResponse { detected }))
 }
 
+/// Live provider test: probe `{base_url}/models` with an optional API key
+/// and return reachability plus the provider's current model list. The
+/// operator-configured URL is the same trust boundary as chat traffic.
+pub async fn test_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ProviderTestRequest>,
+) -> Result<Json<ProviderTestResponse>, AppError> {
+    require_user(&state, &headers).await?;
+    let base = Url::parse(input.base_url.trim())
+        .map_err(|_| AppError::Validation("invalid base URL".into()))?;
+    if base.query().is_some()
+        || base.fragment().is_some()
+        || !matches!(base.scheme(), "https" | "http")
+        || base.username() != ""
+    {
+        return Err(AppError::Validation(
+            "base URL must be http(s) with no query, fragment, or credentials".into(),
+        ));
+    }
+    let models_url = base
+        .join("models")
+        .map_err(|_| AppError::Validation("bad URL".into()))?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|_| AppError::Internal(anyhow::anyhow!("failed to build HTTP client")))?;
+    let mut request = client.get(models_url);
+    if let Some(key) = input.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+        request = request.bearer_auth(key.trim());
+    }
+    let response = request.send().await;
+    let Ok(response) = response else {
+        return Ok(Json(ProviderTestResponse {
+            ok: false,
+            detail: "could not reach provider URL".into(),
+            models: Vec::new(),
+        }));
+    };
+    let status = response.status();
+    if !status.is_success() {
+        return Ok(Json(ProviderTestResponse {
+            ok: false,
+            detail: format!("provider returned HTTP {status}"),
+            models: Vec::new(),
+        }));
+    }
+    // OpenAI-compatible /models payload: {"data": [{"id": "...", ...}]}
+    let Ok(body) = response.json::<serde_json::Value>().await else {
+        return Ok(Json(ProviderTestResponse {
+            ok: true,
+            detail: "provider answered (non-JSON /models)".into(),
+            models: Vec::new(),
+        }));
+    };
+    let mut models = Vec::new();
+    if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+        for entry in data {
+            let Some(id) = entry.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let context_window = entry
+                .get("context_window")
+                .or_else(|| entry.get("context"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            let output_limit = entry
+                .get("output_limit")
+                .or_else(|| entry.get("max_output_tokens"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0) as i32;
+            models.push(crate::usage_api::CatalogModel {
+                reference: id.to_string(),
+                context_window,
+                output_limit,
+            });
+        }
+    }
+    Ok(Json(ProviderTestResponse {
+        ok: true,
+        detail: format!("provider answered — {} models available", models.len()),
+        models,
+    }))
+}
+
+#[derive(Deserialize)]
+pub struct ProviderTestRequest {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderTestResponse {
+    pub ok: bool,
+    pub detail: String,
+    pub models: Vec<crate::usage_api::CatalogModel>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

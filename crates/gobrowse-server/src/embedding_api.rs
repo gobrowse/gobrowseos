@@ -133,6 +133,8 @@ pub async fn list_configurations(
 ) -> Result<Json<Vec<EmbeddingConfiguration>>, AppError> {
     let user = require_user(&state, &headers).await?;
     require_admin(&user)?;
+    // Lazy-seed default OpenRouter embedding model on first access.
+    let _ = embedding::seed_default_embedding_model(&state.pool, user.profile_id).await;
     let rows = sqlx::query(
         "SELECT em.id, p.id AS provider_id, p.display_name, p.provider_type, p.base_url, em.model_reference, em.dimensions, \
          p.secret_reference IS NOT NULL AS authenticated, profile.active_embedding_model_id=em.id AS active \

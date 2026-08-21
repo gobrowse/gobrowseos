@@ -651,11 +651,49 @@ kbd { padding: 2px 6px; border: 1px solid var(--line); border-bottom-width: 2px;
 .preset-chip.anthropic { border-color: #7a4dd3; color: #7a4dd3; }
 .preset-chip.ollama { border-color: var(--teal); color: var(--teal); }
 .preset-chip.ghost { color: var(--slate); }
+.preset-chip.openrouter { border-color: var(--indigo); color: var(--indigo); }
 .model-form-actions { grid-column: 1 / -1; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding-top: 10px; border-top: 1px solid var(--line); margin-top: 4px; }
 .test-spinner { color: var(--slate); font: 600 11px var(--mono); animation: pulse 1s infinite; }
 .test-success { color: var(--teal); font-size: 12.5px; font-weight: 650; }
 .test-error { color: var(--vermillion); font-size: 12.5px; font-weight: 650; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+
+/* — chat markdown + tool cards + streaming (UI batch) — */
+.md-body { font-size: 15px; line-height: 1.65; overflow-wrap: anywhere; }
+.md-body p { margin: 6px 0; }
+.md-body a { color: var(--indigo); }
+.md-body code { font-family: var(--mono); font-size: 12.5px; }
+.md-body pre { margin: 8px 0; }
+
+.message-entry .md-body { padding-top: 2px; }
+.message-entry.streaming { background: linear-gradient(90deg, rgb(21 104 94 / 9%), transparent 70%); border-color: rgb(21 104 94 / 18%); animation: streamPulse 1.2s ease-in-out infinite alternate; }
+@keyframes streamPulse { 0% { border-left-color: var(--teal); } 100% { border-left-color: var(--indigo); } }
+.stream-caret { display: inline-block; width: 8px; height: 14px; margin-left: 2px; background: var(--teal); border-radius: 2px; animation: caretBlink 0.9s steps(2) infinite; vertical-align: -2px; }
+@keyframes caretBlink { 0%, 50% { opacity: 1; } 51%, 100% { opacity: 0; } }
+
+.tool-drawer { display: grid; gap: 10px; margin: 6px 0; }
+.tool-card { border: 1px solid var(--line); border-radius: 10px; background: var(--surface); overflow: hidden; box-shadow: var(--paper-shadow); }
+.tool-card[open] { border-color: var(--line-strong); }
+.tool-card summary { display: flex; align-items: center; gap: 8px; list-style: none; cursor: pointer; padding: 10px 12px; background: var(--fog-2); border-bottom: 1px solid var(--hair); font: 600 12px var(--mono); }
+.tool-card summary::-webkit-details-marker { display: none; }
+.tool-name { font: 700 12px var(--mono); color: var(--ink); flex: 1 1 auto; overflow-wrap: anywhere; }
+.tool-id { font: 500 10px var(--mono); color: var(--slate); letter-spacing: 0.04em; }
+.tool-badge { padding: 2px 7px; border-radius: 999px; font: 700 10px var(--mono); letter-spacing: 0.05em; border: 1px solid var(--line); }
+.tool-badge.ok { color: var(--teal); border-color: var(--teal); background: var(--teal-soft); }
+.tool-badge.error { color: var(--vermillion); border-color: var(--vermillion); background: #fdf0ed; }
+.tool-toggle { font-size: 12px; color: var(--slate); }
+.tool-section { padding: 10px 12px; display: grid; gap: 6px; }
+.tool-section .utility { margin: 0; }
+.tool-pre { margin: 0; padding: 10px 12px; background: #0f1a1e; color: #e6f0ee; border: 1px solid var(--line); border-radius: 8px; font: 12px var(--mono); line-height: 1.6; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.composer textarea, .terminal-input-row textarea { font-family: var(--sans); }
+.terminal-input-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+.terminal-input-row textarea { min-height: 40px; max-height: 120px; padding: 10px 12px; border: 1px solid var(--ink); border-radius: 12px; background: #fff; resize: vertical; line-height: 1.5; }
+.terminal-input-row textarea:focus { outline: 2px solid var(--indigo); outline-offset: 1px; }
+
+/* transcript scroll preservation hint */
+.transcript { scroll-behavior: auto; }
 
 /* — responsive — */
 @media (max-width: 1050px) {

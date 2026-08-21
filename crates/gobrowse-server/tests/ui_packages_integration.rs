@@ -209,7 +209,7 @@ async fn schema_24_migration_applies() {
             .fetch_one(&pool)
             .await
             .expect("schema_version");
-    assert_eq!(version, 24, "schema should be 24 after M24b");
+    assert_eq!(version, 25, "schema should be 25 after M25a");
 }
 
 #[tokio::test]
@@ -490,9 +490,15 @@ async fn full_lifecycle_list_get_activate_rollback_delete_and_csp() {
         .unwrap_or("")
         .to_owned();
     assert!(!csp.is_empty(), "CSP header should be present on /");
+    // script-src must not allow inline scripts (style-src-attr is
+    // intentionally relaxed to 'unsafe-inline' so UI style attributes work).
+    let script_src = csp
+        .split(';')
+        .find_map(|d| d.trim().strip_prefix("script-src"))
+        .unwrap_or("");
     assert!(
-        !csp.contains("unsafe-inline"),
-        "CSP must not contain unsafe-inline"
+        !script_src.contains("unsafe-inline"),
+        "CSP script-src must not contain unsafe-inline"
     );
     assert!(
         csp.contains("default-src"),
@@ -508,9 +514,13 @@ async fn full_lifecycle_list_get_activate_rollback_delete_and_csp() {
         .to_owned();
     // recovery should also have CSP or at least not unsafe-inline if present
     if !csp_rec.is_empty() {
+        let script_src_rec = csp_rec
+            .split(';')
+            .find_map(|d| d.trim().strip_prefix("script-src"))
+            .unwrap_or("");
         assert!(
-            !csp_rec.contains("unsafe-inline"),
-            "recovery CSP no unsafe-inline"
+            !script_src_rec.contains("unsafe-inline"),
+            "recovery CSP script-src no unsafe-inline"
         );
     }
     // rollback -> B becomes previous/rolled_back, A active again
@@ -566,7 +576,7 @@ async fn full_lifecycle_list_get_activate_rollback_delete_and_csp() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(ver, 24);
+    assert_eq!(ver, 25);
 }
 
 #[tokio::test]
@@ -585,7 +595,7 @@ async fn capabilities_and_recovery_accessible_without_auth() {
     let (status, body) = request_json(&app, Method::GET, "/api/v1/capabilities", "", None).await;
     assert_eq!(status, StatusCode::OK, "capabilities: {body}");
     assert_eq!(body["api_version"], "v1");
-    assert_eq!(body["schema_version"], 24);
+    assert_eq!(body["schema_version"], 25);
     assert!(
         body["tools"]
             .as_array()

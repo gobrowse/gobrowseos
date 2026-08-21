@@ -787,6 +787,69 @@ pub async fn queue_depth(pool: &PgPool) -> Result<i64, sqlx::Error> {
     .await
 }
 
+/// Create a default OpenRouter embedding configuration (qwen3-embedding-4b)
+/// when `OPENROUTER_API_KEY` is available and no embedding model exists yet.
+/// Idempotent: skips if an active_embedding_model_id is already set or the
+/// provider+model rows already exist.
+pub async fn seed_default_embedding_model(
+    pool: &PgPool,
+    profile_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    const DEFAULT_PROVIDER_ID: &str = "provider_openrouter_default";
+    const DEFAULT_MODEL_ID: &str = "model_qwen3_embedding_4b";
+    const DEFAULT_MODEL_REF: &str = "qwen/qwen3-embedding-4b";
+    const DEFAULT_DIMENSIONS: i32 = 2048;
+
+    // Skip if OpenRouter key is not in environment.
+    if std::env::var("OPENROUTER_API_KEY").is_err() {
+        return Ok(());
+    }
+
+    // Skip if active embedding model already set.
+    let has_active: bool = sqlx::query_scalar(
+        "SELECT active_embedding_model_id IS NOT NULL FROM profiles WHERE id=$1",
+    )
+    .bind(profile_id)
+    .fetch_one(pool)
+    .await?;
+    if has_active {
+        return Ok(());
+    }
+
+    // Upsert provider row.
+    sqlx::query(
+        "INSERT INTO providers (id, profile_id, provider_type, display_name, base_url, enabled) \
+         VALUES ($1, $2, 'openai_compatible', 'OpenRouter Embeddings', 'https://openrouter.ai/api/v1', true) \
+         ON CONFLICT (id) DO UPDATE SET enabled=true, updated_at=now()",
+    )
+    .bind(DEFAULT_PROVIDER_ID)
+    .bind(profile_id)
+    .execute(pool)
+    .await?;
+
+    // Upsert embedding_model row.
+    sqlx::query(
+        "INSERT INTO embedding_models (id, provider_id, model_reference, dimensions, enabled) \
+         VALUES ($1, $2, $3, $4, true) \
+         ON CONFLICT (provider_id, model_reference) DO UPDATE SET enabled=true",
+    )
+    .bind(DEFAULT_MODEL_ID)
+    .bind(DEFAULT_PROVIDER_ID)
+    .bind(DEFAULT_MODEL_REF)
+    .bind(DEFAULT_DIMENSIONS)
+    .execute(pool)
+    .await?;
+
+    // Activate on profile.
+    sqlx::query("UPDATE profiles SET active_embedding_model_id=$1, updated_at=now() WHERE id=$2")
+        .bind(DEFAULT_MODEL_ID)
+        .bind(profile_id)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -817,5 +880,48 @@ mod tests {
         assert!(forbidden_address("240.0.0.1".parse().unwrap()));
         assert!(forbidden_address("fec0::1".parse().unwrap()));
         assert!(forbidden_address("100::1".parse().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn seed_default_embedding_model_noop_without_key() {
+        // Without OPENROUTER_API_KEY the seed must be a no-op. Env is only
+        // read here (never mutated), so this is safe in any thread.
+        if std::env::var("OPENROUTER_API_KEY").is_ok() {
+            return; // cannot observe the no-op path when a key is present
+        }
+        let Ok(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&database_url)
+            .await
+            .expect("connect test database");
+        crate::db::migrate(&pool)
+            .await
+            .expect("migrate test database");
+        let profile_id = uuid::Uuid::now_v7();
+        sqlx::query("INSERT INTO profiles (id, name) VALUES ($1, 'seed-test')")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("insert profile");
+        seed_default_embedding_model(&pool, profile_id)
+            .await
+            .expect("no-op seed should not fail");
+        let has_active: bool = sqlx::query_scalar(
+            "SELECT active_embedding_model_id IS NOT NULL FROM profiles WHERE id=$1",
+        )
+        .bind(profile_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            !has_active,
+            "should not set active model without OPENROUTER_API_KEY"
+        );
+        sqlx::query("DELETE FROM profiles WHERE id=$1")
+            .bind(profile_id)
+            .execute(&pool)
+            .await
+            .expect("cleanup profile");
     }
 }

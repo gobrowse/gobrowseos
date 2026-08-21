@@ -1,3 +1,9 @@
+#![allow(
+    clippy::redundant_locals,
+    clippy::manual_strip,
+    clippy::collapsible_if,
+    clippy::skip_while_next
+)]
 use gloo_net::http::Request;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -306,6 +312,7 @@ struct ModelRoutingInfo {
 #[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct ContextResponse {
+    #[serde(default)]
     run_id: String,
     schema_version: Option<i32>,
     token_budget: Option<TokenBudgetBreakdown>,
@@ -413,6 +420,7 @@ struct ChatTaskSignals {
     selected: RwSignal<Option<ConversationSummary>>,
     messages: RwSignal<Vec<MessageSummary>>,
     streamed: RwSignal<String>,
+    tool_calls: RwSignal<Vec<ToolCallCard>>,
     active_run: RwSignal<Option<String>>,
     resolving_run: RwSignal<bool>,
     status: RwSignal<String>,
@@ -611,19 +619,46 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                 {is_admin.then(|| view! { <NavGroup title="INSPECT" items=vec![("Diagnostics", Page::Diagnostics)] page /> })}
             </nav>
             <section id="workspace" class="workspace" tabindex="-1">
-                {move || match page.get() {
-                    Page::Chat => view! { <ChatPage user_id=user_id.clone() /> }.into_any(),
-                    Page::Library => view! { <LibraryPage initial_kind=None page /> }.into_any(),
-                    Page::Skills => view! { <LibraryPage initial_kind=Some("SKILL") page /> }.into_any(),
-                    Page::Mcp => view! { <LibraryPage initial_kind=Some("MCP") page /> }.into_any(),
-                    Page::Autobiography => view! { <AutobiographyPage /> }.into_any(),
-                    Page::Workspaces => view! { <WorkspacesPage /> }.into_any(),
-                    Page::Terminals => view! { <TerminalsPage /> }.into_any(),
-                    Page::Models => view! { <ModelsPage /> }.into_any(),
-                    Page::Diagnostics => view! { <DiagnosticsPage /> }.into_any(),
-                    Page::UiPackages => view! { <UiPackagesPage /> }.into_any(),
-                    current => view! { <EmptyOperationalPage page=current /> }.into_any(),
-                }}
+                <div style:display=move || if page.get() == Page::Chat { "block" } else { "none" }>
+                    <ChatPage user_id=user_id.clone() />
+                </div>
+                <div style:display=move || if page.get() == Page::Library { "block" } else { "none" }>
+                    <LibraryPage initial_kind=None page />
+                </div>
+                <div style:display=move || if page.get() == Page::Skills { "block" } else { "none" }>
+                    <LibraryPage initial_kind=Some("SKILL") page />
+                </div>
+                <div style:display=move || if page.get() == Page::Mcp { "block" } else { "none" }>
+                    <LibraryPage initial_kind=Some("MCP") page />
+                </div>
+                <div style:display=move || if page.get() == Page::Autobiography { "block" } else { "none" }>
+                    <AutobiographyPage />
+                </div>
+                <div style:display=move || if page.get() == Page::Workspaces { "block" } else { "none" }>
+                    <WorkspacesPage />
+                </div>
+                <div style:display=move || if page.get() == Page::Terminals { "block" } else { "none" }>
+                    <TerminalsPage />
+                </div>
+                <div style:display=move || if page.get() == Page::Models { "block" } else { "none" }>
+                    <ModelsPage />
+                </div>
+                <div style:display=move || if page.get() == Page::Diagnostics { "block" } else { "none" }>
+                    <DiagnosticsPage />
+                </div>
+                <div style:display=move || if page.get() == Page::UiPackages { "block" } else { "none" }>
+                    <UiPackagesPage />
+                </div>
+                <div style:display=move || if matches!(page.get(), Page::Tasks | Page::Agents) { "block" } else { "none" }>
+                    {move || {
+                        let p = page.get();
+                        if matches!(p, Page::Tasks | Page::Agents) {
+                            view! { <EmptyOperationalPage page=p /> }.into_any()
+                        } else {
+                            view! { <span></span> }.into_any()
+                        }
+                    }}
+                </div>
             </section>
             <aside class="context-pane">
                 <p class="utility">"ACTIVE CONTEXT"</p>
@@ -858,12 +893,33 @@ fn ChatPage(user_id: String) -> impl IntoView {
             .map_or_else(String::new, |submission| submission.text.clone()),
     );
     let streamed = RwSignal::new(String::new());
+    let tool_calls = RwSignal::new(Vec::<ToolCallCard>::new());
+    let transcript_ref = NodeRef::<leptos::html::Div>::new();
+    let transcript_scroll = RwSignal::new(0_i32);
     let active_run = RwSignal::new(restored_run.as_ref().map(|run| run.run_id.clone()));
     let resolving_run = RwSignal::new(restored_run.is_some());
     let submitting = RwSignal::new(false);
     let pending_submission = RwSignal::new(restored_submission);
     let generation = RwSignal::new(0_u64);
     let status = RwSignal::new(String::new());
+    // Auto-scroll transcript when streamed/tool_calls/messages change — super quick feel.
+    Effect::new(move |_| {
+        let _ = streamed.get();
+        let _ = tool_calls.get();
+        let _ = messages.get();
+        if let Some(el) = transcript_ref.get() {
+            let near_bottom = (el.scroll_height() - el.scroll_top() - el.client_height()) < 120;
+            if near_bottom {
+                el.set_scroll_top(el.scroll_height());
+            }
+        }
+    });
+    Effect::new(move |_| {
+        let top = transcript_scroll.get();
+        if let Some(el) = transcript_ref.get() {
+            el.set_scroll_top(top);
+        }
+    });
     // Mirror the open conversation so the unified Library page can offer
     // "pin to current conversation" (kept across page switches).
     Effect::new(move |_| {
@@ -903,6 +959,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
                 selected,
                 messages,
                 streamed,
+                tool_calls,
                 active_run,
                 resolving_run,
                 status,
@@ -1027,6 +1084,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
         submitting.set(true);
         let task_generation = advance_generation(generation);
         streamed.set(String::new());
+        tool_calls.set(Vec::new());
         status.set("Indexing your message...".into());
         let lifecycle = Arc::clone(&send_lifecycle);
         spawn_local(async move {
@@ -1160,6 +1218,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
                     selected,
                     messages,
                     streamed,
+                    tool_calls,
                     active_run,
                     resolving_run,
                     status,
@@ -1209,6 +1268,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
         selected.set(Some(conversation));
         messages.set(Vec::new());
         streamed.set(String::new());
+        tool_calls.set(Vec::new());
         active_run.set(None);
         resolving_run.set(true);
         submitting.set(false);
@@ -1237,6 +1297,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
                 selected,
                 messages,
                 streamed,
+                tool_calls,
                 active_run,
                 resolving_run,
                 status,
@@ -1244,6 +1305,17 @@ fn ChatPage(user_id: String) -> impl IntoView {
             Arc::clone(&open_lifecycle),
         );
     };
+    let handle_composer_keydown = std::sync::Arc::new(move |event: web_sys::KeyboardEvent| {
+        if event.key() == "Enter" && !event.shift_key() {
+            event.prevent_default();
+            if let Some(target) = event.target()
+                && let Ok(el) = target.dyn_into::<web_sys::HtmlTextAreaElement>()
+                && let Some(form) = el.form()
+            {
+                let _ = form.request_submit();
+            }
+        }
+    });
     view! {
         <div class="page-heading">
             <div><p class="utility">"CONVERSATIONS / DURABLE"</p><h1>{move || selected.get().map_or_else(|| "What are we working on?".into(), |conversation| conversation.title)}</h1></div>
@@ -1256,12 +1328,17 @@ fn ChatPage(user_id: String) -> impl IntoView {
             let conversation_id = conversation.id.clone();
             let send = send.clone();
             let cancel = cancel.clone();
+            let handle_composer_keydown = handle_composer_keydown.clone();
             view! {
                 <div class="conversation-toolbar">
                     <button class="text-button" on:click=move |_| {
+                        if let Some(el) = transcript_ref.get() {
+                            transcript_scroll.set(el.scroll_top());
+                        }
                         advance_generation(generation);
                         selected.set(None);
                         streamed.set(String::new());
+                        tool_calls.set(Vec::new());
                         active_run.set(None);
                         resolving_run.set(false);
                         submitting.set(false);
@@ -1269,31 +1346,80 @@ fn ChatPage(user_id: String) -> impl IntoView {
                     <PinnedContext conversation_id=conversation_id.clone() />
                     <span class="utility">{format!("INDEX {}", &conversation_id[..8.min(conversation_id.len())])}</span>
                 </div>
-                <div class="transcript" aria-live="polite">
+                <div class="transcript" node_ref=transcript_ref aria-live="polite"
+                     on:scroll=move |_| {
+                        if let Some(el) = transcript_ref.get() {
+                            transcript_scroll.set(el.scroll_top());
+                        }
+                    }>
                     {move || messages.get().into_iter().map(|message| {
                         let provenance = match (&message.provider, &message.model) {
                             (Some(provider), Some(model)) => format!("{provider} / {model}"),
                             _ => "LOCAL USER".into(),
                         };
-                        view! { <article class=if message.role == "assistant" { "message-entry assistant" } else { "message-entry user" }>
+                        let html = markdown_to_html(&message.text);
+                        let is_assistant = message.role == "assistant";
+                        view! { <article class=if is_assistant { "message-entry assistant" } else { "message-entry user" }>
                             <div><span class="utility">{message.role.to_uppercase()}</span><small>{provenance}</small></div>
-                            <p>{message.text}</p>
+                            <div class="md-body" inner_html=html></div>
                         </article> }
                     }).collect_view()}
-                    {move || (!streamed.get().is_empty()).then(|| view! {
+                    {move || {
+                        let calls = tool_calls.get();
+                        if calls.is_empty() {
+                            None
+                        } else {
+                            Some(view! {
+                                <div class="tool-drawer">
+                                    {calls.into_iter().map(|call| {
+                                        let call_id = call.id.clone();
+                                        let name = call.name.clone();
+                                        let args = call.args.clone();
+                                        let result = call.result.clone().unwrap_or_default();
+                                        let is_error = call.is_error;
+                                        let expanded = RwSignal::new(!call.collapsed);
+                                        view! {
+                                            <details class="tool-card" open=move || expanded.get()>
+                                                <summary on:click=move |e| { e.prevent_default(); expanded.update(|v| *v = !*v); }>
+                                                    <span class="tool-name">{name.clone()}</span>
+                                                    <span class="tool-id">{call_id.chars().take(8).collect::<String>()}</span>
+                                                    <span class=if is_error { "tool-badge error" } else { "tool-badge ok" }>{if is_error { "ERROR" } else { "CALL" }}</span>
+                                                    <span class="tool-toggle">{move || if expanded.get() { "▾" } else { "▸" }}</span>
+                                                </summary>
+                                                <div class="tool-section">
+                                                    <p class="utility">"ARGS"</p>
+                                                    <pre class="tool-pre">{args.clone()}</pre>
+                                                </div>
+                                                {if result.is_empty() {
+                                                    view! { <div class="tool-section"><p class="utility">"AWAITING RESULT…"</p></div> }.into_any()
+                                                } else {
+                                                    view! { <div class="tool-section"><p class="utility">"RESULT"</p><pre class="tool-pre">{result}</pre></div> }.into_any()
+                                                }}
+                                            </details>
+                                        }
+                                    }).collect_view()}
+                                </div>
+                            })
+                        }
+                    }}
+                    {move || (!streamed.get().is_empty()).then(|| {
+                        let html = markdown_to_html(&streamed.get());
+                        view! {
                         <article class="message-entry assistant streaming">
                             <div><span class="utility">"ASSISTANT"</span><small>"STREAMING / DURABLE"</small></div>
-                            <p>{streamed.get()}</p>
+                            <div class="md-body" inner_html=html></div>
+                            <span class="stream-caret"></span>
                         </article>
-                    })}
-                    {move || (messages.get().is_empty() && active_run.get().is_none() && !resolving_run.get()).then(|| view! {
+                    }})}
+                    {move || (messages.get().is_empty() && tool_calls.get().is_empty() && active_run.get().is_none() && !resolving_run.get()).then(|| view! {
                         <div class="conversation-empty"><span class="index-spine">"NEW"</span><div><h2>"Start the durable record"</h2><p>"Messages, selected context, model events, and the final answer remain inspectable after this session closes."</p></div></div>
                     })}
                 </div>
                 <form class="composer" on:submit=send>
-                    <textarea required rows="4" maxlength="1000000" placeholder="Write the next message"
+                    <textarea required rows="4" maxlength="1000000" placeholder="Write the next message — Enter to send, Shift+Enter for newline"
                         disabled=move || resolving_run.get() || active_run.get().is_some() || submitting.get()
                         prop:value=move || draft.get()
+                        on:keydown=move |event| handle_composer_keydown(event)
                         on:input=move |event| {
                             let value = event_target_value(&event);
                             if let Some(pending) = pending_submission.get_untracked()
@@ -1311,7 +1437,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
                         } else if resolving_run.get() {
                             view! { <button class="secondary" type="button" disabled>"Checking run..."</button> }.into_any()
                         } else {
-                            view! { <button class="primary" type="submit" disabled=move || submitting.get()>"Send + run"</button> }.into_any()
+                            view! { <button class="primary" type="submit" disabled=move || submitting.get() || draft.get().trim().is_empty()>"Send + run"</button> }.into_any()
                         }}
                     </div>
                 </form>
@@ -1358,8 +1484,8 @@ fn ContextInspector(active_run: RwSignal<Option<String>>) -> impl IntoView {
     // Fetch context data when panel opens
     let fetch_context = move || {
         let run_id = match active_run.get() {
-            Some(id) => id,
-            None => return,
+            Some(id) if !id.trim().is_empty() => id,
+            _ => return,
         };
         loading.set(true);
         error.set(None);
@@ -2097,6 +2223,286 @@ fn active_conversation() -> RwSignal<Option<ConversationSummary>> {
         .to_owned()
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolCallCard {
+    id: String,
+    name: String,
+    args: String,
+    result: Option<String>,
+    is_error: bool,
+    collapsed: bool,
+}
+
+fn escape_html(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() * 2);
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn inline_code_html(escaped: &str) -> String {
+    format!(
+        "<code style=\"background:var(--hair);padding:1px 5px;border-radius:5px;font-family:var(--mono);font-size:12.5px;border:1px solid var(--line);\">{escaped}</code>"
+    )
+}
+
+fn render_inline(text: &str) -> String {
+    let mut out = escape_html(text);
+    let mut result = String::new();
+    let mut rest = out.as_str();
+    while let Some(start) = rest.find('`') {
+        if let Some(end) = rest[start + 1..].find('`') {
+            result.push_str(&rest[..start]);
+            let code = &rest[start + 1..start + 1 + end];
+            result.push_str(&inline_code_html(code));
+            rest = &rest[start + 1 + end + 1..];
+        } else {
+            break;
+        }
+    }
+    result.push_str(rest);
+    out = result;
+    fn replace_delim(input: &str, delim: &str, open: &str, close: &str) -> String {
+        let mut res = String::new();
+        let mut remaining = input;
+        while let Some(start) = remaining.find(delim) {
+            if let Some(end) = remaining[start + delim.len()..].find(delim) {
+                res.push_str(&remaining[..start]);
+                let inner = &remaining[start + delim.len()..start + delim.len() + end];
+                res.push_str(open);
+                res.push_str(inner);
+                res.push_str(close);
+                remaining = &remaining[start + delim.len() + end + delim.len()..];
+            } else {
+                break;
+            }
+        }
+        res.push_str(remaining);
+        res
+    }
+    out = replace_delim(
+        &out,
+        "**",
+        "<strong style=\"font-weight:700;\">",
+        "</strong>",
+    );
+    out = replace_delim(
+        &out,
+        "__",
+        "<strong style=\"font-weight:700;\">",
+        "</strong>",
+    );
+    out = replace_delim(&out, "*", "<em style=\"font-style:italic;\">", "</em>");
+    out = replace_delim(&out, "_", "<em style=\"font-style:italic;\">", "</em>");
+    let mut linked = String::new();
+    let mut r = out.as_str();
+    while let Some(lb) = r.find('[') {
+        if let Some(rb) = r[lb..].find(']') {
+            let after = lb + rb;
+            if r[after + 1..].starts_with('(') {
+                if let Some(paren_end) = r[after + 1..].find(')') {
+                    let text = &r[lb + 1..lb + rb];
+                    let url = &r[after + 2..after + 1 + paren_end];
+                    let safe_url = if url.starts_with("http://")
+                        || url.starts_with("https://")
+                        || url.starts_with('/')
+                        || url.starts_with('#')
+                    {
+                        escape_html(url)
+                    } else {
+                        continue;
+                    };
+                    linked.push_str(&r[..lb]);
+                    linked.push_str(&format!("<a href=\"{safe_url}\" target=\"_blank\" rel=\"noopener noreferrer\" style=\"color:var(--indigo);text-decoration:underline;\">{text}</a>"));
+                    r = &r[after + 1 + paren_end + 1..];
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    linked.push_str(r);
+    if !linked.is_empty() && linked != out {
+        out = linked;
+    }
+    out
+}
+
+fn markdown_to_html(input: &str) -> String {
+    if input.trim().is_empty() {
+        return String::new();
+    }
+    let mut html = String::new();
+    let lines: Vec<&str> = input.lines().collect();
+    let mut i = 0;
+    let mut in_code_block = false;
+    let mut code_lang = String::new();
+    let mut code_buf = String::new();
+    let mut list_buffer: Vec<String> = Vec::new();
+    let mut in_list = false;
+    let mut blockquote_buf: Vec<String> = Vec::new();
+    let mut in_blockquote = false;
+
+    let flush_list = |html: &mut String, buf: &mut Vec<String>| {
+        if buf.is_empty() {
+            return;
+        }
+        html.push_str("<ul style=\"margin:6px 0 10px 18px;padding:0;list-style:disc;\">");
+        for li in buf.drain(..) {
+            html.push_str(&format!(
+                "<li style=\"margin:2px 0;line-height:1.55;\">{}</li>",
+                render_inline(&li)
+            ));
+        }
+        html.push_str("</ul>");
+    };
+    let flush_blockquote = |html: &mut String, buf: &mut Vec<String>| {
+        if buf.is_empty() {
+            return;
+        }
+        html.push_str("<blockquote style=\"margin:8px 0;padding:8px 12px;border-left:3px solid var(--indigo);background:rgba(44,62,204,0.06);border-radius:0 8px 8px 0;\">");
+        for line in buf.drain(..) {
+            html.push_str(&format!(
+                "<p style=\"margin:0;\">{}</p>",
+                render_inline(&line)
+            ));
+        }
+        html.push_str("</blockquote>");
+    };
+
+    while i < lines.len() {
+        let raw = lines[i];
+        let trimmed = raw.trim();
+        if trimmed.starts_with("```") {
+            if in_code_block {
+                let lang_label = if !code_lang.is_empty() {
+                    format!(
+                        "<span style=\"position:absolute;top:6px;right:8px;font:600 10px var(--mono);letter-spacing:0.06em;color:var(--slate);text-transform:uppercase;\">{}</span>",
+                        escape_html(&code_lang)
+                    )
+                } else {
+                    String::new()
+                };
+                html.push_str(&format!("<div style=\"position:relative;margin:10px 0;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:#0f1a1e;\">{lang_label}<pre style=\"margin:0;padding:14px 14px;overflow:auto;font:12.5px var(--mono);line-height:1.6;color:#e6f0ee;white-space:pre;word-wrap:normal;\"><code>{}</code></pre></div>", escape_html(&code_buf)));
+                code_buf.clear();
+                code_lang.clear();
+                in_code_block = false;
+            } else {
+                flush_list(&mut html, &mut list_buffer);
+                in_list = false;
+                flush_blockquote(&mut html, &mut blockquote_buf);
+                in_blockquote = false;
+                in_code_block = true;
+                code_lang = trimmed.trim_start_matches('`').trim().to_owned();
+            }
+            i += 1;
+            continue;
+        }
+        if in_code_block {
+            code_buf.push_str(raw);
+            code_buf.push('\n');
+            i += 1;
+            continue;
+        }
+        if trimmed.is_empty() {
+            flush_list(&mut html, &mut list_buffer);
+            in_list = false;
+            flush_blockquote(&mut html, &mut blockquote_buf);
+            in_blockquote = false;
+            i += 1;
+            continue;
+        }
+        if trimmed.starts_with("> ") || trimmed == ">" {
+            if in_list {
+                flush_list(&mut html, &mut list_buffer);
+                in_list = false;
+            }
+            in_blockquote = true;
+            let content = if trimmed.len() > 2 {
+                trimmed[2..].to_owned()
+            } else {
+                String::new()
+            };
+            blockquote_buf.push(content);
+            i += 1;
+            continue;
+        } else if in_blockquote {
+            flush_blockquote(&mut html, &mut blockquote_buf);
+            in_blockquote = false;
+        }
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") || trimmed.starts_with("+ ") {
+            in_list = true;
+            let content = trimmed[2..].to_owned();
+            list_buffer.push(content);
+            i += 1;
+            continue;
+        }
+        let is_ordered = {
+            let mut chars = trimmed.chars();
+            let mut digits = 0;
+            while let Some(ch) = chars.next() {
+                if ch.is_ascii_digit() {
+                    digits += 1;
+                } else if ch == '.' && digits > 0 {
+                    if chars.next() == Some(' ') {
+                        break;
+                    } else {
+                        digits = 0;
+                        break;
+                    }
+                } else {
+                    digits = 0;
+                    break;
+                }
+            }
+            digits > 0 && trimmed.chars().skip_while(|c| c.is_ascii_digit()).next() == Some('.')
+        };
+        if is_ordered {
+            in_list = true;
+            let dot = trimmed.find('.').unwrap();
+            let content = trimmed[dot + 2..].to_owned();
+            list_buffer.push(content);
+            i += 1;
+            continue;
+        }
+        if in_list {
+            flush_list(&mut html, &mut list_buffer);
+            in_list = false;
+        }
+        if trimmed.starts_with("### ") {
+            html.push_str(&format!("<h4 style=\"margin:10px 0 6px;font-family:var(--display);font-size:15px;font-weight:600;letter-spacing:-0.01em;\">{}</h4>", render_inline(trimmed[4..].trim())));
+        } else if trimmed.starts_with("## ") {
+            html.push_str(&format!("<h3 style=\"margin:12px 0 6px;font-family:var(--display);font-size:16px;font-weight:600;letter-spacing:-0.015em;\">{}</h3>", render_inline(trimmed[3..].trim())));
+        } else if trimmed.starts_with("# ") {
+            html.push_str(&format!("<h2 style=\"margin:14px 0 8px;font-family:var(--display);font-size:18px;font-weight:600;letter-spacing:-0.02em;\">{}</h2>", render_inline(trimmed[2..].trim())));
+        } else if trimmed.starts_with("---") || trimmed.starts_with("***") {
+            html.push_str(
+                "<hr style=\"margin:12px 0;border:0;border-top:1px solid var(--hair);\" />",
+            );
+        } else {
+            html.push_str(&format!(
+                "<p style=\"margin:6px 0;line-height:1.65;\">{}</p>",
+                render_inline(trimmed)
+            ));
+        }
+        i += 1;
+    }
+    flush_list(&mut html, &mut list_buffer);
+    flush_blockquote(&mut html, &mut blockquote_buf);
+    if in_code_block {
+        html.push_str(&format!("<div style=\"margin:10px 0;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:#0f1a1e;\"><pre style=\"margin:0;padding:14px 14px;overflow:auto;font:12.5px var(--mono);line-height:1.6;color:#e6f0ee;\"><code>{}</code></pre></div>", escape_html(&code_buf)));
+    }
+    html
+}
+
 #[component]
 fn WorkspacesPage() -> impl IntoView {
     let workspaces = RwSignal::new(Vec::<WorkspaceSummary>::new());
@@ -2232,6 +2638,20 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
     let stepper_source = RwSignal::new(String::new());
     let stepper_version = RwSignal::new(String::new());
     let stepper_workspace = RwSignal::new(String::new());
+    // Edit/Delete surfaces for Library/MCP/Plugin books (task 6)
+    let edit_book = RwSignal::new(None::<LoadedBook>);
+    let edit_title = RwSignal::new(String::new());
+    let edit_body = RwSignal::new(String::new());
+    let edit_tags = RwSignal::new(String::new());
+    let edit_reason = RwSignal::new(String::new());
+    let edit_status = RwSignal::new(String::new());
+    let edit_saving = RwSignal::new(false);
+    let mcp_edit_id = RwSignal::new(None::<String>);
+    let mcp_edit_name = RwSignal::new(String::new());
+    let mcp_edit_config = RwSignal::new(String::new());
+    let mcp_edit_enabled = RwSignal::new(true);
+    let mcp_edit_status = RwSignal::new(String::new());
+    let mcp_edit_saving = RwSignal::new(false);
     load_library_list(all_books, status, None);
     load_workspaces(workspaces);
 
@@ -2506,6 +2926,172 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
             mcp_creating.set(false);
             load_library_list(all_books, status, None);
         });
+    };
+
+    // ---- edit surfaces for Library / MCP (book PUT, MCP PATCH/DELETE) ----
+    let open_book_edit = {
+        let edit_book = edit_book;
+        let edit_title = edit_title;
+        let edit_body = edit_body;
+        let edit_tags = edit_tags;
+        let edit_reason = edit_reason;
+        let edit_status = edit_status;
+        move |book: LoadedBook| {
+            edit_title.set(book.title.clone());
+            edit_body.set(
+                book.body
+                    .clone()
+                    .or_else(|| book.content.clone())
+                    .unwrap_or_default(),
+            );
+            edit_tags.set("".into());
+            edit_reason.set("Edit via Library page".into());
+            edit_status.set(String::new());
+            edit_book.set(Some(book));
+        }
+    };
+    let save_book_edit = move |_| {
+        let Some(book) = edit_book.get_untracked() else {
+            return;
+        };
+        let title = edit_title.get_untracked().trim().to_owned();
+        if title.is_empty() {
+            edit_status.set("Title is required.".into());
+            return;
+        }
+        let body = edit_body.get_untracked();
+        let tags = edit_tags
+            .get_untracked()
+            .split(',')
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>();
+        let reason = edit_reason.get_untracked().trim().to_owned();
+        if reason.is_empty() {
+            edit_status.set("Reason is required.".into());
+            return;
+        }
+        edit_saving.set(true);
+        edit_status.set("Saving...".into());
+        let book_id = book.book_id.clone();
+        let revision = book.revision;
+        spawn_local(async move {
+            let body_json = serde_json::json!({"title": title, "body": body, "tags": tags, "metadata": {}, "expected_revision": revision, "reason": reason,});
+            let request =
+                Request::put(&format!("/api/v1/library/books/{book_id}")).json(&body_json);
+            let outcome = match request {
+                Ok(req) => match req.send().await {
+                    Ok(resp) if resp.ok() => Ok("Book updated.".to_owned()),
+                    Ok(resp) => Err(api_error(&resp).await),
+                    Err(_) => Err("Library service did not answer.".to_owned()),
+                },
+                Err(_) => Err("Edit request could not be encoded.".to_owned()),
+            };
+            edit_saving.set(false);
+            match outcome {
+                Ok(msg) => {
+                    edit_status.set(msg);
+                    edit_book.set(None);
+                    load_library_list(all_books, status, None);
+                    loaded.set(None);
+                }
+                Err(err) => edit_status.set(format!("Save failed: {err}")),
+            }
+        });
+    };
+    let close_book_edit = move |_| {
+        edit_book.set(None);
+        edit_status.set(String::new());
+    };
+    let open_mcp_edit = {
+        let mcp_edit_id = mcp_edit_id;
+        let mcp_edit_name = mcp_edit_name;
+        let mcp_edit_config = mcp_edit_config;
+        let mcp_edit_enabled = mcp_edit_enabled;
+        let mcp_edit_status = mcp_edit_status;
+        move |book: LoadedBook| {
+            if let Some(server_id) = book.mcp_server_id.clone() {
+                mcp_edit_id.set(Some(server_id));
+                mcp_edit_name.set(book.name.clone().unwrap_or_default());
+                mcp_edit_enabled.set(true);
+                mcp_edit_config.set(String::new());
+                mcp_edit_status.set(String::new());
+            }
+        }
+    };
+    let save_mcp_edit = move |_| {
+        let Some(server_id) = mcp_edit_id.get_untracked() else {
+            return;
+        };
+        let name = mcp_edit_name.get_untracked().trim().to_owned();
+        if name.is_empty() {
+            mcp_edit_status.set("Name is required.".into());
+            return;
+        }
+        let config_text = mcp_edit_config.get_untracked().trim().to_owned();
+        let config_value = if config_text.is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            match serde_json::from_str(&config_text) {
+                Ok(v) => v,
+                Err(e) => {
+                    mcp_edit_status.set(format!("Invalid JSON: {e}"));
+                    return;
+                }
+            }
+        };
+        let enabled = mcp_edit_enabled.get_untracked();
+        mcp_edit_saving.set(true);
+        mcp_edit_status.set("Saving MCP server...".into());
+        spawn_local(async move {
+            let body = serde_json::json!({"name": name, "configuration": config_value, "enabled": enabled});
+            let request = Request::patch(&format!("/api/v1/mcp/servers/{server_id}")).json(&body);
+            let outcome = match request {
+                Ok(req) => match req.send().await {
+                    Ok(resp) if resp.ok() => Ok("MCP server updated.".to_owned()),
+                    Ok(resp) => Err(api_error(&resp).await),
+                    Err(_) => Err("MCP service did not answer.".to_owned()),
+                },
+                Err(_) => Err("Update request could not be encoded.".to_owned()),
+            };
+            mcp_edit_saving.set(false);
+            match outcome {
+                Ok(msg) => {
+                    mcp_edit_status.set(msg);
+                    mcp_edit_id.set(None);
+                    load_library_list(all_books, status, None);
+                    loaded.set(None);
+                }
+                Err(err) => mcp_edit_status.set(format!("Save failed: {err}")),
+            }
+        });
+    };
+    let delete_mcp = move |server_id: String| {
+        let confirmed = web_sys::window().is_some_and(|w| {
+            w.confirm_with_message(&format!("Delete MCP server {server_id}?"))
+                .unwrap_or(false)
+        });
+        if !confirmed {
+            return;
+        }
+        spawn_local(async move {
+            let request = Request::delete(&format!("/api/v1/mcp/servers/{server_id}"))
+                .send()
+                .await;
+            match request {
+                Ok(resp) if resp.ok() => {
+                    status.set("MCP server deleted.".into());
+                    load_library_list(all_books, status, None);
+                    loaded.set(None);
+                }
+                Ok(resp) => status.set(format!("Delete failed: {}", api_error(&resp).await)),
+                Err(_) => status.set("MCP service did not answer.".into()),
+            }
+        });
+    };
+    let close_mcp_edit = move |_| {
+        mcp_edit_id.set(None);
+        mcp_edit_status.set(String::new());
     };
 
     // ---- plugin install stepper ----
@@ -3053,6 +3639,19 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                                             let book_id = book.id.clone();
                                             move |_| pin_book(book_id.clone())
                                         }>"Pin to conversation"</button>
+                                        <button class="text-button" on:click={
+                                            let book_id = book.id.clone();
+                                            let open_book_edit = open_book_edit;
+                                            move |_| {
+                                                let open_book_edit = open_book_edit;
+                                                let bid = book_id.clone();
+                                                spawn_local(async move {
+                                                    if let Ok(found) = load_library_book(&bid).await {
+                                                        open_book_edit(found);
+                                                    }
+                                                });
+                                            }
+                                        }>"Edit"</button>
                                     </div>
                                 </article>
                             })
@@ -3083,6 +3682,19 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                                             let book_id = book.id.clone();
                                             move |_| pin_book(book_id.clone())
                                         }>"Pin to conversation"</button>
+                                        <button class="text-button" on:click={
+                                            let book_id = book.id.clone();
+                                            let open_book_edit = open_book_edit;
+                                            move |_| {
+                                                let open_book_edit = open_book_edit;
+                                                let bid = book_id.clone();
+                                                spawn_local(async move {
+                                                    if let Ok(found) = load_library_book(&bid).await {
+                                                        open_book_edit(found);
+                                                    }
+                                                });
+                                            }
+                                        }>"Edit"</button>
                                     </div>
                                 </article>
                             })
@@ -3096,8 +3708,25 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                         <section class="model-section book-detail">
                             <div class="section-heading">
                                 <div><p class="utility">"LIBRARY / DETAIL"</p><h2>{book.title.clone()}</h2></div>
-                                <div>
+                                <div style="display:flex;gap:8px;align-items:center;">
                                     <span class="spine-cell">{book.kind.clone().unwrap_or_else(|| "SOURCE".into())}</span>
+                                    <button class="secondary" type="button" on:click={
+                                        let b = book.clone();
+                                        let open_book_edit = open_book_edit;
+                                        move |_| open_book_edit(b.clone())
+                                    }>"Edit book"</button>
+                                    {if book.kind.as_deref() == Some("MCP") {
+                                        let b = book.clone();
+                                        let open_mcp_edit = open_mcp_edit;
+                                        let sid = book.mcp_server_id.clone().unwrap_or_default();
+                                        let delete_mcp = delete_mcp;
+                                        view! {
+                                            <button class="secondary" type="button" on:click=move |_| open_mcp_edit(b.clone())>"Edit MCP"</button>
+                                            <button class="secondary danger" type="button" on:click=move |_| delete_mcp(sid.clone())>"Delete MCP"</button>
+                                        }.into_any()
+                                    } else {
+                                        view! { <span></span> }.into_any()
+                                    }}
                                     <button class="text-button" on:click=close>"Close"</button>
                                 </div>
                             </div>
@@ -3109,6 +3738,43 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
         } else {
             view! { <span class="utility"></span> }.into_any()
         }}
+        {move || edit_book.get().map(|_book| {
+            view! {
+                <div class="modal-backdrop" role="presentation">
+                    <section class="modal" role="dialog" aria-modal="true" aria-label="Edit book">
+                        <div class="modal-head"><p class="utility">"LIBRARY / EDIT BOOK"</p><button class="text-button" on:click=close_book_edit>"Close"</button></div>
+                        <label>"Title"<input required maxlength="500" prop:value=move || edit_title.get() on:input=move |e| edit_title.set(event_target_value(&e)) /></label>
+                        <label>"Body / Content"<textarea rows="8" prop:value=move || edit_body.get() on:input=move |e| edit_body.set(event_target_value(&e))></textarea></label>
+                        <label>"Tags (comma separated)"<input maxlength="500" placeholder="tag1, tag2" prop:value=move || edit_tags.get() on:input=move |e| edit_tags.set(event_target_value(&e)) /></label>
+                        <label>"Reason"<input required maxlength="500" prop:value=move || edit_reason.get() on:input=move |e| edit_reason.set(event_target_value(&e)) /></label>
+                        <p class="form-note">{move || edit_status.get()}</p>
+                        <div class="stepper-actions">
+                            <button class="secondary" type="button" on:click=close_book_edit>"Cancel"</button>
+                            <button class="primary" type="button" disabled=move || edit_saving.get() on:click=save_book_edit>{move || if edit_saving.get() { "Saving..." } else { "Save" }}</button>
+                        </div>
+                    </section>
+                </div>
+            }.into_any()
+        })}
+        {move || mcp_edit_id.get().as_ref().map(|sid| {
+            let sid = sid.clone();
+            view! {
+                <div class="modal-backdrop" role="presentation">
+                    <section class="modal" role="dialog" aria-modal="true" aria-label="Edit MCP server">
+                        <div class="modal-head"><p class="utility">"LIBRARY / EDIT MCP"</p><button class="text-button" on:click=close_mcp_edit>"Close"</button></div>
+                        <p class="form-note"><span>"Server: "</span><span>{sid.clone()}</span></p>
+                        <label>"Name"<input required maxlength="200" prop:value=move || mcp_edit_name.get() on:input=move |e| mcp_edit_name.set(event_target_value(&e)) /></label>
+                        <label>"Configuration (JSON)"<textarea rows="8" placeholder="{}" prop:value=move || mcp_edit_config.get() on:input=move |e| mcp_edit_config.set(event_target_value(&e))></textarea></label>
+                        <label class="confirm-row"><input type="checkbox" prop:checked=move || mcp_edit_enabled.get() on:change=move |e| mcp_edit_enabled.set(event_target_checked(&e)) /><span>"Enabled"</span></label>
+                        <p class="form-note">{move || mcp_edit_status.get()}</p>
+                        <div class="stepper-actions">
+                            <button class="secondary" type="button" on:click=close_mcp_edit>"Cancel"</button>
+                            <button class="primary" type="button" disabled=move || mcp_edit_saving.get() on:click=save_mcp_edit>{move || if mcp_edit_saving.get() { "Saving..." } else { "Save MCP" }}</button>
+                        </div>
+                    </section>
+                </div>
+            }.into_any()
+        })}
         {move || stepper.get().map(|state| {
             let state = state.clone();
             let close = close_stepper;
@@ -4577,9 +5243,19 @@ fn TerminalsPage() -> impl IntoView {
                         </div>
                         <pre class="terminal-output" node_ref=output_ref tabindex="0">{move || output.get()}</pre>
                         <form class="terminal-input-row" on:submit=send_line>
-                            <input placeholder="Type a command…" disabled=move || sending.get()
+                            <textarea rows="2" placeholder="Type a command… Enter to send, Shift+Enter for newline" disabled=move || sending.get()
                                 prop:value=move || input_line.get()
-                                on:input=move |event| input_line.set(event_target_value(&event)) />
+                                on:keydown=move |event: web_sys::KeyboardEvent| {
+                                    if event.key() == "Enter" && !event.shift_key() {
+                                        event.prevent_default();
+                                        if let Some(target) = event.target()
+                                            && let Ok(el) = target.dyn_into::<web_sys::HtmlTextAreaElement>()
+                                            && let Some(form) = el.form() {
+                                                let _ = form.request_submit();
+                                        }
+                                    }
+                                }
+                                on:input=move |event| input_line.set(event_target_value(&event))></textarea>
                             <button class="primary" type="submit" disabled=move || sending.get()>
                                 {move || if sending.get() { "Sending..." } else { "Send" }}
                             </button>
@@ -6099,6 +6775,7 @@ fn resolve_active_run(
         selected,
         messages,
         streamed,
+        tool_calls,
         active_run,
         resolving_run,
         status,
@@ -6154,6 +6831,7 @@ fn resolve_active_run(
                                     selected,
                                     messages,
                                     streamed,
+                                    tool_calls,
                                     active_run,
                                     resolving_run,
                                     status,
@@ -6216,10 +6894,12 @@ fn follow_run(
         selected,
         messages,
         streamed,
+        tool_calls,
         active_run,
         resolving_run,
         status,
     } = signals;
+    let _ = &tool_calls;
     spawn_local(async move {
         let run_id = active_session.run_id.clone();
         let conversation_id = active_session.conversation_id.clone();

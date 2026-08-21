@@ -264,9 +264,33 @@ pub async fn create_owner(
 
 pub async fn login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(input): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     check_login_throttle(&state.pool, input.email.trim(), &state.settings.auth).await?;
+    // M25a: in-memory per-IP + global sliding-window limits on top of the
+    // existing per-email DB throttle.
+    let ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string());
+    let ip_key = ip.unwrap_or_else(|| "unknown".to_string());
+    if state
+        .rate_limiter
+        .check_key(&format!("login:ip:{ip_key}"), 300, 20)
+        .await
+    {
+        return Err(AppError::RateLimited);
+    }
+    if state
+        .rate_limiter
+        .check_global("login:global", 60, 100)
+        .await
+    {
+        return Err(AppError::RateLimited);
+    }
     let row = sqlx::query(
         "SELECT id, primary_profile_id, email, display_name, role, password_hash \
          FROM users WHERE lower(email) = lower($1) AND disabled_at IS NULL",
@@ -368,6 +392,240 @@ pub async fn rotate_sessions(
     .await?;
     tx.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// List the caller's linked auth methods.
+pub async fn list_auth_methods(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let rows = sqlx::query(
+        "SELECT id, method_type, label, is_primary, last_used_at, created_at \
+         FROM auth_methods WHERE user_id = $1 ORDER BY is_primary DESC, created_at ASC",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    let methods: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            serde_json::json!({
+                "id": row.get::<Uuid, _>("id"),
+                "method_type": row.get::<String, _>("method_type"),
+                "label": row.get::<Option<String>, _>("label"),
+                "is_primary": row.get::<bool, _>("is_primary"),
+                "last_used_at": row.get::<Option<time::OffsetDateTime>, _>("last_used_at"),
+                "created_at": row.get::<time::OffsetDateTime, _>("created_at"),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "methods": methods })))
+}
+
+/// Delete an auth method; the last remaining method cannot be removed.
+pub async fn delete_auth_method(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let method: Option<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, method_type FROM auth_methods WHERE id = $1 AND user_id = $2 FOR UPDATE",
+    )
+    .bind(id)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((method_id, _)) = method else {
+        return Err(AppError::NotFound);
+    };
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM auth_methods WHERE user_id = $1 AND id <> $2")
+            .bind(user.id)
+            .bind(method_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if remaining == 0 {
+        return Err(AppError::Conflict(
+            "cannot remove the last authentication method",
+        ));
+    }
+    sqlx::query("DELETE FROM auth_methods WHERE id = $1")
+        .bind(method_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "auth.method_deleted",
+        "auth_method",
+        Some(method_id.to_string()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// List the caller's active sessions (device info from user-agent hash).
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let session_hash = user.session_hash.unwrap_or_default();
+    let rows = sqlx::query(
+        "SELECT token_hash, created_at, last_seen_at, expires_at, last_step_up_at \
+         FROM sessions WHERE user_id = $1 AND expires_at > now() \
+         AND NOT EXISTS (SELECT 1 FROM session_revocations r WHERE r.token_hash = sessions.token_hash) \
+         ORDER BY created_at DESC",
+    )
+    .bind(user.id)
+    .fetch_all(&state.pool)
+    .await?;
+    let sessions: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|row| {
+            let hash: Vec<u8> = row.get("token_hash");
+            serde_json::json!({
+                "hash": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &hash),
+                "current": hash == session_hash,
+                "created_at": row.get::<time::OffsetDateTime, _>("created_at"),
+                "last_seen_at": row.get::<time::OffsetDateTime, _>("last_seen_at"),
+                "expires_at": row.get::<time::OffsetDateTime, _>("expires_at"),
+                "last_step_up_at": row.get::<Option<time::OffsetDateTime>, _>("last_step_up_at"),
+            })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+/// Revoke all other sessions (keep the current one).
+pub async fn revoke_other_sessions(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let Some(hash) = user.session_hash else {
+        return Err(AppError::Unauthorized);
+    };
+    let mut tx = state.pool.begin().await?;
+    let revoked = crate::session_manager::revoke_all_other_sessions(
+        &mut tx,
+        user.id,
+        &hash,
+        "user_revoked_others",
+    )
+    .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "auth.sessions_revoked_others",
+        "session",
+        None,
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(if revoked == 0 {
+        StatusCode::NO_CONTENT
+    } else {
+        StatusCode::OK
+    })
+}
+
+/// Revoke a specific session by its base64url hash.
+pub async fn revoke_one_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(hash): axum::extract::Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let decoded = base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        hash.as_bytes(),
+    )
+    .map_err(|_| AppError::NotFound)?;
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<Uuid> =
+        sqlx::query_scalar("SELECT user_id FROM sessions WHERE token_hash = $1")
+            .bind(&decoded)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(owner) = owned else {
+        return Err(AppError::NotFound);
+    };
+    if owner != user.id {
+        return Err(AppError::NotFound);
+    }
+    crate::session_manager::revoke_session(
+        &mut tx,
+        user.id,
+        &decoded,
+        "user_revoked",
+        Some(user.id),
+    )
+    .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "auth.session_revoked",
+        "session",
+        None,
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Step-up re-authentication: verify the password again and mark the current
+/// session as step-up fresh for sensitive operations.
+pub async fn step_up(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<StepUpRequest>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let Some(hash) = user.session_hash else {
+        return Err(AppError::Unauthorized);
+    };
+    let row = sqlx::query("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user.id)
+        .fetch_optional(&state.pool)
+        .await?;
+    let encoded = row.as_ref().map(|r| r.get::<String, _>("password_hash"));
+    if !state
+        .passwords
+        .verify(&input.password, encoded.as_deref())
+        .await?
+    {
+        return Err(AppError::Unauthorized);
+    }
+    let mut tx = state.pool.begin().await?;
+    crate::session_manager::mark_step_up(&mut tx, &hash, user.id).await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "auth.step_up",
+        "session",
+        None,
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+pub struct StepUpRequest {
+    pub password: String,
 }
 
 pub async fn require_user(

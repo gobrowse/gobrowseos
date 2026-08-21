@@ -1,6 +1,7 @@
 pub mod api;
 pub mod auth;
 pub mod autobiography_api;
+pub mod autobiography_update;
 pub mod capabilities_api;
 pub mod chat;
 pub mod config;
@@ -18,12 +19,14 @@ pub mod model_api;
 pub mod outbound_http;
 pub mod plugin_api;
 pub mod plugin_github;
+pub mod rate_limiter;
 pub mod realtime;
 pub mod router;
 pub mod run_api;
 pub mod run_tools;
 pub mod sandbox_api;
 pub mod sandbox_client;
+pub mod session_manager;
 pub mod skills_api;
 pub mod task_api;
 pub mod ui_api;
@@ -165,6 +168,8 @@ pub struct AppState {
     /// startup so the strict CSP (no `unsafe-inline`) still allows the
     /// Trunk bootstrap and recovery page.
     pub builtin_csp_hashes: Arc<crate::csp::BuiltinCspHashes>,
+    /// In-memory sliding-window rate limiter (per-IP, global).
+    pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
 }
 
 impl AppState {
@@ -232,6 +237,7 @@ impl AppState {
             tool_descriptors,
             active_ui: Arc::new(RwLock::new(active_ui_state)),
             builtin_csp_hashes: Arc::new(builtin_csp_hashes),
+            rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new()),
         })
     }
 
@@ -308,6 +314,15 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/logout", post(auth::logout))
         .route("/auth/me", get(auth::me))
         .route("/auth/rotate", post(auth::rotate_sessions))
+        .route("/auth/methods", get(auth::list_auth_methods))
+        .route("/auth/methods/{id}", delete(auth::delete_auth_method))
+        .route("/auth/sessions", get(auth::list_sessions))
+        .route("/auth/sessions/revoke", post(auth::revoke_other_sessions))
+        .route(
+            "/auth/sessions/{hash}/revoke",
+            post(auth::revoke_one_session),
+        )
+        .route("/auth/step-up", post(auth::step_up))
         .route("/version", get(api::version))
         .route("/capabilities", get(capabilities_api::get_capabilities))
         .route(
@@ -392,6 +407,7 @@ pub fn router(state: AppState) -> Router {
             delete(model_api::delete_task_route),
         )
         .route("/providers/catalog", get(usage_api::list_provider_catalog))
+        .route("/providers/test", post(model_api::test_provider))
         .route("/usage/summary", get(usage_api::usage_summary))
         .route(
             "/conversations/{id}/runs",

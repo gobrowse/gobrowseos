@@ -15,7 +15,7 @@ serde_json.workspace = true
 url.workspace = true
 wasm-bindgen-futures = "0.4.50"
 wasm-bindgen = "0.2.127"
-web-sys = { version = "0.3.77", features = ["HtmlElement", "HtmlInputElement", "HtmlPreElement", "Window", "Location", "Storage"] }
+web-sys = { version = "0.3.77", features = ["HtmlElement", "HtmlInputElement", "HtmlPreElement", "HtmlTextAreaElement", "HtmlFormElement", "Window", "Location", "Storage"] }
 
 [lints]
 workspace = true
