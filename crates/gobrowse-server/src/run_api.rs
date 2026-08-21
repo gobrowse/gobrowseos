@@ -163,7 +163,7 @@ pub async fn start_turn(
     .ok_or(AppError::NotFound)?;
     if let Some(row) = sqlx::query(
         "SELECT id,conversation_id,state,step,requested_model_id,selected_model_id,input_message_id, \
-         output_message_id,error_code,created_at,updated_at,request_fingerprint FROM agent_runs \
+         output_message_id,error_code,context_snapshot,created_at,updated_at,request_fingerprint FROM agent_runs \
          WHERE conversation_id=$1 AND requested_by=$2 AND client_submission_id=$3 AND run_kind='conversation_turn'",
     )
     .bind(conversation_id)
@@ -1318,11 +1318,12 @@ async fn build_messages(
     // Phase 2: Parallel dependent queries (library search, worktree).
     // Unified Library search — bounded snippets only, never full bodies. This
     // is the *implicit* retrieval context, so it is deliberately conservative
-    // (A3): RESTRICTED/AGENT/PRIVATE/USER scopes are never injected into model
-    // context implicitly, WORKSPACE/PROJECT books require workspace membership,
-    // and NULL-kind legacy books are included (treated as SOURCE).
-    // AUTOBIOGRAPHY books are excluded from agent retrieval. Explicit loads via
-    // `library_load` use the regular `library_api` authorization predicates.
+    // (A3): RESTRICTED classification and AGENT/USER/PRIVATE scopes are never
+    // injected into model context implicitly, WORKSPACE/PROJECT books require
+    // workspace membership, and NULL-kind legacy books are included (treated
+    // as SOURCE). AUTOBIOGRAPHY books are excluded from agent retrieval.
+    // Explicit loads via `library_load` use the regular `library_api`
+    // authorization predicates.
     let (library_rows, worktree_rows) = tokio::try_join!(
         async {
             sqlx::query(

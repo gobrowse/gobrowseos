@@ -75,6 +75,28 @@ jobs:
           tool: trunk@0.21.14
       - run: trunk build index.html --release --dist ../../dist
         working-directory: crates/gobrowse-web
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get update && sudo apt-get install -y binaryen
+      - name: Optimize WASM with wasm-opt
+        run: |
+          shopt -s nullglob
+          command -v wasm-opt >/dev/null 2>&1 || { echo "::error::wasm-opt (binaryen) not installed"; exit 1; }
+          found=0
+          for f in dist/*_bg.wasm; do
+            found=1
+            before_raw=$(wc -c < "$f")
+            before_gz=$(gzip -c "$f" | wc -c)
+            wasm-opt -Oz --enable-bulk-memory -o "$f.opt" "$f"
+            mv "$f.opt" "$f"
+            after_raw=$(wc -c < "$f")
+            after_gz=$(gzip -c "$f" | wc -c)
+            echo "::group::$f"
+            echo "raw:  $before_raw -> $after_raw ($(($before_raw - $after_raw)) bytes saved)"
+            echo "gzip: $before_gz -> $after_gz ($(($before_gz - $after_gz)) bytes saved)"
+            echo "::endgroup::"
+            if [ "$after_gz" -le 0 ]; then echo "::error::optimized wasm is empty"; exit 1; fi
+          done
+          if [ "$found" -eq 0 ]; then echo "::error::no *_bg.wasm found in dist/"; exit 1; fi
 
   supply-chain:
     runs-on: ubuntu-latest

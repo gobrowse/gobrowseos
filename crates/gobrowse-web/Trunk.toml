@@ -6,6 +6,3 @@ release = true
 
 [watch]
 ignore = ["../../target", "../../dist"]
-
-[tools]
-wasm_opt = "Oz"
