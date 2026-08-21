@@ -281,7 +281,7 @@ async fn spawn_mock_github() -> MockGitHub {
         .with_state(state);
     let join = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
-            eprintln!("MOCK_GITHUB_DEAD: {error}");
+            eprintln!("mock GitHub server error: {error}");
         }
     });
     MockGitHub {
