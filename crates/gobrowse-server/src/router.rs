@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use gobrowse_core::library::{TaskClass, RankingWeights, task_capability_map};
+use gobrowse_core::library::{RankingWeights, TaskClass, task_capability_map};
 use gobrowse_core::model::ModelRoute;
 
 /// A model-task route mapping from the `model_task_routes` table.
@@ -58,13 +58,28 @@ pub fn classify_task(text: &str) -> (TaskClass, &'static str) {
     }
 
     // Check for coding keywords
-    let coding_keywords = ["fn ", "func ", "def ", "class ", "function", "rust", "python", "javascript", "typescript", "code", "implement", "debug"];
+    let coding_keywords = [
+        "fn ",
+        "func ",
+        "def ",
+        "class ",
+        "function",
+        "rust",
+        "python",
+        "javascript",
+        "typescript",
+        "code",
+        "implement",
+        "debug",
+    ];
     if coding_keywords.iter().any(|k| text_lower.contains(k)) {
         return (TaskClass::Coding, "rule");
     }
 
     // Check for shell commands (shell_automation)
-    let shell_patterns = ["$ ", "> ", "curl ", "git ", "npm ", "cargo ", "bash", "sh ", "sudo "];
+    let shell_patterns = [
+        "$ ", "> ", "curl ", "git ", "npm ", "cargo ", "bash", "sh ", "sudo ",
+    ];
     if shell_patterns.iter().any(|p| text.contains(p)) {
         return (TaskClass::ShellAutomation, "rule");
     }
@@ -77,9 +92,14 @@ pub fn classify_task(text: &str) -> (TaskClass, &'static str) {
     }
 
     // Check for file paths + create/write keywords (document_creation)
-    let has_file_path = text.contains(".md") || text.contains(".txt") || text.contains(".rs") || text.contains("/") && text.contains("file");
+    let has_file_path = text.contains(".md")
+        || text.contains(".txt")
+        || text.contains(".rs")
+        || text.contains("/") && text.contains("file");
     let create_keywords = ["create", "write", "document", "draft"];
-    if has_file_path || create_keywords.iter().any(|k| text_lower.contains(k)) && text_lower.contains("file") {
+    if has_file_path
+        || create_keywords.iter().any(|k| text_lower.contains(k)) && text_lower.contains("file")
+    {
         return (TaskClass::DocumentCreation, "rule");
     }
 
@@ -90,7 +110,9 @@ pub fn classify_task(text: &str) -> (TaskClass, &'static str) {
     }
 
     // Check for system administration keywords
-    let admin_keywords = ["system", "config", "service", "daemon", "log", "monitor", "admin"];
+    let admin_keywords = [
+        "system", "config", "service", "daemon", "log", "monitor", "admin",
+    ];
     if admin_keywords.iter().any(|k| text_lower.contains(k)) {
         return (TaskClass::SystemAdministration, "rule");
     }
@@ -131,7 +153,9 @@ pub fn generate_routing_reason(
     let mut clauses = Vec::new();
 
     // Capability match
-    if let Some(caps) = &signals.capability_match && !caps.is_empty() {
+    if let Some(caps) = &signals.capability_match
+        && !caps.is_empty()
+    {
         clauses.push(format!("Capability match ({})", caps.join(", ")));
     }
 
@@ -186,7 +210,9 @@ pub fn generate_routing_reason(
     }
 
     // Past success
-    if let Some(rate) = signals.past_success_rate && rate > 0.0 {
+    if let Some(rate) = signals.past_success_rate
+        && rate > 0.0
+    {
         clauses.push(format!(
             "previously used successfully ({:.0}% success rate)",
             rate * 100.0
@@ -223,7 +249,11 @@ pub fn rank_capabilities(
     // Get task capabilities if task class is provided
     let task_capabilities: Vec<String> = task_class
         .as_ref()
-        .and_then(|tc| task_capability_map().get(tc).map(|v| v.iter().map(|s| s.to_string()).collect()))
+        .and_then(|tc| {
+            task_capability_map()
+                .get(tc)
+                .map(|v| v.iter().map(|s| s.to_string()).collect())
+        })
         .unwrap_or_default();
 
     // Compute extended scores for each book
@@ -264,10 +294,10 @@ pub fn rank_capabilities(
 
             // Token cost proxy (negative weight)
             let token_cost_factor = match book.kind.as_deref() {
-                Some("SKILL") => 0.5,  // Lower cost
-                Some("SOURCE") | None => 1.0,  // Standard cost
-                Some("PLUGIN") => 1.5,  // Higher cost
-                Some("MCP") => 2.0,     // Highest cost (activation expensive)
+                Some("SKILL") => 0.5,         // Lower cost
+                Some("SOURCE") | None => 1.0, // Standard cost
+                Some("PLUGIN") => 1.5,        // Higher cost
+                Some("MCP") => 2.0,           // Highest cost (activation expensive)
                 _ => 1.0,
             };
             score += token_cost_factor * weights.token_cost;

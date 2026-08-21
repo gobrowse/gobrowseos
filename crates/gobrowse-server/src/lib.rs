@@ -17,6 +17,7 @@ pub mod outbound_http;
 pub mod plugin_api;
 pub mod plugin_github;
 pub mod realtime;
+pub mod router;
 pub mod run_api;
 pub mod run_tools;
 pub mod sandbox_api;
@@ -29,7 +30,6 @@ pub mod vault_api;
 pub mod webhook_scheduler;
 pub mod webhooks;
 pub mod worktree_api;
-pub mod router;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
@@ -82,6 +82,9 @@ pub struct AppState {
     /// Per-server MCP client pool (Lane E). Connections are created lazily on
     /// first `library_load` for an MCP book.
     pub mcp_clients: mcp_client::McpClientPool,
+    /// Cached tool descriptors for the run loop. Computed at startup to avoid
+    /// rebuilding per request.
+    pub tool_descriptors: Arc<Vec<gobrowse_core::model::ToolDefinition>>,
 }
 
 impl AppState {
@@ -111,6 +114,7 @@ impl AppState {
         };
         let plugin_source = GitHubReleaseSource::from_settings(&settings.features);
         let plugin_marketplace = GitHubMarketplace::from_settings(&settings.features);
+        let tool_descriptors = Arc::new(crate::run_tools::tool_definitions(sandbox.is_some()));
         Ok(Self {
             pool,
             settings: Arc::new(settings),
@@ -121,6 +125,7 @@ impl AppState {
             plugin_source,
             plugin_marketplace,
             mcp_clients: mcp_client::McpClientPool::new(),
+            tool_descriptors,
         })
     }
 

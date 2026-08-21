@@ -2,7 +2,10 @@
 target = "index.html"
 dist = "../../dist"
 public_url = "/"
-release = false
+release = true
 
 [watch]
 ignore = ["../../target", "../../dist"]
+
+[tools]
+wasm_opt = "Oz"

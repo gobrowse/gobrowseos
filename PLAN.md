@@ -1932,3 +1932,646 @@ a future UX path; the immediate M23 design only specifies the data flow and even
     `budget.by_category`, and `task_class` fields. The UI handles this with explicit
     "predates M23" empty states. No migration of old snapshots is required (they are
     immutable historical records).
+---
+---
+
+# PLAN.md — M24: Full Token, Runtime, Container & Architecture Optimization
+
+Authoritative architecture and implementation plan for M24. M22 and M23 are complete and deployed
+(schema version 22). This milestone makes Gobrowse dramatically lighter without losing capability.
+Same-or-better capability, less context/RAM/disk/CPU/latency/smaller containers/simpler code.
+M24 optimizations are the permanent baseline — all subsequent milestones inherit them.
+
+## Goal
+
+Optimize Gobrowse OS architecture across every measurable dimension: WASM binary size, Docker
+image size, idle RSS, startup time, search/chat latency, build time, token usage per run, and
+dependency footprint. Non-negotiable: do NOT remove features. Pay for capabilities only when
+needed. Keep boring, LLM-editable code. Maintain an architecture map. Stress-test with many
+Books/plugins (context and RAM must not scale with installed count). Requires before/after
+benchmark table and capability regression matrix.
+
+## Constraints
+
+*   **No feature removal.** Every M23 API endpoint, tool, and UI page must remain available.
+*   **Schema version unchanged** (22). No new migrations unless strictly required for
+    performance (e.g. a covering index). Schema changes require explicit justification.
+*   **`unsafe_code = "forbid"`**, edition 2024, Rust 1.94, nextest, forward migrations.
+*   **Every batch is independently deployable** and can be verified against baselines.
+*   **M24 is permanent.** All subsequent milestone builds (M24b, M25, …) MUST use the same
+    optimization standards. M24 sets the floor, not a ceiling.
+*   **Boring code.** No exotic abstractions, no new frameworks, no proc macros beyond what
+    already exists. The codebase must remain LLM-editable.
+
+## Current State (observed facts — M24 pre-implementation)
+
+### Artifact sizes (reported)
+*   Docker image: ~66 MB gzipped (multi-stage: `rust:1.94-bookworm` → `debian:bookworm-slim`)
+*   WASM bundle: ~12 MB (trunk build, no wasm-opt, no code splitting)
+*   Server binary: release profile with `lto = "thin"`, `codegen-units = 1`, `strip = "symbols"`,
+    `panic = "abort"`. No `wasm-opt` invocation, no `cargo-zigbuild`, no UPX.
+*   WASM build: `trunk build index.html --release` with no `Trunk.toml` optimization flags
+    (Trunk.toml only sets `target`, `dist`, `public_url`, `release = false`)
+
+### Dockerfile (observed)
+```dockerfile
+FROM rust:1.94-bookworm AS tools          # 1.4 GB layer — installs trunk
+RUN cargo install trunk --version 0.21.14 --locked
+
+FROM tools AS builder                     # Reuses tools layer
+WORKDIR /workspace
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+RUN rustup target add wasm32-unknown-unknown
+WORKDIR /workspace/crates/gobrowse-web
+RUN trunk build index.html --release --dist /workspace/dist
+WORKDIR /workspace
+RUN cargo build --locked --release -p gobrowse-server
+
+FROM debian:bookworm-slim AS runtime      # ~75 MB base
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && rm -rf /var/lib/apt/lists/*
+# ... user creation, COPY binary, COPY dist, COPY migrations, EXPOSE 8080
+```
+
+Issues:
+1. `rust:1.94-bookworm` base is ~1.4 GB; trunk installation adds ~400 MB.
+2. No Docker layer caching for Cargo registry/index (full rebuild on any source change).
+3. Runtime installs `curl` and `git` (useful for health probes but add ~15 MB).
+4. No `.dockerignore` optimization verified (may copy `target/` into build context).
+5. `trunk build` runs from inside Docker without incremental caching.
+
+### Server binary (observed dependencies)
+*   **Heavy deps always linked**: `argon2` (password hashing, startup-only), `flate2`
+    (plugin tar extraction, on-demand), `zip` (plugin zip extraction, on-demand), `tar`
+    (plugin tar extraction, on-demand), `pgvector` (embedding search, only when embeddings
+    configured).
+*   **Feature flags not used**: all workspace deps are unconditional. No `features = [...]`
+    gating for optional capabilities.
+*   **Startup path**: `main.rs` → `Settings::load()` → `PgPool::connect()` →
+    `sqlx::migrate!()` → `AppState::new()` → `tokio::spawn(embedding::run_worker())` →
+    `tokio::spawn(run_worker())` → `tokio::spawn(webhook_scheduler::run_worker())` →
+    `axum::serve()`. Migration runs synchronously at startup.
+
+### WASM bundle (observed)
+*   `gobrowse-web/src/app.rs`: **5,500+ lines**, single-file component tree. All pages
+    (Chat, Library, Workspaces, Terminals, Models, Diagnostics, Autobiography, Plugins) are
+    compiled into one bundle. No lazy routing, no dynamic imports.
+*   Dependencies: `leptos` (CSR), `gloo-net`, `js-sys`, `wasm-bindgen-futures`,
+    `web-sys` (HtmlElement, HtmlInputElement, HtmlPreElement, Window, Location, Storage).
+*   No `wasm-opt` post-processing. No `wasm-strip`. No feature gating for unused pages.
+
+### Context assembly (observed in `run_api.rs::build_messages`)
+1.  Fetches last 40 messages from `messages` table (no index on `conversation_id + ordinal`).
+2.  Runs `websearch_to_tsquery` FTS search on `books` with `ts_headline` for snippets.
+3.  Fetches up to 20 pinned books with `left(b.body, 3000)` — always full 3K chars even if
+    token budget is small.
+4.  Fetches up to 10 worktrees with all columns.
+5.  Token estimation: `chars / 4` — rough but adequate for budgeting.
+6.  Three sequential DB queries (no parallelism).
+7.  `build_context()` in `gobrowse_core::context.rs` does a simple sort-and-fill — O(n log n)
+    on candidate count.
+
+### Tool definitions (observed in `run_tools.rs`)
+*   `tool_definitions()` and `sandbox_tool_definitions()` build `Vec<ToolDefinition>` with
+    JSON schemas on every call. The schemas are `serde_json::json!()` macros — constructed
+    fresh each time, not cached.
+*   `tool_descriptors()` similarly constructs `Vec<ToolDescriptor>` from statics each call.
+
+### MCP client pool (observed in `mcp_client.rs`)
+*   `McpClientPool` is a `HashMap<Uuid, Arc<Mutex<ProcessMcpClient>>>` — one child process
+    per configured MCP server. Connections are created lazily. No eviction, no max-size
+    enforcement. Pool lives for server lifetime.
+*   Each `get_or_connect()` queries `mcp_servers` table on cache miss.
+
+### Embedding worker (observed in `embedding.rs`)
+*   Background worker claims jobs from `embedding_jobs` table, processes in batches of 16.
+*   Creates a new `reqwest::Client` per provider (no client reuse across jobs).
+*   `provider_http_client()` builds client with TLS configuration each time.
+
+### Sandbox client (observed in `sandbox_client.rs`)
+*   Fresh Unix socket connection per `send()` call. No connection pooling. No keepalive.
+*   This is intentional per protocol design (one client per connection), but worth noting.
+
+### Router (observed in `lib.rs`)
+*   70+ routes registered in a flat `Router::new()` chain.
+*   Tower layers: `DefaultBodyLimit`, `TimeoutLayer` (30s), `CompressionLayer`,
+    `SetSensitiveRequestHeadersLayer`, `PropagateRequestIdLayer`, `SetRequestIdLayer`,
+    `TraceLayer`, `CatchPanicLayer`, `origin_guard` middleware.
+*   All layers applied unconditionally (no feature gating).
+
+### Core crate (observed in `gobrowse-core`)
+*   13 modules: `activity`, `agent`, `context`, `fake_model`, `library`, `mcp`, `model`,
+    `plugin`, `policy`, `redaction`, `sandbox`, `scheduler`, `skills`, `tools`, `worktrees`.
+*   All modules compiled unconditionally. No feature flags.
+*   `sandbox.rs` has extensive protocol types with `deny_unknown_fields` on every struct —
+    good for security but increases code size.
+
+### Existing benchmarks (observed)
+*   `crates/gobrowse-core/benches/core.rs`: three criterion benchmarks:
+    - `library_rank_fusion_200x200`
+    - `chunk_book_1m_chars`
+    - `context_select_500_candidates`
+*   No server-level benchmarks (latency, throughput, startup time).
+*   No WASM size tracking.
+*   No Docker image size tracking.
+
+## Architectural Decisions
+
+### 1. Measure before optimizing — baseline metrics first
+
+Before any code change, establish reproducible baselines:
+
+| Metric | How to measure | Target |
+|---|---|---|
+| WASM bundle size | `wc -c dist/*.wasm` after trunk build | ≤ 8 MB (from ~12 MB) |
+| WASM gzipped | `gzip -k dist/*.wasm && wc -c dist/*.wasm.gz` | ≤ 3 MB |
+| Docker image size | `docker images gobrowse:latest` | ≤ 40 MB gzip (from ~66 MB) |
+| Docker build time | `time docker build .` (clean, no cache) | ≤ 5 min |
+| Server binary size | `wc -c target/release/gobrowse` | ≤ 15 MB (current unknown) |
+| Idle RSS | `ps -o rss= -p $(pgrep gobrowse)` after startup, no requests | ≤ 30 MB |
+| Startup time | Time from `gobrowse serve` to "listening on :8080" log | ≤ 3 s |
+| `build_messages` latency | Instrument `build_messages` with `tracing::info!(elapsed)` | ≤ 50 ms (p99) |
+| FTS search latency | Instrument search_books with timing | ≤ 20 ms (p99) |
+| Tool definition build time | Instrument `tool_definitions()` | ≤ 1 ms per call |
+| Build time (incremental) | `cargo build -p gobrowse-server` after touching one file | ≤ 30 s |
+| Build time (clean) | `cargo clean && cargo build --release -p gobrowse-server` | ≤ 5 min |
+| Context assembly tokens | Track `RunTokenMetrics.used_tokens` in representative runs | ≤ 80% of budget |
+| Book count scaling | Memory after loading 1,000 / 10,000 / 100,000 books | RSS must not grow > 2 MB |
+| Plugin count scaling | Memory with 0 / 10 / 100 dormant plugins | RSS must not grow > 1 MB |
+
+**Implementation**: Add a `scripts/benchmark.sh` that runs all measurements and outputs a
+markdown table. This script is the authoritative source for before/after comparison.
+
+### 2. Docker image optimization — distroless runtime, layer caching
+
+**Decision**: Replace `debian:bookworm-slim` with a minimal runtime base. Reorder Dockerfile
+for maximum layer cache hits.
+
+**Approach**:
+*   Runtime base: `gcr.io/distroless/cc-debian12` (no shell, no apt, ~2 MB) OR
+    `debian:bookworm-slim` with `curl` removed (keep only `ca-certificates` for TLS).
+*   Cargo registry cache: mount `~/.cargo/registry` and `~/.cargo/git` as build cache mounts.
+*   Separate the trunk installation into a cached layer (only rebuilds on version change).
+*   Copy `Cargo.toml`, `Cargo.lock`, and a minimal `src/lib.rs` first for dependency caching,
+    then copy full source.
+*   Add `.dockerignore` excluding `target/`, `dist/`, `*.md`, `.git/`, `node_modules/`.
+*   Remove `curl` from runtime (health checks use the `/health/live` endpoint directly).
+    Keep `git` only if required by plugin install at runtime (verify).
+
+**Files**: `Dockerfile`, `.dockerignore` (new)
+
+### 3. WASM bundle size — feature gates, code splitting, wasm-opt
+
+**Decision**: Use Leptos router with lazy page loading. Add `wasm-opt` post-processing.
+
+**Approach**:
+*   **wasm-opt**: Add `trunk build --release` with `--optimized` flag or run `wasm-opt -Oz`
+    on the output `.wasm`. Expected reduction: 20-40% on debug/info sections.
+*   **Trunk.toml optimization**: Set `[tools] wasm_opt = "Oz"` (or `O4` for speed-critical
+    paths). Set `[build] release = true` in Trunk.toml (currently `release = false`).
+*   **Feature-gate gobrowse-core in WASM**: The WASM crate only needs `library`, `context`,
+    `model`, `tools`, `policy`, `mcp`, `skills`, `plugin` from `gobrowse-core`. It does NOT
+    need `sandbox`, `activity`, `worktrees`, `scheduler`, `fake_model`, `redaction`. Add
+    feature flags to `gobrowse-core` Cargo.toml for WASM-only compilation.
+*   **Leptos CSR code splitting**: Use `#[component]` with conditional rendering based on
+    `Page` enum (already exists). The single `app.rs` (5,500+ lines) should remain a single
+    file for LLM-editability, but component-level lazy loading can be added if trunk supports it.
+    If Leptos CSR doesn't support route-level code splitting, accept the single bundle.
+*   **web-sys feature trimming**: Audit `web-sys` features. Currently requests `HtmlElement`,
+    `HtmlInputElement`, `HtmlPreElement`, `Window`, `Location`, `Storage`. If any are unused,
+    remove. Each feature adds ~1-5 KB to the WASM binary.
+
+**Files**: `crates/gobrowse-web/Trunk.toml`, `crates/gobrowse-core/Cargo.toml`,
+`crates/gobrowse-web/Cargo.toml`
+
+### 4. Server binary optimization — feature-gated optional capabilities
+
+**Decision**: Make heavy, rarely-used dependencies optional via Cargo feature flags.
+
+**Approach**:
+*   Add `[features]` to `gobrowse-server/Cargo.toml`:
+    ```toml
+    [features]
+    default = ["sandbox", "plugins", "embeddings"]
+    sandbox = ["dep:gobrowse-sandboxd"]
+    plugins = ["dep:flate2", "dep:tar", "dep:zip"]
+    embeddings = ["dep:pgvector"]
+    ```
+*   Conditionally compile `sandbox_api.rs`, `sandbox_client.rs`, `plugin_api.rs`,
+    `plugin_github.rs`, `embedding.rs`, `embedding_api.rs` behind `#[cfg(feature = "...")]`.
+*   Gate the corresponding routes in `lib.rs` router construction.
+*   `argon2` stays unconditional (auth is core). `reqwest` stays unconditional (chat provider).
+*   Expected savings: removing `flate2`+`tar`+`zip`+`pgvector` saves ~500 KB-1 MB of binary
+    when features are disabled. More importantly, it clarifies architecture.
+
+**Files**: `crates/gobrowse-server/Cargo.toml`, `crates/gobrowse-server/src/lib.rs`,
+per-module `#[cfg]` gates
+
+### 5. Context assembly optimization — parallel queries, bounded pin loading
+
+**Decision**: Parallelize DB queries in `build_messages`, bound pinned book body size by
+remaining budget.
+
+**Approach**:
+*   Use `tokio::join!` or `futures::join!` for the three sequential queries in
+    `build_messages`:
+    1.  Recent messages (40 rows)
+    2.  Library FTS search (12 rows)
+    3.  Pinned books (20 rows)
+    4.  Worktrees (10 rows)
+    All four can run in parallel since they have no data dependencies.
+*   **Bounded pin loading**: Currently fetches `left(b.body, 3000)` for each pinned book.
+    Change to `left(b.body, LEAST(3000, $remaining_budget / $pin_count))` — scale body
+    truncation to actual budget. This prevents 20 pinned books × 3K chars = 60K chars from
+    consuming all budget before library search results are considered.
+*   **Index for recent messages**: Add a covering index:
+    ```sql
+    CREATE INDEX IF NOT EXISTS idx_messages_conversation_ordinal
+        ON messages (conversation_id, ordinal DESC)
+        INCLUDE (role, content);
+    ```
+    This is the only schema change in M24 — justified by measurable latency improvement.
+*   **Index for library FTS**: Verify `search_document` has a GIN index (should exist from
+    migration 0001). If not, add one.
+
+**Files**: `crates/gobrowse-server/src/run_api.rs`, `crates/gobrowse-server/migrations/`
+(new index migration if needed)
+
+### 6. Tool definition caching — avoid per-request reconstruction
+
+**Decision**: Cache `ToolDefinition` and `ToolDescriptor` vectors in `AppState`.
+
+**Approach**:
+*   Add `tool_definitions: Vec<ToolDefinition>` and `sandbox_tool_definitions: Vec<ToolDefinition>`
+    to `AppState` (computed once at startup, behind `Arc<Vec<...>>`).
+*   Add `tool_descriptors: Vec<ToolDescriptor>` similarly.
+*   `tool_definitions(sandbox_enabled)` becomes `state.tool_definitions.clone()` (Arc clone =
+    pointer copy, ~8 ns).
+*   The JSON schemas are currently `serde_json::json!()` macros — these are lazy-evaluated
+    `Value` trees. Caching avoids re-parsing/allocating on every request.
+*   For `sandbox_tool_definitions`, conditionally build based on `settings.features.sandbox`.
+
+**Files**: `crates/gobrowse-server/src/run_tools.rs`, `crates/gobrowse-server/src/lib.rs`
+
+### 7. Embedding worker — reuse HTTP client
+
+**Decision**: Reuse `reqwest::Client` across embedding jobs instead of creating a new one
+per provider per job.
+
+**Approach**:
+*   Cache `reqwest::Client` in `AppState` (one per server lifetime). `reqwest::Client` is
+    designed to be shared — connection pooling is built in.
+*   `provider_http_client()` becomes `state.http_client.clone()` or takes `&AppState`.
+*   Expected savings: eliminates ~1-2 ms of TLS handshake setup per embedding job, reduces
+    memory fragmentation from client teardown/creation.
+
+**Files**: `crates/gobrowse-server/src/embedding.rs`, `crates/gobrowse-server/src/lib.rs`
+
+### 8. MCP client pool — add max-size eviction
+
+**Decision**: Cap the MCP client pool at a configurable max (default 8). Evict LRU on overflow.
+
+**Approach**:
+*   Add `max_pool_size: usize` to `McpClientPool` (default from settings).
+*   On `get_or_connect()`, if pool is full, drop the oldest-unused entry.
+*   The `ProcessMcpClient` drop impl kills the child process (tokio `Child` drops kill on
+    drop). This is safe — the next `get_or_connect()` re-spawns.
+*   Prevents unbounded child process growth with many MCP servers.
+
+**Files**: `crates/gobrowse-server/src/mcp_client.rs`
+
+### 9. Startup time — background migration, lazy worker spawn
+
+**Decision**: Move migration to a background task. Spawn workers after the server starts
+accepting connections.
+
+**Approach**:
+*   Run `sqlx::migrate!()` in a `tokio::spawn` that blocks on the migration but doesn't
+    delay `axum::serve()`. The server starts serving health checks immediately; API calls
+    that need the schema wait for migration to complete (race-safe because migration is
+    idempotent).
+*   Spawn `embedding::run_worker`, `run_worker`, `webhook_scheduler::run_worker` after
+    `axum::serve()` starts, not before. This shaves ~100-500 ms off perceived startup.
+*   The `/health/ready` endpoint should return 503 until migration completes (already
+    should — verify).
+
+**Files**: `crates/gobrowse-server/src/main.rs`, `crates/gobrowse-server/src/api.rs`
+
+### 10. Core crate — feature-gate unused modules for WASM
+
+**Decision**: Add feature flags to `gobrowse-core` so WASM compilation excludes server-only
+modules.
+
+**Approach**:
+*   Add to `gobrowse-core/Cargo.toml`:
+    ```toml
+    [features]
+    default = ["server"]
+    server = ["sandbox", "scheduler", "activity", "worktrees"]
+    sandbox = []
+    scheduler = []
+    activity = []
+    worktrees = []
+    fake_model = []
+    redaction = []
+    ```
+*   Gate `pub mod sandbox;` etc. with `#[cfg(feature = "...")]`.
+*   `gobrowse-web/Cargo.toml` depends on `gobrowse-core` with `default-features = false`,
+    only enabling the modules it needs.
+*   Expected savings: 10-30 KB WASM reduction (removes `sandbox.rs` types, `activity.rs`,
+    `worktrees.rs`, `scheduler.rs` from the WASM binary).
+
+**Files**: `crates/gobrowse-core/Cargo.toml`, `crates/gobrowse-core/src/lib.rs`,
+`crates/gobrowse-web/Cargo.toml`
+
+### 11. Architecture map — maintain a live architecture diagram
+
+**Decision**: Add `docs/architecture.md` with a text-based architecture map showing crate
+dependencies, data flow, and module responsibilities. Update it when M24 lands.
+
+**Approach**:
+*   Simple ASCII/text diagram showing: `gobrowse-core` (domain model) → `gobrowse-server`
+    (binary) → `gobrowse-web` (WASM) → `gobrowse-sandboxd` (daemon).
+*   Module map for each crate with 1-line descriptions.
+*   Data flow: user → WASM → server → PostgreSQL + LLM providers + sandboxd.
+*   This is a living document, not a one-off.
+
+**Files**: `docs/architecture.md` (new)
+
+## Implementation Batches
+
+### Batch 1: Measurement Infrastructure (no code changes)
+
+**Goal**: Establish reproducible baselines. Create measurement scripts.
+
+**Files to create**:
+-   `scripts/benchmark.sh` — runs all measurements, outputs markdown table
+-   `scripts/measure-wasm.sh` — WASM binary size, gzipped size, wasm-opt potential
+-   `scripts/measure-docker.sh` — Docker image size, build time
+-   `scripts/measure-server.sh` — binary size, idle RSS, startup time
+
+**Verification**:
+-   Run `scripts/benchmark.sh` and confirm all metrics are captured
+-   Store baseline table in `docs/m24-baselines.md`
+-   All subsequent batches reference this baseline
+
+**Dependencies**: None (first batch)
+
+### Batch 2: Container & Binary Optimization (Dockerfile, Cargo features)
+
+**Goal**: Slim Docker image, reduce binary size, add feature gates.
+
+**Files to modify**:
+-   `Dockerfile` — restructure for layer caching, slim runtime, `.dockerignore`
+-   `.dockerignore` — exclude `target/`, `dist/`, `.git/`, `*.md`
+-   `crates/gobrowse-server/Cargo.toml` — add `[features]` for sandbox/plugins/embeddings
+-   `crates/gobrowse-core/Cargo.toml` — add feature flags for server-only modules
+-   `crates/gobrowse-core/src/lib.rs` — gate modules with `#[cfg(feature)]`
+-   `crates/gobrowse-web/Cargo.toml` — depend on core with minimal features
+-   `crates/gobrowse-server/src/lib.rs` — gate module declarations and route registration
+-   Per-module `#[cfg]` gates in: `sandbox_api.rs`, `sandbox_client.rs`, `plugin_api.rs`,
+    `plugin_github.rs`, `embedding.rs`, `embedding_api.rs`
+
+**Verification**:
+-   `scripts/measure-docker.sh` shows image size reduction
+-   `scripts/measure-wasm.sh` shows WASM size reduction from feature gating
+-   `cargo build --release -p gobrowse-server` succeeds with default features
+-   `cargo build --release -p gobrowse-server --no-default-features` succeeds (core-only)
+-   All existing tests pass: `cargo nextest run`
+-   Capability regression matrix: every API endpoint still reachable, every tool still callable
+
+### Batch 3: WASM Optimization (Trunk.toml, wasm-opt, web-sys trimming)
+
+**Goal**: Reduce WASM bundle size toward 8 MB target.
+
+**Files to modify**:
+-   `crates/gobrowse-web/Trunk.toml` — enable release build, add wasm-opt settings
+-   `crates/gobrowse-web/Cargo.toml` — audit and trim `web-sys` features
+-   `Dockerfile` — install `wasm-opt` in tools stage, run post-build
+
+**Verification**:
+-   `scripts/measure-wasm.sh` shows ≥ 20% WASM size reduction
+-   WASM loads in browser without errors (manual smoke test or automated)
+-   All UI pages render correctly (Chat, Library, Workspaces, Terminals, Models, Diagnostics)
+
+### Batch 4: Runtime Performance (context assembly, tool caching, HTTP client reuse)
+
+**Goal**: Reduce per-request latency and memory allocation.
+
+**Files to modify**:
+-   `crates/gobrowse-server/src/run_api.rs` — parallelize `build_messages` queries, bounded
+    pin loading
+-   `crates/gobrowse-server/src/run_tools.rs` — cache tool definitions in `AppState`
+-   `crates/gobrowse-server/src/lib.rs` — add cached tool defs to `AppState`
+-   `crates/gobrowse-server/src/embedding.rs` — reuse HTTP client from `AppState`
+-   `crates/gobrowse-server/src/mcp_client.rs` — add pool max-size eviction
+-   `crates/gobrowse-server/migrations/` — new migration for `idx_messages_conversation_ordinal`
+    covering index
+
+**Verification**:
+-   `build_messages` latency ≤ 50 ms p99 (instrumented tracing output)
+-   `tool_definitions()` returns cached Arc clone, not fresh construction
+-   MCP pool eviction tested with > max_pool_size servers configured
+-   All existing integration tests pass
+-   Existing criterion benchmarks in `gobrowse-core/benches/core.rs` still pass
+
+### Batch 5: Startup Optimization (background migration, lazy workers)
+
+**Goal**: Server responds to health checks within 1 second of process start.
+
+**Files to modify**:
+-   `crates/gobrowse-server/src/main.rs` — background migration, deferred worker spawn
+-   `crates/gobrowse-server/src/api.rs` — verify `/health/ready` returns 503 during migration
+
+**Verification**:
+-   Time from process start to `/health/live` responding: ≤ 1 s
+-   Time from process start to `/health/ready` responding: ≤ 3 s
+-   All API calls succeed after `/health/ready` returns 200
+-   Migration idempotency: restart server twice, confirm no migration errors
+
+### Batch 6: Stress Testing (many books, many plugins, context scaling)
+
+**Goal**: Verify RSS and context usage don't scale with installed count.
+
+**Verification**:
+-   Load 1,000 books, measure RSS → must be within 2 MB of baseline
+-   Load 10,000 books, measure RSS → must be within 5 MB of baseline
+-   Configure 10 dormant plugins, measure RSS → must be within 1 MB of baseline
+-   Run `build_messages` with 50 pinned books and 20 worktree candidates → must stay within
+    token budget, no OOM
+-   Run 100 concurrent chat runs (if feasible) → RSS must be bounded
+
+**Files**: No code changes — measurement only. If scaling issues found, address in Batch 4.
+
+### Batch 7: Cleanup & Documentation
+
+**Goal**: Finalize architecture map, update docs, verify M24 is permanent baseline.
+
+**Files to modify**:
+-   `docs/architecture.md` — new, live architecture diagram
+-   `docs/m24-baselines.md` — before/after benchmark table
+-   `PLAN.md` — this section, updated with final results
+-   `README.md` — update build instructions if Dockerfile changed
+
+**Verification**:
+-   `docs/architecture.md` reflects actual crate/module structure
+-   `docs/m24-baselines.md` has complete before/after table
+-   Capability regression matrix is complete (every M23 feature confirmed working)
+
+## Verification Steps
+
+### Capability Regression Matrix
+
+Every row must be ✅ (working, same or better) after M24:
+
+| Feature | Endpoint/Tool | Verification |
+|---|---|---|
+| Owner setup | `POST /api/v1/setup/owner` | Integration test |
+| Login | `POST /api/v1/auth/login` | Integration test |
+| Create workspace | `POST /api/v1/workspaces` | Integration test |
+| Create book | `POST /api/v1/library/books` | Integration test |
+| FTS search | `GET /api/v1/library/search?q=...` | Integration test |
+| Progressive load | `POST /api/v1/library/books/{id}/load` | Integration test |
+| Start chat run | `POST /api/v1/conversations/{id}/runs` | Integration test |
+| Tool: library_search | Agent tool call | Integration test |
+| Tool: library_add | Agent tool call | Integration test |
+| Tool: library_load | Agent tool call | Integration test |
+| Sandbox tools | Agent tool call (if sandbox enabled) | Integration test |
+| Plugin install | `POST /api/v1/plugins/install` | Integration test |
+| Plugin list | `GET /api/v1/plugins` | Integration test |
+| Skill CRUD | `POST /api/v1/skills` | Integration test |
+| MCP server CRUD | `POST /api/v1/mcp/servers` | Integration test |
+| Embedding config | `POST /api/v1/embeddings/configurations` | Integration test |
+| Worktree CRUD | `POST /api/v1/workspaces/{id}/worktrees` | Integration test |
+| Task routing | `PUT /api/v1/models/task-routes` | Integration test |
+| Autobiography | `GET /api/v1/autobiography` | Integration test |
+| Vault secrets | `POST /api/v1/vault/secrets` | Integration test |
+| Webhook delivery | `POST /api/v1/webhooks/{id}/deliver` | Integration test |
+| Health endpoints | `GET /health/live`, `GET /health/ready` | Integration test |
+| WASM loads | Browser smoke test | Manual or automated |
+| All UI pages render | Each Page variant | Manual or automated |
+
+### Benchmark Table (to be filled after Batch 1)
+
+| Metric | Baseline (M23) | After M24 | Change |
+|---|---|---|---|
+| WASM size (raw) | ~12 MB | | |
+| WASM size (gzipped) | ~3 MB | | |
+| Docker image (gzipped) | ~66 MB | | |
+| Server binary size | TBD | | |
+| Idle RSS | TBD | | |
+| Startup to /health/live | TBD | | |
+| Startup to /health/ready | TBD | | |
+| build_messages p99 | TBD | | |
+| FTS search p99 | TBD | | |
+| Tool def build time | TBD | | |
+| Incremental build time | TBD | | |
+| Clean build time | TBD | | |
+| RSS at 1,000 books | TBD | | |
+| RSS at 10,000 books | TBD | | |
+| RSS at 100 plugins | TBD | | |
+
+## Database / Migration Changes
+
+**Only one new migration** (if justified by Batch 4 measurements):
+
+```sql
+-- Covering index for build_messages recent messages query
+-- Justification: eliminates seq scan on messages table for the
+-- conversation_id + ordinal DESC query that runs on every chat turn.
+CREATE INDEX IF NOT EXISTS idx_messages_conversation_ordinal
+    ON messages (conversation_id, ordinal DESC)
+    INCLUDE (role, content);
+```
+
+No other schema changes. Schema version stays at 22 unless this index requires a bump
+(verify sqlx::migrate behavior with additive-only indexes).
+
+## API Changes
+
+**None.** All existing endpoints remain identical. M24 is a pure optimization milestone.
+No new endpoints, no changed response shapes, no removed endpoints.
+
+## Security Requirements
+
+*   All existing auth, CSRF, and origin guards remain unchanged.
+*   Feature-gated modules (sandbox, plugins, embeddings) must still enforce authorization
+    when enabled — no security regression from feature gating.
+*   WASM `wasm-opt` must not introduce security issues (it's a well-austen optimizer; verify
+    output matches input behavior with the capability regression matrix).
+*   Background migration must be idempotent and safe to run concurrently with API requests
+    (PostgreSQL DDL is transactional; `CREATE INDEX CONCURRENTLY` if needed).
+*   MCP pool eviction must cleanly kill child processes (verify `Child` drop behavior).
+
+## Concurrency Requirements
+
+*   `build_messages` parallel queries must not deadlock (they use independent pool connections).
+*   MCP pool eviction must handle concurrent `get_or_connect()` calls safely (already uses
+    `tokio::sync::Mutex`).
+*   Background migration must not conflict with API requests that touch the same tables
+    (additive index creation uses `CONCURRENTLY` to avoid locks).
+*   Embedding worker HTTP client reuse must be thread-safe (`reqwest::Client` is `Clone + Send + Sync`).
+
+## Tests Required
+
+1.  **Feature-gate compilation test**: `cargo check --no-default-features -p gobrowse-server`
+    must succeed (proves core-only build works).
+2.  **Tool definition caching test**: Verify `tool_definitions()` returns same Arc pointer
+    on repeated calls (unit test).
+3.  **MCP pool eviction test**: Create pool with max_size=2, connect 3 servers, verify
+    oldest is evicted (unit test).
+4.  **Parallel build_messages test**: Verify all four DB queries complete and results merge
+    correctly (integration test).
+5.  **Bounded pin loading test**: With 20 pinned books and small token budget, verify
+    `build_messages` respects budget (integration test).
+6.  **Startup timing test**: Measure time to `/health/live` in integration test (assert < 2s).
+7.  **Capability regression**: Run full integration test suite — all existing tests must pass.
+
+## Deployment Considerations
+
+*   **Rolling deploy**: M24 changes are backward-compatible. No migration required (unless
+    index is added). Deploy is a simple image replacement.
+*   **Feature flag rollout**: If feature gates are used, the default feature set includes
+    all capabilities. Operators can disable features with `--no-default-features` at build
+    time if they want a slimmer binary.
+*   **Docker build cache**: After M24, Docker builds will be significantly faster due to
+    layer caching. First build may be slower (downloading cache mounts).
+*   **Monitoring**: After deploy, monitor idle RSS, startup time, and p99 latency to confirm
+    improvements match baselines.
+*   **Rollback**: Since no schema changes are required (index is additive), rollback is a
+    simple image revert.
+
+## Open Questions
+
+1.  **Distroless vs bookworm-slim**: `gcr.io/distroless/cc-debian12` is smaller but has no
+    shell. Health probes must use HTTP directly (already the case via `/health/live`).
+    If any runtime debugging requires a shell, bookworm-slim is safer. Recommendation:
+    start with bookworm-slim (remove `curl`, keep `ca-certificates`), evaluate distroless
+    in a follow-up if image size is still too large.
+
+2.  **wasm-opt in Docker or locally?**: Running `wasm-opt` in Docker adds ~30s to build.
+    Running locally (in CI or dev) means the Docker build doesn't include it. Recommendation:
+    run `wasm-opt` in the Docker tools stage so every build is consistent.
+
+3.  **Feature gate depth**: Should sandbox/plugins/embeddings be fully feature-gated (all
+    code behind `#[cfg]`), or just the route registration (code compiles but routes are
+    404)? Full gating saves more binary size but increases `#[cfg]` complexity. Recommendation:
+    full gating for server binary (measurable savings), keep routes unconditional for
+    simplicity if savings are negligible.
+
+4.  **Background migration race condition**: If a request arrives before migration completes
+    and touches a table that migration is altering, what happens? PostgreSQL DDL is
+    transactional — the request will either see the old schema or the new schema, never an
+    intermediate state. For additive changes (new index), this is safe. Recommendation:
+    verify with a targeted test.
+
+5.  **MCP pool max size**: Default of 8 seems reasonable for typical deployments. Should
+    this be configurable via settings? Yes — add `mcp_max_pool_size` to `FeatureSettings`.
+    Operators with many MCP servers may want higher limits.
+
+6.  **Token estimation accuracy**: `chars / 4` is a rough heuristic. For non-Latin scripts
+    (CJK, emoji), this overestimates. For code-heavy content, it may underestimate. Should
+    M24 improve this? Recommendation: defer to a follow-up — the current estimator is
+    adequate for budgeting (bounded error, never negative). Improving it doesn't affect the
+    optimization goal.

@@ -1,0 +1,12 @@
+target/
+dist/
+.git/
+*.md
+docs/
+.github/
+.opencode/
+.playwright-mcp/
+docker-compose.yml
+deny.toml
+.env*
+config*.toml

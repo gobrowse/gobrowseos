@@ -232,14 +232,73 @@ pub enum TaskClass {
 pub fn task_capability_map() -> std::collections::HashMap<TaskClass, Vec<&'static str>> {
     use std::collections::HashMap;
     let mut map = HashMap::new();
-    map.insert(TaskClass::Coding, vec!["rust", "python", "javascript", "typescript", "go", "code", "debug", "test", "implement"]);
-    map.insert(TaskClass::Research, vec!["search", "find", "lookup", "investigate", "explore", "documentation", "docs"]);
-    map.insert(TaskClass::DataAnalysis, vec!["data", "csv", "json", "analyze", "chart", "graph", "statistics", "pandas"]);
-    map.insert(TaskClass::DocumentCreation, vec!["write", "document", "markdown", "report", "summary", "create"]);
-    map.insert(TaskClass::GeneralQA, vec!["what", "how", "why", "explain", "describe", "tell"]);
-    map.insert(TaskClass::ShellAutomation, vec!["bash", "shell", "command", "script", "terminal", "execute", "run"]);
-    map.insert(TaskClass::Ecommerce, vec!["shop", "buy", "purchase", "cart", "checkout", "payment", "order"]);
-    map.insert(TaskClass::SystemAdministration, vec!["system", "config", "service", "daemon", "log", "monitor", "admin"]);
+    map.insert(
+        TaskClass::Coding,
+        vec![
+            "rust",
+            "python",
+            "javascript",
+            "typescript",
+            "go",
+            "code",
+            "debug",
+            "test",
+            "implement",
+        ],
+    );
+    map.insert(
+        TaskClass::Research,
+        vec![
+            "search",
+            "find",
+            "lookup",
+            "investigate",
+            "explore",
+            "documentation",
+            "docs",
+        ],
+    );
+    map.insert(
+        TaskClass::DataAnalysis,
+        vec![
+            "data",
+            "csv",
+            "json",
+            "analyze",
+            "chart",
+            "graph",
+            "statistics",
+            "pandas",
+        ],
+    );
+    map.insert(
+        TaskClass::DocumentCreation,
+        vec![
+            "write", "document", "markdown", "report", "summary", "create",
+        ],
+    );
+    map.insert(
+        TaskClass::GeneralQA,
+        vec!["what", "how", "why", "explain", "describe", "tell"],
+    );
+    map.insert(
+        TaskClass::ShellAutomation,
+        vec![
+            "bash", "shell", "command", "script", "terminal", "execute", "run",
+        ],
+    );
+    map.insert(
+        TaskClass::Ecommerce,
+        vec![
+            "shop", "buy", "purchase", "cart", "checkout", "payment", "order",
+        ],
+    );
+    map.insert(
+        TaskClass::SystemAdministration,
+        vec![
+            "system", "config", "service", "daemon", "log", "monitor", "admin",
+        ],
+    );
     map
 }
 

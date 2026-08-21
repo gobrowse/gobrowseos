@@ -312,7 +312,6 @@ struct ContextResponse {
     model_routing: Option<ModelRoutingInfo>,
 }
 
-
 #[derive(Debug, Serialize)]
 struct CreateConversationRequest<'a> {
     title: &'a str,
@@ -1347,9 +1346,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
 
 /// Context Inspector panel for displaying routing and token budget information.
 #[component]
-fn ContextInspector(
-    active_run: RwSignal<Option<String>>,
-) -> impl IntoView {
+fn ContextInspector(active_run: RwSignal<Option<String>>) -> impl IntoView {
     let context_data = RwSignal::new(None::<ContextResponse>);
     let is_open = RwSignal::new(false);
     let active_tab = RwSignal::new(0u8);
@@ -1367,19 +1364,20 @@ fn ContextInspector(
         context_data.set(None);
 
         spawn_local(async move {
-            match Request::get(&format!("/api/v1/runs/{}/context", run_id)).send().await {
-                Ok(response) if response.ok() => {
-                    match response.json::<ContextResponse>().await {
-                        Ok(data) => {
-                            context_data.set(Some(data));
-                            loading.set(false);
-                        }
-                        Err(e) => {
-                            error.set(Some(format!("Failed to parse response: {}", e)));
-                            loading.set(false);
-                        }
+            match Request::get(&format!("/api/v1/runs/{}/context", run_id))
+                .send()
+                .await
+            {
+                Ok(response) if response.ok() => match response.json::<ContextResponse>().await {
+                    Ok(data) => {
+                        context_data.set(Some(data));
+                        loading.set(false);
                     }
-                }
+                    Err(e) => {
+                        error.set(Some(format!("Failed to parse response: {}", e)));
+                        loading.set(false);
+                    }
+                },
                 Ok(response) => {
                     error.set(Some(format!("HTTP {}", response.status())));
                     loading.set(false);
@@ -1674,7 +1672,6 @@ fn ContextInspector(
         </div>
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Workspace + MCP page types

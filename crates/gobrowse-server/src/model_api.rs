@@ -1,3 +1,9 @@
+use crate::{
+    AppState,
+    auth::{AuthenticatedUser, audit, require_user},
+    embedding,
+    error::AppError,
+};
 use axum::{
     Json,
     extract::{Path, State},
@@ -8,12 +14,6 @@ use sqlx::Row;
 use sqlx::types::time::OffsetDateTime;
 use url::Url;
 use uuid::Uuid;
-use crate::{
-    AppState,
-    auth::{AuthenticatedUser, audit, require_user},
-    embedding,
-    error::AppError,
-};
 
 #[derive(Deserialize)]
 pub struct CreateChatModelRequest {
@@ -280,17 +280,25 @@ pub async fn upsert_task_route(
 ) -> Result<(StatusCode, Json<TaskRouteResponse>), AppError> {
     let user = require_user(&state, &headers).await?;
     require_admin(&user)?;
-    
+
     // Validate task_class
-    let valid_classes = ["coding", "research", "data_analysis", "document_creation",
-        "general_qa", "shell_automation", "ecommerce", "system_administration"];
+    let valid_classes = [
+        "coding",
+        "research",
+        "data_analysis",
+        "document_creation",
+        "general_qa",
+        "shell_automation",
+        "ecommerce",
+        "system_administration",
+    ];
     if !valid_classes.contains(&input.task_class.as_str()) {
         return Err(AppError::Validation(format!(
             "invalid task_class: {}",
             input.task_class
         )));
     }
-    
+
     // Verify the model exists and belongs to the profile
     let model_exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM models m JOIN providers p ON p.id=m.provider_id \
@@ -300,11 +308,11 @@ pub async fn upsert_task_route(
     .bind(user.profile_id)
     .fetch_one(&state.pool)
     .await?;
-    
+
     if !model_exists {
         return Err(AppError::NotFound);
     }
-    
+
     let route_id = Uuid::new_v4();
     let row = sqlx::query(
         "INSERT INTO model_task_routes (id, profile_id, task_class, preferred_model_id, position, created_at) \
@@ -318,7 +326,7 @@ pub async fn upsert_task_route(
     .bind(&input.preferred_model_id)
     .fetch_one(&state.pool)
     .await?;
-    
+
     let response = TaskRouteResponse {
         id: row.get("id"),
         task_class: row.get("task_class"),
@@ -337,15 +345,13 @@ pub async fn delete_task_route(
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
     require_admin(&user)?;
-    
-    let result = sqlx::query(
-        "DELETE FROM model_task_routes WHERE profile_id=$1 AND task_class=$2",
-    )
-    .bind(user.profile_id)
-    .bind(&task_class)
-    .execute(&state.pool)
-    .await?;
-    
+
+    let result = sqlx::query("DELETE FROM model_task_routes WHERE profile_id=$1 AND task_class=$2")
+        .bind(user.profile_id)
+        .bind(&task_class)
+        .execute(&state.pool)
+        .await?;
+
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound);
     }
