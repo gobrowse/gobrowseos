@@ -176,7 +176,7 @@ async fn releases_latest(State(state): State<MockState>) -> Json<Value> {
 
 async fn release_by_tag(
     State(state): State<MockState>,
-    Path(tag): Path<String>,
+    Path((_owner, _repo, tag)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, StatusCode> {
     if matches!(tag.as_str(), V1_TAG | V2_TAG | V3_TAG) {
         Ok(Json(release_json(&tag, &state.base)))
@@ -185,7 +185,7 @@ async fn release_by_tag(
     }
 }
 
-async fn git_ref_tags(Path(tag): Path<String>) -> Json<Value> {
+async fn git_ref_tags(Path((_owner, _repo, tag)): Path<(String, String, String)>) -> Json<Value> {
     Json(json!({ "object": { "sha": sha_for_tag(&tag), "type": "commit" } }))
 }
 
@@ -280,9 +280,9 @@ async fn spawn_mock_github() -> MockGitHub {
         .route("/assets/{file}", get(asset))
         .with_state(state);
     let join = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .await
-            .expect("mock GitHub serves");
+        if let Err(error) = axum::serve(listener, app).await {
+            eprintln!("MOCK_GITHUB_DEAD: {error}");
+        }
     });
     MockGitHub {
         base: Url::parse(&base).unwrap(),
@@ -290,10 +290,6 @@ async fn spawn_mock_github() -> MockGitHub {
         join,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Test harness
-// ---------------------------------------------------------------------------
 
 async fn test_pool() -> Option<PgPool> {
     let url = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok()?;
@@ -722,7 +718,13 @@ async fn upgrade_stage_diff_activate_and_rollback_round_trip() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| format!("{}:{}", p["domain"], p["scope_value"]))
+        .map(|p| {
+            format!(
+                "{}:{}",
+                p["domain"].as_str().unwrap(),
+                p["scope_value"].as_str().unwrap()
+            )
+        })
         .collect();
     assert!(added_perms.contains(&"filesystem_write:/workspace/out/**".to_owned()));
     assert!(added_perms.contains(&"network:api.example.com:443".to_owned()));
@@ -730,7 +732,13 @@ async fn upgrade_stage_diff_activate_and_rollback_round_trip() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|p| format!("{}:{}", p["domain"], p["scope_value"]))
+        .map(|p| {
+            format!(
+                "{}:{}",
+                p["domain"].as_str().unwrap(),
+                p["scope_value"].as_str().unwrap()
+            )
+        })
         .collect();
     assert!(removed_perms.contains(&"secrets:DEMO_TOKEN".to_owned()));
     let added_components: Vec<String> = diff["components"]["added"]
@@ -831,16 +839,23 @@ async fn upgrade_stage_diff_activate_and_rollback_round_trip() {
         .collect();
     assert_eq!(
         component_names,
-        vec!["run-demo".to_owned(), "demo-runbook".to_owned()]
+        vec!["demo-runbook".to_owned(), "run-demo".to_owned()],
+        "components are ORDER BY name (server contract)"
     );
     let rollback_statuses: Vec<String> = detail["installations"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|i| format!("{}:{}", i["version"], i["status"]))
+        .map(|i| {
+            format!(
+                "{}:{}",
+                i["version"].as_str().unwrap(),
+                i["status"].as_str().unwrap()
+            )
+        })
         .collect();
-    assert!(rollback_statuses.contains(&"v2.0.0:rolled_back".to_owned()));
-    assert!(rollback_statuses.contains(&"v1.0.0:active".to_owned()));
+    assert!(rollback_statuses.contains(&"2.0.0:rolled_back".to_owned()));
+    assert!(rollback_statuses.contains(&"1.0.0:active".to_owned()));
 
     // Book body/metadata follow the active version.
     let book: Value = sqlx::query_scalar(
@@ -921,7 +936,7 @@ async fn workspace_install_requires_workspace_owner_and_scopes_book() {
     let mock = spawn_mock_github().await;
     let profile_id = create_profile(&pool).await;
     let (owner_id, owner_cookie) = create_session(&pool, profile_id, "OWNER").await;
-    let (member_id, member_cookie) = create_session(&pool, profile_id, "EDITOR").await;
+    let (member_id, member_cookie) = create_session(&pool, profile_id, "MEMBER").await;
     let workspace_id = Uuid::now_v7();
     sqlx::query(
         "INSERT INTO workspaces (id, profile_id, title, created_by_user_id) VALUES ($1, $2, 'plugin-ws', $3)",
@@ -1014,7 +1029,11 @@ async fn workspace_install_requires_workspace_owner_and_scopes_book() {
         None,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "delete by non-owner member should hide existence (404): {status}"
+    );
 }
 
 #[tokio::test]
