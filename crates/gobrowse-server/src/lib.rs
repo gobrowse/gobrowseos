@@ -161,6 +161,10 @@ pub struct AppState {
     pub tool_descriptors: Arc<Vec<gobrowse_core::model::ToolDefinition>>,
     /// Active UI package state (M24b). Populated from DB on startup and updated on activation/rollback.
     pub active_ui: Arc<RwLock<Option<ActiveUiState>>>,
+    /// Hashes of the built-in UI's inline scripts/styles, computed at
+    /// startup so the strict CSP (no `unsafe-inline`) still allows the
+    /// Trunk bootstrap and recovery page.
+    pub builtin_csp_hashes: Arc<crate::csp::BuiltinCspHashes>,
 }
 
 impl AppState {
@@ -192,6 +196,29 @@ impl AppState {
         let tool_descriptors = Arc::new(crate::run_tools::tool_definitions(sandbox.is_some()));
         // Load active UI package from DB (M24b). Best-effort: missing table before migration 0024 yields None.
         let active_ui_state = load_active_ui_state(&pool).await.unwrap_or(None);
+        let static_dir = settings.http.static_dir.clone();
+        let builtin_index = tokio::fs::read_to_string(static_dir.join("index.html"))
+            .await
+            .unwrap_or_default();
+        let mut script_hashes = crate::csp::extract_inline_hashes(&builtin_index, "script");
+        let mut style_hashes = crate::csp::extract_inline_hashes(RECOVERY_HTML, "style");
+        // The Trunk-built recovery app (if present) also carries an inline
+        // bootstrap script and style block.
+        for candidate in [
+            std::path::PathBuf::from("/app/recovery/index.html"),
+            std::path::PathBuf::from("./dist-recovery/index.html"),
+            std::path::PathBuf::from("./crates/gobrowse-recovery/dist/index.html"),
+            static_dir.join("recovery/index.html"),
+        ] {
+            if let Ok(html) = tokio::fs::read_to_string(&candidate).await {
+                script_hashes.extend(crate::csp::extract_inline_hashes(&html, "script"));
+                style_hashes.extend(crate::csp::extract_inline_hashes(&html, "style"));
+            }
+        }
+        let builtin_csp_hashes = crate::csp::BuiltinCspHashes {
+            script_hashes,
+            style_hashes,
+        };
         Ok(Self {
             pool,
             settings: Arc::new(settings),
@@ -204,6 +231,7 @@ impl AppState {
             mcp_clients: mcp_client::McpClientPool::new(),
             tool_descriptors,
             active_ui: Arc::new(RwLock::new(active_ui_state)),
+            builtin_csp_hashes: Arc::new(builtin_csp_hashes),
         })
     }
 
@@ -611,9 +639,13 @@ async fn origin_guard(
     Ok(next.run(request).await)
 }
 
+/// Built-in recovery page (no JS required): links to the API and the
+/// recovery asset bundle. Kept as a constant so its inline style hash can be
+/// computed once at startup and allowed by the strict CSP.
+const RECOVERY_HTML: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gobrowse OS — Recovery</title><style>:root{--bg:#0f1419;--fg:#e6e8eb;--accent:#7ea0ff;--muted:#8a9099;--card:#1a232e;--border:#2a3441}*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Arial;background:var(--bg);color:var(--fg);display:grid;place-items:center;min-height:100vh;padding:24px}a{color:var(--accent)}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;max-width:560px;width:100%;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:22px;letter-spacing:-.02em}p{margin:8px 0;color:var(--muted);line-height:1.5}code{background:#0f1419;border:1px solid var(--border);padding:2px 6px;border-radius:6px}.btn{display:inline-block;margin-top:16px;background:var(--accent);color:#0f1419;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:600}</style></head><body><div class="card"><h1>Recovery</h1><p>Built-in recovery UI is always available. Use it to manage UI packages, rollback, or restore the built-in interface.</p><p>Endpoints: <code>GET /api/v1/capabilities</code> · <code>GET /api/v1/ui/packages</code></p><a class="btn" href="/api/v1/capabilities">View capabilities</a><p style="margin-top:16px"><a href="/">Back to app</a> · <a href="/recovery">Recovery</a></p><noscript><p>This page works without JavaScript. Use the API directly if needed.</p></noscript></div></body></html>"#;
+
 async fn recovery_handler() -> impl IntoResponse {
-    let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gobrowse OS — Recovery</title><style>:root{--bg:#0f1419;--fg:#e6e8eb;--accent:#7ea0ff;--muted:#8a9099;--card:#1a232e;--border:#2a3441}*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Arial;background:var(--bg);color:var(--fg);display:grid;place-items:center;min-height:100vh;padding:24px}a{color:var(--accent)}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;max-width:560px;width:100%;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:22px;letter-spacing:-.02em}p{margin:8px 0;color:var(--muted);line-height:1.5}code{background:#0f1419;border:1px solid var(--border);padding:2px 6px;border-radius:6px}.btn{display:inline-block;margin-top:16px;background:var(--accent);color:#0f1419;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:600}</style></head><body><div class="card"><h1>Recovery</h1><p>Built-in recovery UI is always available. Use it to manage UI packages, rollback, or restore the built-in interface.</p><p>Endpoints: <code>GET /api/v1/capabilities</code> · <code>GET /api/v1/ui/packages</code></p><a class="btn" href="/api/v1/capabilities">View capabilities</a><p style="margin-top:16px"><a href="/">Back to app</a> · <a href="/recovery">Recovery</a></p><noscript><p>This page works without JavaScript. Use the API directly if needed.</p></noscript></div></body></html>"#;
-    axum::response::Html(html)
+    axum::response::Html(RECOVERY_HTML)
 }
 
 async fn recovery_asset_handler(

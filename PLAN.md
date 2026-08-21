@@ -1,565 +1,714 @@
-# PLAN.md — M24b: Custom UI System
+# PLAN.md — M25: Auth Hardening & Enterprise Authorization
 
-Authoritative architecture and implementation plan for M24b. **Current batch** — M24 is the
-completed optimization baseline. Branch: `initial-agent-os`, HEAD `0168513`.
+Authoritative architecture and implementation plan for M25 (M25a + M25b). **Current batch**.
 
-**Schema version: 23 (post-M24). M24b adds migration 0024.**
+**M24 is COMPLETE.** M24b (Custom UI System) is COMPLETE. Branch: `initial-agent-os`.
+
+**Schema version: 24 (post-M24b). M25 adds migrations 0025+.**
 
 ---
 
 ## Goal
 
-Agent-editable UI with permissions. THE UI IS CUSTOMIZABLE; THE SECURITY MODEL IS NOT.
+M25 delivers two complementary security milestones:
 
-Users and agents can install, preview, and activate custom UI packages (themes or full WASM
-frontends) over the same stable versioned backend APIs. Third-party UI packages are untrusted:
-CSP-enforced, hash-verified, no raw secrets, no DB/sandbox creds, no internal tokens, server-side
-auth always authoritative. Agent UI edits require explicit user approval; silent activation is
-prohibited. A built-in recovery UI always remains available and cannot be overwritten.
+**M25a — Auth Hardening**: WebAuthn/OIDC support, login rate-limit hardening, CSRF hardening,
+session rotation hardening, session lifecycle hardening. Every auth path is hardened while
+single-user installs stay simple (no mandatory config, password-only still works).
 
-M24b MUST NOT regress any M24 optimization or break any security/verification gate: `unsafe_code =
-"forbid"`, `clippy -D warnings`, `rustfmt`, nextest, schema version 23 asserted in
-`postgres_integration.rs:42` + `worktrees_integration.rs:50`, `wasm-opt -Oz`, cheapest-capable
-routing, lazy tool schemas, bounded context.
+**M25b — Enterprise Authorization**: A single centralized ALLOW/ASK/DENY authorization engine
+covering every actor (human, agent, plugin, MCP, sandbox, context retrieval). Multi-user/workspace
+isolation, agent/tool permissions, approval policies, secrets protection, and enterprise-grade
+auditing with complete attribution. Single-user installs default to OWNER = everything with no
+mandatory enterprise config; enterprise features activate when multiple users/workspaces exist.
+
+M25 MUST NOT regress any M24/M24b optimization or break any security/verification gate:
+`unsafe_code = "forbid"`, `clippy -D warnings`, `rustfmt`, nextest, `wasm-opt -Oz`,
+cheapest-capable routing, lazy tool schemas, bounded context, strict CSP (no unsafe-inline).
 
 ---
 
-## Current State (observed post-M24, HEAD 0168513)
+## Current State (observed post-M24b, HEAD 0168513)
 
 ### What exists today
 
 | System | State |
 |--------|-------|
-| **Book model** | `books` table with `kind` column: SOURCE, SKILL, MCP, PLUGIN, AUTOBIOGRAPHY. Companion Books created transactionally for skills/MCP/plugins. |
-| **Plugin system** | Full install pipeline: preview → install → activate/rollback. `plugins` + `plugin_components` + `plugin_permissions` + `plugin_installations` tables. Artifacts in `settings.features.plugins_dir` (default `./data/plugins`). |
-| **Static serving** | `ServeDir::new(static_dir).fallback(ServeFile::new(index.html))` at `lib.rs:392`. Single SPA from `dist/`. |
-| **Auth** | Session cookies (`__Host-gobrowse_session`), OWNER/ADMIN/MEMBER/VIEWER roles, `origin_guard` middleware (`lib.rs:415`). |
-| **Frontend** | Leptos WASM SPA, 6205 LOC `app.rs`, 12 pages (Chat, Workspaces, Library, Tasks, Agents, Terminals, Skills, Autobiography, MCP, Models, Diagnostics), CSS custom properties for theming. |
-| **CSP** | **None.** No Content-Security-Policy headers anywhere. |
-| **Capabilities endpoint** | **Does not exist.** No `GET /api/v1/capabilities`. |
-| **UI packages** | **Does not exist.** No theme/UI package infrastructure. |
-| **Recovery UI** | **Does not exist.** No fallback mechanism. |
-| **UI permission model** | **Does not exist.** No DENY/ASK/ALLOW levels. |
-| **API versioning** | `GET /api/v1/version` returns `{ version, api_version: "v1", schema_version, build_commit }` (`api.rs:38-48`). |
+| **Auth** | Argon2id passwords, opaque sessions (`__Host-gobrowse_session`), `origin_guard` CSRF middleware, login throttling (5 attempts / 300 s window via `check_login_throttle`), session rotation via `POST /auth/rotate`. users.role: OWNER/ADMIN/MEMBER/VIEWER. Sessions table: `token_hash`, `auth_epoch`, `expires_at`, `absolute_expires_at`, `ip_hash`, `user_agent_hash`. Password hashing with bounded concurrency semaphore. |
+| **CSRF** | `origin_guard` middleware enforces Origin header match on POST/PUT/PATCH/DELETE, rejects `Sec-Fetch-Site: cross-site`, exempts `/api/v1/webhooks/`. Good but missing: SameSite cookie attribute enforcement on the server side, Fetch Metadata `Sec-Fetch-Dest`/`Sec-Fetch-Mode` checks. |
+| **Plugins** | Full install pipeline. `plugin_permissions` table: `filesystem_read`, `filesystem_write`, `network`, `secrets`, `subprocess`, `admin`, `system_info` domains. Static policy inspection (`validate_permissions`). Workspace-scoped plugins require workspace owner. |
+| **MCP** | `mcp_client.rs`: per-server permissions + approval policy, OAuth PKCE states (migration 0018), vault-backed secrets. Bounded: `MAX_MCP_TOOLS=16`, `MAX_MCP_TOOLS_SCHEMA_BYTES=64KB`, `MAX_MCP_CALL_RESULT_BYTES=64KB`. |
+| **Runs** | `risk_class_for_tool` classifies tool names as `"read"` or `"write"` (binary). `gobrowse_core::policy::RiskClass`: Read/Write/Execute/ExternalSideEffect/Destructive/Admin (6 levels). `PolicyEngine` evaluates tool_id × RiskClass → Allow/Ask/Deny. tool_calls table tracks `risk_class`, `idempotency_key`, `status`. `approvals` table (tied to tool_call_id): pending/approved/denied/expired with `decided_by`, `decided_at`, `expires_at`. |
+| **Sandbox** | `sandbox_client.rs` — typed Unix-socket client. Sandboxd NOT wired into the app (`SandboxHandle` lazily connected, `features.sandbox` can be enabled). |
+| **SSRF** | `outbound_http.rs` — `PinnedHttpsTransport`, `validate_resolved_target`: deny loopback/private/link-local/metadata ranges. `MAX_TARGET_URL_LENGTH=2048`, 2 s DNS, 5 s connect/request timeout. |
+| **Vault** | `vault.rs` — AES-256-GCM envelope encryption, master key external (file or env), key rotation (`POST /vault/rotate`). MCP OAuth purposes: `mcp_oauth_access_token`, `mcp_oauth_refresh_token`, `mcp_oauth_client_secret`, `mcp_oauth_pkce_verifier`. |
+| **Audit** | `audit_events` table (append-only via trigger): `sequence bigserial`, `actor_user_id`, `profile_id`, `action`, `resource_type`, `resource_id`, `outcome`, `detail jsonb`, `request_id`, `created_at`. Index: `(profile_id, sequence DESC)`. Activity events also append-only with per-workspace ordering. |
+| **Workspace isolation** | `workspace_memberships` (OWNER/EDITOR/VIEWER). Queries filter by `workspace_id` + `profile_id`. Task integrity enforced via composite FKs (migration 0010). Cross-workspace references quarantined. |
+| **CSP** | Strict (M24b): no unsafe-inline, hash-verified WASM/JS/CSS. `csp.rs` computes headers from `ui_package_assets` hashes. Built-in bootstrap hash handled. |
+| **UI** | Recovery UI at `/recovery`. Capabilities endpoint `GET /api/v1/capabilities`. Active UI state in `AppState.active_ui: Arc<RwLock<Option<ActiveUiState>>>`. |
 
-### M24 baseline constraints (non-negotiable)
+### Key gaps identified (verified in code)
 
-- Schema version 23 (migration `0023_agent_retrieval_index.sql` applied)
-- Docker image: `debian:bookworm-slim` + `ca-certificates` only; healthcheck via `gobrowse health`
-- WASM: `wasm-opt -Oz --enable-bulk-memory`
-- Lazy tool schemas: round 1 advertises only 3 base tools
-- Lazy sandbox connection via `SandboxHandle` (OnceLock)
-- Cheapest-capable routing via `cost_ranking`
-- `unsafe_code = "forbid"`, `clippy::all = "warn"`, Rust 1.94, edition 2024
-
-### M24 optimization checks per M24b batch
-
-Every M24b batch MUST verify:
-1. `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings`
-2. `cargo clippy -p gobrowse-web --target wasm32-unknown-unknown -- -D warnings`
-3. `cargo nextest run --workspace` (with `GOBROWSE_TEST_DATABASE_URL`)
-4. No schema_version regressions (integration tests assert 23)
-5. No `unsafe` blocks added
-6. No removal of existing tools, features, or endpoints
-7. Docker build succeeds and `gobrowse health` works
-8. WASM builds with `trunk build --release` and `wasm-opt -Oz`
-9. Context budget stays bounded (no new large constant payloads)
+1. **No WebAuthn/OIDC**: Only Argon2id passwords. No passkey, OIDC, or TOTP support.
+2. **Single auth method per user**: No concept of linked auth methods — a user has exactly one password.
+3. **`risk_class_for_tool` is binary**: Maps everything to read/write. The full 6-level `RiskClass` enum exists in `gobrowse-core` but is unused at dispatch time.
+4. **No centralized authorization decision point**: Each module (plugin_api, mcp_client, run_api, sandbox_api) does its own ad-hoc checks. No unified `authorize(actor, action, resource) -> Decision` function.
+5. **Plugin permissions are install-time only**: `validate_permissions` runs at install but there's no runtime enforcement of whether a plugin actually uses only its declared permissions.
+6. **Agent permissions stored as JSONB but unenforced**: `agents.permissions jsonb` column exists but is never checked at tool dispatch time.
+7. **No secrets access control**: Vault encrypts secrets but any OWNER/ADMIN can read any profile's secrets. Secret access is not audited per-read.
+8. **Approval model is tool-call-specific**: `approvals` table is only for tool calls. No generic approval policy for plugins, MCP servers, agents, sandbox operations, webhook deliveries.
+9. **Session hardening gaps**: No concurrent session limit, no device/browser fingerprint tracking, no step-up auth for sensitive operations, no session revocation list.
+10. **Audit coverage is incomplete**: Plugin installs, MCP server mutations, sandbox operations, and secret access are not consistently audited.
+11. **No enterprise audit viewer**: No API endpoint or UI for querying/searching the audit trail.
+12. **Login rate-limit is per-email only**: No IP-based rate limiting, no global rate limit, no account lockout after N failures.
 
 ---
 
-## Architectural Decisions (M24b)
+## Architectural Decisions
 
-### AD-B1: UI packages follow the Plugin pattern with a Companion Book
+### AD-25.1: Single centralized authorization decision point
 
-**Rationale**: Plugins already have a proven install lifecycle (preview → install →
-activate/rollback), a companion Book for library search, artifact storage on disk, and a
-state machine with serialization via `SELECT ... FOR UPDATE`. UI packages have identical
-needs. Reusing the pattern means less code, familiar security boundaries, and the agent
-discovers UI packages through the same library search.
+**Rationale**: Every human, agent, plugin, MCP, sandbox action, and context retrieval MUST pass
+through the same centralized authorization system. No bypasses. One function, one code path, one
+audit trail.
 
-**Decision**:
-- New `ui_packages` table (analogous to `plugins`) with `state` column driving the lifecycle.
-- Companion Book with `kind = 'GOBROWSE_UI'` (analogous to `kind = 'PLUGIN'`), created in
-  the same transaction as the `ui_packages` row.
-- Artifacts stored in `settings.features.ui_packages_dir` (default `./data/ui-packages`),
-  analogous to `plugins_dir`.
-- Same digest verification (TOCTOU protection: preview returns digest, install requires it).
+**Decision**: New module `crate::authorize` in `gobrowse-server` with a single public API:
 
-**New `BookKind` variant**: Add `GobrowseUi` to the `BookKind` enum in `gobrowse-core/src/library.rs`,
-and `'GOBROWSE_UI'` to the `books_kind_check` constraint via migration.
-
-### AD-B2: Safe change pipeline — CANDIDATE / ACTIVE / PREVIOUS states
-
-**Rationale**: The roadmap requires preserving CURRENT + PREVIOUS + CANDIDATE. Plugins use
-`discovered | staged | installed | enabled | dormant | active | unhealthy | update_available`.
-UI packages need a simpler state machine focused on safe transitions.
-
-**Decision**:
-```
-discovered  →  staged  →  validated  →  candidate  →  active
-                                                  ↘  failed
-active  →  previous  (on activation of a new package)
-previous →  active    (on rollback)
-any     →  rolled_back (on explicit rollback of non-active)
+```rust
+pub async fn authorize(
+    state: &AppState,
+    actor: &Actor,
+    action: &Action,
+    resource: &Resource,
+    context: &AuthorizationContext,
+) -> Result<AuthorizationDecision, AppError>
 ```
 
-- `discovered`: initial preview, manifest parsed, digest computed.
-- `staged`: package installed on disk (files extracted, hashes verified).
-- `validated`: automated validation passed (manifest schema, CSP hash computation, WASM
-  load check, capability compatibility check).
-- `candidate`: ready for activation, awaiting user approval.
-- `active`: currently serving. Exactly one per profile at a time.
-- `previous`: was active before the current activation. Single rollback target.
-- `failed`: validation or activation failed.
-- `rolled_back`: explicitly deactivated via rollback.
+Every call site that currently does ad-hoc permission checks MUST call `authorize()` instead.
+The function returns `Allow`, `Ask`, or `Deny` with a mandatory reason.
 
-Transitions enforced in application code (not DB CHECK, to allow the full graph). Only one
-row per profile can be `active` at a time (enforced via unique partial index).
+**Actor** enum:
+```rust
+pub enum Actor {
+    Human { user_id: Uuid, session_id: Option<Vec<u8>> },
+    Agent { agent_id: Uuid, run_id: Uuid, user_id: Uuid },
+    Plugin { plugin_id: Uuid, installation_id: Uuid },
+    Mcp { server_id: Uuid, profile_id: Uuid },
+    Sandbox { workspace_id: Uuid },
+    Webhook { webhook_id: Uuid },
+    System,
+}
+```
 
-### AD-B3: CSP computed and injected server-side
+**Action** enum:
+```rust
+pub enum Action {
+    // CRUD
+    Create { resource_type: ResourceType },
+    Read { resource_type: ResourceType },
+    Update { resource_type: ResourceType },
+    Delete { resource_type: ResourceType },
+    // Operations
+    Execute { tool_name: String, risk_class: RiskClass },
+    Approve { approval_id: Uuid },
+    AccessSecret { secret_id: Uuid, purpose: String },
+    ContextRetrieve { book_ids: Vec<Uuid> },
+    WebhookDeliver { url: String },
+    // Admin
+    ManageUsers,
+    ManageWorkspace,
+    ManageBilling,
+    ViewAudit,
+}
+```
 
-**Rationale**: Third-party UI packages are untrusted. CSP is the primary browser enforcement
-mechanism. The server MUST compute hashes and inject headers; the UI package manifest can
-declare additional allowed origins, but the server is always authoritative.
+**Resource** enum:
+```rust
+pub enum Resource {
+    Conversation(Uuid),
+    Workspace(Uuid),
+    Book(Uuid),
+    Plugin(Uuid),
+    McpServer(Uuid),
+    SandboxWorkspace(Uuid),
+    Secret(Uuid),
+    Webhook(Uuid),
+    Profile(Uuid),
+    AuditTrail,
+    SystemConfig,
+}
+```
 
-**Decision**:
-- Server computes SHA-256 hashes of all served assets (WASM, CSS, JS) at install time and
-  stores them in `ui_package_assets` table.
-- On every response serving UI assets, inject `Content-Security-Policy` header:
-  ```
-  default-src 'none';
-  script-src 'sha256-<wasm_hash>' 'sha256-<js_hash>';
-  style-src 'sha256-<css_hash>';
-  img-src 'self' data:;
-  connect-src <api_origin>;
-  font-src 'self';
-  frame-ancestors 'none';
-  base-uri 'self';
-  form-action 'self';
-  ```
-- No `'unsafe-inline'`, no `'unsafe-eval'`, no wildcard origins.
-- `connect-src` restricted to the server's own API origin (from `settings.http.public_origin`).
-- CSP is injected via middleware (`csp_headers`) on all `/ui/` asset routes and the SPA
-  fallback route.
-- THEME packages: CSP uses the built-in WASM hash + theme CSS override hash.
+### AD-25.2: Permission matrix is the authority; policy rules are layered on top
 
-**CSP middleware**: new module `crate::csp` with a `CspHeaders` struct that holds computed
-hashes for the active UI package. Injected as a tower layer in `router()`.
+**Rationale**: A clear, auditable permission matrix defines defaults. Policy rules (per-user,
+per-agent, per-plugin allowlists/denylists) can tighten but never relax the matrix defaults.
 
-### AD-B4: Recovery UI — minimal built-in, never overwritable
+**Decision**: Permission matrix stored in code (constant, compiled, testable). Policy rules stored
+in database (runtime-configurable). The effective decision is `matrix_default ∩ policy_rules`:
+policy can only restrict, never expand.
 
-**Rationale**: A broken UI package must not lock the user out. The recovery UI is a separate,
-minimal Leptos WASM binary (`recovery_ui.wasm`) compiled into the Docker image at a known
-path (`/app/recovery/`). It provides login + UI package management + diagnostics.
+### AD-25.3: Single-user installs default to OWNER = everything
 
-**Decision**:
-- `crates/gobrowse-recovery/` — separate crate, separate Leptos app.
-  - Pages: Login, UI Package List (activate, rollback, delete), Diagnostics, Built-in Restore.
-  - Minimal CSS inline, no external dependencies.
-  - Compiled to `recovery_ui.wasm`, placed in Docker image at `/app/recovery/`.
-- Server route: `GET /recovery` serves the recovery SPA. `GET /recovery/*` serves recovery assets.
-  These routes bypass the active UI package entirely.
-- Auto-fallback: the server's SPA fallback logic checks whether the active UI package's WASM
-  file exists on disk. If missing or hash mismatch, requests for `/` get a 302 redirect to `/recovery`.
-- `DELETE /api/v1/ui/packages/{id}` is rejected for `state = 'active'` or when it's the only
-  remaining installed package (last-known-good protection).
-- Recovery UI HTML contains a `<meta http-equiv="refresh">` fallback if WASM fails to load.
+**Rationale**: The roadmap requires single-user installs stay simple. When only one user exists
+(role=OWNER, one profile, one workspace), every authorization check short-circuits to ALLOW with
+a `"single_user_mode"` reason. No enterprise config, no approval prompts, no permission setup
+required.
 
-### AD-B5: Capabilities endpoint — stable versioned contract
+**Decision**: `authorize()` checks `is_single_user_mode(state)` as the first branch. If true,
+return `Allow` for all actions that don't involve external actors (plugins, MCP, webhooks still
+go through their own permission checks). Single-user mode is detected by: exactly one user with
+role=OWNER, one profile, ≤1 workspace.
 
-**Rationale**: UI packages need to know what APIs/tools/capabilities are available without
-hardcoding assumptions. The capabilities endpoint is the machine-readable contract between
-backend and UI.
+### AD-25.4: Approval policies tiered by risk + actor
 
-**Decision**:
-- `GET /api/v1/capabilities` — unauthenticated, always available.
-- Response format:
-  ```json
-  {
-    "api_version": "v1",
-    "schema_version": 24,
-    "server_version": "0.1.0",
-    "auth": { "methods": ["session_cookie"], "setup_required": false },
-    "features": {
-      "sandbox": true,
-      "browser": false,
-      "messaging": false,
-      "plugins": true,
-      "ui_packages": true,
-      "webhooks": true
-    },
-    "tools": [
-      { "name": "library_search", "kind": "library" },
-      { "name": "sandbox_exec", "kind": "sandbox" }
-    ],
-    "endpoints": {
-      "conversations": { "base": "/api/v1/conversations" },
-      "library": { "base": "/api/v1/library" }
-    },
-    "ui": {
-      "active_package_id": "uuid-or-null",
-      "active_package_kind": "BUILT_IN",
-      "permission_level": "ASK"
-    }
-  }
-  ```
-- Tool list is derived from the existing `tool_definitions()` function (already cached in
-  `AppState.tool_descriptors`).
-- Feature flags from `settings.features`.
-- UI packages declare `min_api_version` in their manifest; activation is rejected if the
-  server's `api_version` is lower.
+**Rationale**: Different actors have different trust levels. A human OWNER approving a plugin
+install is different from an agent requesting a sandbox exec. Approval policies must be
+configurable per (actor_kind, risk_class, resource_type) tuple.
 
-### AD-B6: THEME vs FULL_UI — same table, different `ui_kind`
+**Decision**: New `approval_policies` table with rows for (actor_kind, risk_class, action,
+resource_type) → decision (Allow/Ask/Deny). Default policies ship as migration data. Users
+with ADMIN+ role can customize policies. Policies are cached in `AppState` with a reload
+endpoint.
 
-**Rationale**: Both themes and full UI packages share the same lifecycle (install, validate,
-activate, rollback), permissions model, and library discovery path. Separating them would
-duplicate code and confuse the state machine.
+### AD-25.5: Audit trail is the existing `audit_events` table, extended
 
-**Decision**:
-- `ui_kind` column: `'THEME'` | `'FULL_UI'` (CHECK constraint).
-- THEME: `manifest.theme` contains CSS custom property overrides.
-  ```json
-  { "theme": { "variables": { "--ink": "#1a1a2e", "--canvas": "#fafafa" } } }
-  ```
-  Activation injects a `<style>` block or serves an overridden `styles.css`.
-  The built-in WASM and HTML remain unchanged.
-- FULL_UI: `manifest.entry` points to the WASM entry point (`index.html` path within the
-  package). The entire frontend is replaced.
-- Both kinds produce a companion Book (kind=GOBROWSE_UI) for library search.
-- Both go through the same permission checks.
+**Rationale**: The `audit_events` table already has the right schema (append-only, per-profile
+index, request_id, detail jsonb). Adding columns for the new authorization model extends it
+without breaking existing queries.
 
-### AD-B7: UI permission levels — per-profile setting
+**Decision**: Add columns to `audit_events` and create an audit query API:
+- `authorization_decision` text: `'ALLOW' | 'ASK' | 'DENY'`
+- `authorization_reason` text: human-readable reason
+- `authorization_policy_id` uuid: which policy row matched (nullable)
+- `actor_kind` text: kind of actor (human/agent/plugin/mcp/sandbox/webhook/system)
+- `actor_id` text: specific actor identifier
+- `resource_workspace_id` uuid: workspace scope for the resource
 
-**Rationale**: The roadmap specifies DENY / ASK (default) / ALLOW_WORKSPACE / ALLOW_GLOBAL.
-This is a profile-level setting controlling what the agent can do without explicit human
-approval.
+The existing `actor_user_id` and `profile_id` columns are preserved.
 
-**Decision**:
-- `profiles.ui_permission_level` column: `'DENY' | 'ASK' | 'ALLOW_WORKSPACE' | 'ALLOW_GLOBAL'`.
-  Default: `'ASK'`.
-- `DENY`: All UI package operations forbidden for agents. User can still manage via recovery UI.
-- `ASK` (default): Agent must obtain explicit user approval before activating a UI package.
-  Install and preview are allowed; activation blocks pending approval.
-- `ALLOW_WORKSPACE`: Agent can activate workspace-scoped UI packages without asking.
-  Global packages still require approval.
-- `ALLOW_GLOBAL`: Agent can activate any UI package. This requires OWNER or ADMIN role to change
-  to, and is logged as a security event.
-- Approval flow: agent calls `POST /api/v1/ui/packages/{id}/activate` → if `ASK` and caller
-  is an agent (determined by run context), the activation enters `awaiting_approval` substate
-  → user receives notification (via run event) → user approves via `POST .../approve`.
+### AD-25.6: WebAuthn/OIDC as linked auth methods, not replacement
 
-### AD-B8: Agent path = human path
+**Rationale**: Users should be able to add multiple auth methods (password, passkey, OIDC)
+without losing existing sessions. This is a linked-identity model, not an either/or model.
 
-**Rationale**: The roadmap explicitly requires this. No special agent-only APIs for UI
-management. The agent uses the same HTTP endpoints.
-
-**Decision**:
-- All UI endpoints accept both human (session cookie) and agent (run-scoped) auth.
-- Agent auth is determined by `require_user_or_run` pattern (similar to how
-  conversation APIs work with run context).
-- Agent installs/activations are recorded with `installed_by`/`activated_by` pointing to the
-  agent's run or user identity.
-- The run loop's tool dispatch does NOT auto-approve UI changes; the agent must call the
-  same endpoints and face the same permission checks.
-- The agent's browser-test step uses the `browser` sandbox capability (M24b does not
-  implement browser automation — that's a future milestone; for now, agent can preview
-  screenshots via the server's `/ui/packages/{id}/preview` route that returns a static
-  snapshot).
-
-### AD-B9: `ui_packages` table design
-
+**Decision**: New `auth_methods` table:
 ```sql
-CREATE TABLE ui_packages (
+CREATE TABLE auth_methods (
     id uuid PRIMARY KEY,
-    profile_id uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    workspace_id uuid REFERENCES workspaces(id) ON DELETE CASCADE,
-    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
-    version text NOT NULL CHECK (char_length(version) BETWEEN 1 AND 64),
-    ui_kind text NOT NULL CHECK (ui_kind IN ('THEME', 'FULL_UI')),
-    description text NOT NULL DEFAULT '',
-    source_type text NOT NULL CHECK (source_type IN ('github_release', 'local_package', 'marketplace')),
-    source_uri text NOT NULL,
-    manifest jsonb NOT NULL DEFAULT '{}'::jsonb,
-    artifact_digest text,  -- SHA-256 of the source archive
-    install_path text,     -- on-disk directory under ui_packages_dir
-    entry_point text,      -- relative path to index.html (FULL_UI) or null (THEME)
-    api_version text NOT NULL DEFAULT 'v1',
-    state text NOT NULL DEFAULT 'discovered'
-        CHECK (state IN ('discovered','staged','validated','candidate','active','previous','failed','rolled_back')),
-    trust text NOT NULL DEFAULT 'UNTRUSTED'
-        CHECK (trust IN ('VERIFIED','USER_PROVIDED','AGENT_INFERRED','EXTERNAL','UNTRUSTED')),
-    created_by uuid REFERENCES users(id) ON DELETE SET NULL,
-    activated_by uuid REFERENCES users(id) ON DELETE SET NULL,
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    method_type text NOT NULL CHECK (method_type IN ('password', 'webauthn', 'oidc')),
+    method_data jsonb NOT NULL,  -- credential_id/public_key for webauthn, issuer/subject for OIDC
+    label text,  -- user-friendly name like "YubiKey 5" or "Google"
+    is_primary boolean NOT NULL DEFAULT false,
+    last_used_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    activated_at timestamptz,
-    UNIQUE (profile_id, name)
+    UNIQUE (user_id, method_type, label)
 );
-
--- Only one active UI package per profile.
-CREATE UNIQUE INDEX ui_packages_one_active_per_profile
-    ON ui_packages (profile_id) WHERE state = 'active';
-
--- Asset hashes for CSP computation.
-CREATE TABLE ui_package_assets (
-    id uuid PRIMARY KEY,
-    ui_package_id uuid NOT NULL REFERENCES ui_packages(id) ON DELETE CASCADE,
-    file_path text NOT NULL,   -- relative path within package
-    content_type text NOT NULL,-- MIME type
-    sha256_hash text NOT NULL, -- hex-encoded SHA-256
-    file_size bigint NOT NULL,
-    created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (ui_package_id, file_path)
-);
-
--- Declared capabilities (from manifest).
-CREATE TABLE ui_package_capabilities (
-    id uuid PRIMARY KEY,
-    ui_package_id uuid NOT NULL REFERENCES ui_packages(id) ON DELETE CASCADE,
-    capability_name text NOT NULL,
-    min_api_version text,
-    UNIQUE (ui_package_id, capability_name)
-);
-
--- Profile-level UI permission.
-ALTER TABLE profiles ADD COLUMN ui_permission_level text NOT NULL DEFAULT 'ASK'
-    CHECK (ui_permission_level IN ('DENY', 'ASK', 'ALLOW_WORKSPACE', 'ALLOW_GLOBAL'));
 ```
 
-### AD-B10: UI package manifest format
+WebAuthn follows the WebAuthn Level 3 spec with `attestation=none` for simplicity.
+OIDC follows the Authorization Code Flow with PKCE. Both are optional — password-only
+still works.
 
-```json
-{
-  "kind": "gobrowse-ui",
-  "manifest_version": 1,
-  "name": "dark-theme",
-  "version": "1.0.0",
-  "ui_kind": "THEME",
-  "description": "Dark color scheme for Gobrowse OS",
-  "publisher": { "name": "Alice", "url": "https://example.com" },
-  "license": "MIT",
-  "api_version": "v1",
-  "min_api_version": "v1",
-  "entry": null,
-  "capabilities": [],
-  "permissions": {
-    "ui_kind": "THEME"
-  },
-  "theme": {
-    "variables": {
-      "--ink": "#e0e0e0",
-      "--canvas": "#1a1a2e",
-      "--surface": "#16213e",
-      "--blue": "#7ea0ff"
-    }
-  },
-  "source": {
-    "repository": "https://github.com/alice/gobrowse-dark-theme",
-    "revision": "abc123"
-  }
-}
-```
+### AD-25.7: CSRF hardening adds Fetch Metadata checks
 
-For FULL_UI:
-```json
-{
-  "kind": "gobrowse-ui",
-  "manifest_version": 1,
-  "name": "custom-dashboard",
-  "version": "1.0.0",
-  "ui_kind": "FULL_UI",
-  "entry": "index.html",
-  "capabilities": ["conversations", "library", "sandbox"],
-  "theme": null
-}
-```
+**Rationale**: The existing `origin_guard` is good but browsers now send `Sec-Fetch-*` headers
+that provide additional CSRF protection. Adding these checks with `Sec-Fetch-Site` already
+handled — add `Sec-Fetch-Mode: navigate` rejection for state-changing endpoints and
+`Sec-Fetch-Dest` verification.
 
-### AD-B11: No BookKind enum change in gobrowse-core
+**Decision**: Extend `origin_guard` middleware to also check:
+- `Sec-Fetch-Mode: navigate` → reject on state-changing endpoints (navigations should use GET)
+- `Sec-Fetch-Dest: empty` on POST/PUT/PATCH/DELETE → reject (should be `empty` only for
+  same-origin XHR/fetch)
+- Add `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`
+  headers for Spectre/transient execution protection
 
-**Decision**: Rather than adding a new variant to the `BookKind` enum (which would break
-existing match exhaustiveness), store the UI package companion Book with `kind = NULL`
-(meaning SOURCE in the current model) and distinguish via `metadata->>'ui_package_id'`.
-This avoids touching the shared `gobrowse-core` enum and keeps M24b changes server-local.
-Alternatively, use `kind = 'GOBROWSE_UI'` as a new BookKind variant — but this requires a
-core change.
+### AD-25.8: Session hardening via limits + tracking
 
-**Revised decision**: Add `GobrowseUi` to `BookKind` and `'GOBROWSE_UI'` to the CHECK
-constraint. The existing match arms on BookKind use `#[serde(default)]` on `kind: Option<BookKind>`,
-so adding a variant is backward-compatible — existing code that matches on `Some(Source)`,
-`Some(Skill)`, etc. will get a compile error from non-exhaustive match, which forces audit.
-This is the correct, boring approach. Add the variant.
+**Rationale**: Defense-in-depth against session hijacking. Limit concurrent sessions per user,
+track device/browser fingerprint, require step-up auth for sensitive operations (vault access,
+user management, billing).
 
-### AD-B12: Security boundaries (third-party UI = untrusted)
+**Decision**:
+- `MAX_CONCURRENT_SESSIONS` config (default 10, 1 for VIEWER)
+- `users.auth_epoch` column already exists — increment on password change, session rotation,
+  or forced logout; invalidates all existing sessions
+- New `session_events` table: `{session_hash, event_type (created/rotated/expired/revoked/
+  step_up), ip_hash, user_agent_hash, created_at}` — append-only
+- Step-up auth: POST/PUT/DELETE on `/vault/*`, `/admin/*`, `/auth/rotate` require session
+  age < `STEP_UP_MAX_AGE` (default 5 minutes) or re-authentication
 
-- CSP enforced server-side; manifest CSP declarations are advisory only.
-- UI package WASM runs in the browser, NOT on the server. No server-side execution.
-- UI package has NO access to: DB credentials, sandbox socket, vault secrets, session tokens
-  (HttpOnly cookies), internal provider credentials.
-- ALL auth/RBAC decisions are server-side and authoritative.
-- UI package CANNOT: modify CSP, access `/api/v1/vault/*`, access `/api/v1/admin/*`, override
-  recovery UI routes.
-- Manifest `permissions` field is informational/metadata; actual enforcement is via
-  `ui_permission_level` on the profile and server-side auth.
-- CSP `connect-src` restricted to `public_origin` (the server itself) — UI cannot phone home.
+### AD-25.9: Centralized authorization for context retrieval
+
+**Rationale**: The roadmap explicitly requires context retrieval to pass through authorization.
+Currently `build_messages` in `run_api.rs` fetches books from the library without checking
+whether the agent is allowed to read each book.
+
+**Decision**: Before a book is included in context, `authorize(Actor::Agent{...}, Action::ContextRetrieve{book_ids}, Resource::Book(id), ...)` is called. The authorization engine checks:
+- Agent's declared permissions (`agents.permissions` JSONB)
+- Book's `security_classification` (PUBLIC/INTERNAL/CONFIDENTIAL/RESTRICTED)
+- Book's `scope` (GLOBAL/USER/PROFILE/WORKSPACE/CONVERSATION/AGENT/PRIVATE)
+- Workspace membership (for WORKSPACE-scoped books)
+
+Books the agent is not authorized to read are omitted from context with an audit log entry.
 
 ---
 
-## Data Model (Migration 0024)
+## Data Model (Migrations 0025+)
 
-### New migration file
-
-`crates/gobrowse-server/migrations/0024_ui_packages.sql`
+### Migration 0025: `auth_methods` + `session_events` + auth hardening schema
 
 ```sql
--- 0024_ui_packages.sql
--- Custom UI System: UI packages, assets, capabilities, profile permission level.
--- Schema 23 -> 24.
+-- 0025_auth_hardening.sql
+-- Schema 24 -> 25.
 
--- 1. UI permission level on profiles.
-ALTER TABLE profiles ADD COLUMN ui_permission_level text NOT NULL DEFAULT 'ASK'
-    CHECK (ui_permission_level IN ('DENY', 'ASK', 'ALLOW_WORKSPACE', 'ALLOW_GLOBAL'));
+-- 1. Auth methods (WebAuthn, OIDC, password tracking)
+CREATE TABLE auth_methods (
+    id uuid PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    method_type text NOT NULL CHECK (method_type IN ('password', 'webauthn', 'oidc')),
+    method_data jsonb NOT NULL,
+    label text,
+    is_primary boolean NOT NULL DEFAULT false,
+    last_used_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (user_id, method_type, label)
+);
 
--- 2. UI packages (analogous to plugins table).
-CREATE TABLE ui_packages (
+-- Backfill: existing password users get a password auth_method
+INSERT INTO auth_methods (id, user_id, method_type, method_data, label, is_primary, created_at)
+SELECT
+    gen_random_uuid(), id, 'password',
+    jsonb_build_object('hash', password_hash),
+    'Password', true, created_at
+FROM users
+ON CONFLICT DO NOTHING;
+
+-- 2. Session events (append-only session lifecycle audit)
+CREATE TABLE session_events (
+    id bigserial PRIMARY KEY,
+    session_hash bytea NOT NULL,
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_type text NOT NULL CHECK (event_type IN ('created','rotated','expired','revoked','step_up','login','logout')),
+    ip_hash bytea,
+    user_agent_hash bytea,
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX session_events_user_idx ON session_events (user_id, created_at DESC);
+CREATE INDEX session_events_session_idx ON session_events (session_hash, created_at);
+
+-- 3. User account lockout tracking
+ALTER TABLE users ADD COLUMN consecutive_failures integer NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN locked_until timestamptz;
+
+-- 4. Session revocation list (for forced logout)
+CREATE TABLE session_revocations (
+    token_hash bytea PRIMARY KEY,
+    user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    revoked_by uuid REFERENCES users(id) ON DELETE SET NULL,
+    reason text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX session_revocations_user_idx ON session_revocations (user_id, created_at DESC);
+
+-- 5. Step-up auth tracking
+ALTER TABLE sessions ADD COLUMN last_step_up_at timestamptz;
+
+UPDATE schema_metadata SET schema_version = 25, updated_at = now() WHERE singleton;
+```
+
+### Migration 0026: `approval_policies` + `authorization_policies`
+
+```sql
+-- 0026_authorization_policies.sql
+-- Schema 25 -> 26.
+
+-- 1. Approval/authorization policy rules
+CREATE TABLE authorization_policies (
     id uuid PRIMARY KEY,
     profile_id uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
-    workspace_id uuid REFERENCES workspaces(id) ON DELETE CASCADE,
-    name text NOT NULL CHECK (char_length(name) BETWEEN 1 AND 200),
-    version text NOT NULL CHECK (char_length(version) BETWEEN 1 AND 64),
-    ui_kind text NOT NULL CHECK (ui_kind IN ('THEME', 'FULL_UI')),
-    description text NOT NULL DEFAULT '',
-    source_type text NOT NULL CHECK (source_type IN ('github_release', 'local_package', 'marketplace')),
-    source_uri text NOT NULL,
-    manifest jsonb NOT NULL DEFAULT '{}'::jsonb,
-    artifact_digest text,
-    install_path text,
-    entry_point text,
-    api_version text NOT NULL DEFAULT 'v1',
-    state text NOT NULL DEFAULT 'discovered'
-        CHECK (state IN ('discovered','staged','validated','candidate','active','previous','failed','rolled_back')),
-    trust text NOT NULL DEFAULT 'UNTRUSTED'
-        CHECK (trust IN ('VERIFIED','USER_PROVIDED','AGENT_INFERRED','EXTERNAL','UNTRUSTED')),
+    priority integer NOT NULL CHECK (priority >= 0),
+    actor_kind text NOT NULL CHECK (actor_kind IN ('human','agent','plugin','mcp','sandbox','webhook','system')),
+    risk_class text CHECK (risk_class IS NULL OR risk_class IN ('read','write','execute','external_side_effect','destructive','admin')),
+    action_pattern text NOT NULL DEFAULT '*',  -- glob pattern for action
+    resource_type text CHECK (resource_type IS NULL OR resource_type IN (
+        'conversation','workspace','book','plugin','mcp_server','sandbox_workspace',
+        'secret','webhook','profile','audit_trail','system_config')),
+    decision text NOT NULL CHECK (decision IN ('ALLOW','ASK','DENY')),
+    reason text NOT NULL,
+    enabled boolean NOT NULL DEFAULT true,
+    scope text NOT NULL DEFAULT 'profile' CHECK (scope IN ('profile','workspace','agent','plugin','mcp_server','global')),
+    scope_id uuid,  -- FK target depends on scope
     created_by uuid REFERENCES users(id) ON DELETE SET NULL,
-    activated_by uuid REFERENCES users(id) ON DELETE SET NULL,
     created_at timestamptz NOT NULL DEFAULT now(),
-    updated_at timestamptz NOT NULL DEFAULT now(),
-    activated_at timestamptz,
-    UNIQUE (profile_id, name)
+    updated_at timestamptz NOT NULL DEFAULT now()
 );
+CREATE INDEX authorization_policies_profile_idx ON authorization_policies (profile_id, priority);
+CREATE INDEX authorization_policies_lookup_idx ON authorization_policies (profile_id, actor_kind, risk_class, enabled)
+    WHERE enabled = true;
 
--- Only one active UI package per profile at a time.
-CREATE UNIQUE INDEX ui_packages_one_active_per_profile
-    ON ui_packages (profile_id) WHERE state = 'active';
+-- 2. Default policies (shipped with migration)
+-- Single-user installs get empty policy table (OWNER = everything).
 
--- 3. Asset hashes for CSP computation.
-CREATE TABLE ui_package_assets (
+-- 3. Extend audit_events with authorization fields
+ALTER TABLE audit_events ADD COLUMN authorization_decision text;
+ALTER TABLE audit_events ADD COLUMN authorization_reason text;
+ALTER TABLE audit_events ADD COLUMN authorization_policy_id uuid;
+ALTER TABLE audit_events ADD COLUMN actor_kind text;
+ALTER TABLE audit_events ADD COLUMN actor_id text;
+ALTER TABLE audit_events ADD COLUMN resource_workspace_id uuid REFERENCES workspaces(id) ON DELETE SET NULL;
+
+CREATE INDEX audit_events_actor_idx ON audit_events (actor_kind, actor_id, created_at DESC);
+CREATE INDEX audit_events_decision_idx ON audit_events (authorization_decision, created_at DESC);
+
+UPDATE schema_metadata SET schema_version = 26, updated_at = now() WHERE singleton;
+```
+
+### Migration 0027: Agent permissions + workspace isolation hardening
+
+```sql
+-- 0027_agent_permissions_isolation.sql
+-- Schema 26 -> 27.
+
+-- 1. Agent permission allowlists (checked at tool dispatch)
+CREATE TABLE agent_tool_permissions (
     id uuid PRIMARY KEY,
-    ui_package_id uuid NOT NULL REFERENCES ui_packages(id) ON DELETE CASCADE,
-    file_path text NOT NULL,
-    content_type text NOT NULL,
-    sha256_hash text NOT NULL,
-    file_size bigint NOT NULL,
+    agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    tool_pattern text NOT NULL,  -- glob: 'sandbox_*', 'library_search', '*'
+    risk_class_limit text NOT NULL CHECK (risk_class_limit IN ('read','write','execute','external_side_effect','destructive','admin')),
+    workspace_id uuid REFERENCES workspaces(id) ON DELETE CASCADE,  -- NULL = all workspaces
     created_at timestamptz NOT NULL DEFAULT now(),
-    UNIQUE (ui_package_id, file_path)
+    UNIQUE (agent_id, tool_pattern, workspace_id)
 );
 
--- 4. Declared capabilities (from manifest, informational).
-CREATE TABLE ui_package_capabilities (
+-- 2. Agent secrets access
+CREATE TABLE agent_secret_permissions (
     id uuid PRIMARY KEY,
-    ui_package_id uuid NOT NULL REFERENCES ui_packages(id) ON DELETE CASCADE,
-    capability_name text NOT NULL,
-    min_api_version text,
-    UNIQUE (ui_package_id, capability_name)
+    agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    secret_id uuid NOT NULL REFERENCES secret_references(id) ON DELETE CASCADE,
+    purpose text NOT NULL,
+    max_uses integer,  -- NULL = unlimited
+    use_count integer NOT NULL DEFAULT 0,
+    expires_at timestamptz,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (agent_id, secret_id, purpose)
 );
 
--- 5. Indexes.
-CREATE INDEX ui_packages_profile_state_idx ON ui_packages (profile_id, state);
-CREATE INDEX ui_package_assets_package_idx ON ui_package_assets (ui_package_id);
+-- 3. Workspace isolation: resource_workspace_id on all resource tables
+-- (most already have workspace_id; this formalizes the audit trail)
+-- No schema changes needed — existing workspace_id columns are authoritative.
 
--- 6. Companion Book: add GOBROWSE_UI to books_kind_check.
---    SQLite-style: drop and recreate the constraint.
-ALTER TABLE books DROP CONSTRAINT IF EXISTS books_kind_check;
-ALTER TABLE books ADD CONSTRAINT books_kind_check
-    CHECK (kind IS NULL OR kind IN ('SOURCE','SKILL','MCP','PLUGIN','AUTOBIOGRAPHY','GOBROWSE_UI'));
+-- 4. Workspace-level authorization policies
+ALTER TABLE authorization_policies ADD CONSTRAINT authorization_policies_scope_check
+    CHECK (
+        (scope = 'workspace' AND scope_id IS NOT NULL) OR
+        (scope != 'workspace')
+    );
 
--- 7. Bump schema.
-UPDATE schema_metadata SET schema_version = 24, updated_at = now() WHERE singleton;
+UPDATE schema_metadata SET schema_version = 27, updated_at = now() WHERE singleton;
 ```
 
-### BookKind enum addition
+### Migration 0028: Secrets access audit + enterprise audit viewer schema
 
-In `gobrowse-core/src/library.rs`, add variant:
-```rust
-pub enum BookKind {
-    Source,
-    Skill,
-    Mcp,
-    Plugin,
-    Autobiography,
-    /// Custom UI package (M24b).
-    GobrowseUi,
-}
+```sql
+-- 0028_secrets_audit_enterprise.sql
+-- Schema 27 -> 28.
+
+-- 1. Secret access log (append-only, separate from audit_events for volume)
+CREATE TABLE secret_access_log (
+    id bigserial PRIMARY KEY,
+    secret_id uuid NOT NULL REFERENCES secret_references(id) ON DELETE CASCADE,
+    actor_kind text NOT NULL,
+    actor_id text NOT NULL,
+    profile_id uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    purpose text NOT NULL,
+    access_type text NOT NULL CHECK (access_type IN ('resolve','create','rotate','delete','denied')),
+    authorization_decision text NOT NULL CHECK (authorization_decision IN ('ALLOW','DENY')),
+    ip_address inet,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX secret_access_log_secret_idx ON secret_access_log (secret_id, created_at DESC);
+CREATE INDEX secret_access_log_profile_idx ON secret_access_log (profile_id, created_at DESC);
+
+-- Make the table append-only
+CREATE OR REPLACE FUNCTION reject_secret_access_mutation()
+RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'secret_access_log is append-only';
+END; $$;
+
+CREATE TRIGGER secret_access_log_append_only
+    BEFORE UPDATE OR DELETE OR TRUNCATE ON secret_access_log
+    FOR EACH STATEMENT EXECUTE FUNCTION reject_secret_access_mutation();
+
+-- 2. Audit retention policy
+ALTER TABLE audit_events ADD COLUMN retention_policy text NOT NULL DEFAULT 'permanent'
+    CHECK (retention_policy IN ('permanent', '7_years', '1_year', '90_days'));
+CREATE INDEX audit_events_retention_idx ON audit_events (retention_policy, created_at);
+
+UPDATE schema_metadata SET schema_version = 28, updated_at = now() WHERE singleton;
 ```
 
-The `serde(rename_all = "SCREAMING_SNAKE_CASE")` derives the wire/DB value `GOBROWSE_UI`.
+---
 
-### FeatureSettings addition
+## Central Authorization Flow
 
-In `crates/gobrowse-server/src/config.rs`:
-```rust
-pub struct FeatureSettings {
-    // ... existing fields ...
-    /// Root directory for UI package artifacts.
-    #[serde(default = "default_ui_packages_dir")]
-    pub ui_packages_dir: PathBuf,
-}
-
-fn default_ui_packages_dir() -> PathBuf {
-    PathBuf::from("./data/ui-packages")
-}
+```mermaid
+flowchart TD
+    Request["Incoming request\n(HTTP / tool call / MCP / sandbox)"] --> ExtractActor["Extract Actor\n(headers, session, run context)"]
+    ExtractActor --> SingleUser{"is_single_user_mode?"}
+    SingleUser -->|yes, internal| AllowSU["ALLOW\n(reason: single_user_mode)"]
+    SingleUser -->|no or external| BuildAction["Build Action + Resource\n(from request params)"]
+    BuildAction --> CheckCache{"Policy cache hit?"}
+    CheckCache -->|yes| CachedDecision["Use cached decision"]
+    CheckCache -->|no| QueryPolicies["Query authorization_policies\nORDER BY priority"]
+    QueryPolicies --> MatchPattern{"Pattern match\nactor_kind + risk_class + action + resource_type"}
+    MatchPattern -->|no match| MatrixDefault["Use permission matrix default"]
+    MatchPattern -->|matched| EffectiveDecision["decision ∩ matrix_default"]
+    CachedDecision --> Audit
+    MatrixDefault --> Audit
+    EffectiveDecision --> Audit
+    Audit["Write audit_events row\n(actor, action, resource, decision, reason, policy_id)"]
+    Audit --> Decision{"Decision?"}
+    Decision -->|ALLOW| Proceed["Proceed to handler"]
+    Decision -->|ASK| CreateApproval["Create approval request\nnotify user"]
+    Decision -->|DENY| Reject["Return 403 Forbidden\nwith reason"]
+    CreateApproval --> Pending["Await user decision\n(timeout → DENY)"]
+    Pending -->|approved| Proceed
+    Pending -->|denied/timeout| Reject
 ```
+
+**Plain-text summary**:
+
+1. Every request extracts an `Actor` from the authentication context (session, run, plugin
+   identity, MCP server identity).
+2. If single-user mode (one OWNER, one profile, ≤1 workspace) and the actor is internal
+   (human/agent/system), short-circuit to ALLOW — no policy queries, no approvals.
+3. For multi-user mode or external actors, build an `Action` + `Resource` from the request.
+4. Query `authorization_policies` ordered by priority. First matching policy (by
+   `actor_kind`, `risk_class`, `action_pattern`, `resource_type`, `scope`) determines the
+   decision.
+5. The permission matrix provides a hard ceiling: even if a policy says ALLOW, the matrix
+   default for that (actor_kind, action) tuple cannot be exceeded.
+6. Write an `audit_events` row with the decision, reason, policy_id, actor_kind, actor_id.
+7. ALLOW → proceed. ASK → create approval, notify user, block until decision. DENY → 403.
+8. Policy cache in `AppState` (reloaded via `POST /api/v1/admin/policies/reload` or on
+   policy mutation). Cache is an `Arc<RwLock<HashMap<(ActorKind, RiskClass, String), Decision>>>`.
+
+---
+
+## Permission Matrix (defaults)
+
+Defaults are compiled constants. Policy rules can restrict (never expand) these.
+
+| Actor | Action | Default | Notes |
+|-------|--------|---------|-------|
+| **Human (OWNER)** | All | ALLOW | Single-user: all ALLOW. Multi-user: OWNER = all ALLOW on own profile. |
+| **Human (ADMIN)** | All (own profile) | ALLOW | Can manage users, workspaces. Cannot access other profiles unless shared. |
+| **Human (MEMBER)** | Read (own workspace) | ALLOW | Can read conversations, books, sandbox in own workspace. |
+| **Human (MEMBER)** | Write/Create (own workspace) | ASK | Create/update requires approval from OWNER/ADMIN. |
+| **Human (MEMBER)** | Delete, Execute (destructive) | DENY | Cannot delete workspace resources or execute destructive tools. |
+| **Human (VIEWER)** | Read (own workspace) | ALLOW | Read-only on assigned workspaces. |
+| **Human (VIEWER)** | Write/Create/Delete/Execute | DENY | No mutations. |
+| **Agent** | Read (library, context) | ALLOW | Agent can read books the user can read. |
+| **Agent** | Execute (read tools) | ALLOW | library_search, library_load, sandbox_read_file, etc. |
+| **Agent** | Execute (write tools) | ASK | library_add, sandbox_exec, terminal_* — requires per-tool approval. |
+| **Agent** | Execute (destructive) | DENY | sandbox_remove, process_kill — blocked by default. |
+| **Agent** | Create (conversation, book) | ASK | Agent creates content → user approves. |
+| **Agent** | Delete | DENY | Agents never delete. |
+| **Agent** | ContextRetrieve | ALLOW | Filtered by book scope + security_classification. |
+| **Agent** | AccessSecret | DENY | Agents never access raw secrets. Tool auth via vault injection only. |
+| **Plugin** | Read (filesystem) | ASK | Plugin declares `filesystem_read` at install; runtime access requires approval. |
+| **Plugin** | Write (filesystem) | ASK | Scope-limited to declared paths. |
+| **Plugin** | Network | ASK | Restricted to declared `host:port` pairs. |
+| **Plugin** | Secrets | DENY | Plugins never access raw secrets. |
+| **Plugin** | Subprocess/Admin | DENY | Blocked. |
+| **MCP** | Tool call | ASK | Per-server approval policy; first tool call requires approval. |
+| **MCP** | OAuth token refresh | ALLOW | Automatic; audited. |
+| **Sandbox** | Exec (read-only) | ALLOW | ls, cat, stat, git log. |
+| **Sandbox** | Exec (network) | ASK | curl, git fetch — requires network policy = FULL. |
+| **Sandbox** | Exec (write/destructive) | ASK | rm, git push, process kill. |
+| **Webhook** | Deliver | ALLOW | HMAC-verified, SSRF-checked. Audited. |
+| **System** | Maintenance | ALLOW | Migrations, health checks, CSP header injection. |
+
+---
+
+## Approval Policy Model
+
+### Lifecycle
+
+```
+Trigger (ASK decision)
+    → Create approval_request row
+    → Notify user (SSE / run event / webhook)
+    → User decides: approve / deny
+    → If timeout (configurable, default 5 min): auto-deny
+    → Decision recorded in approval_request + audit_events
+```
+
+### New `approval_requests` table (replaces the existing `approvals` table)
+
+```sql
+CREATE TABLE approval_requests (
+    id uuid PRIMARY KEY,
+    profile_id uuid NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+    actor_kind text NOT NULL,
+    actor_id text NOT NULL,
+    action text NOT NULL,
+    resource_type text NOT NULL,
+    resource_id text,
+    risk_class text,
+    reason text NOT NULL,
+    policy_id uuid REFERENCES authorization_policies(id) ON DELETE SET NULL,
+    status text NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','approved','denied','expired','canceled')),
+    decided_by uuid REFERENCES users(id) ON DELETE SET NULL,
+    decided_at timestamptz,
+    expires_at timestamptz NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    metadata jsonb NOT NULL DEFAULT '{}'::jsonb
+);
+CREATE INDEX approval_requests_profile_status_idx ON approval_requests (profile_id, status, created_at DESC);
+```
+
+The existing `approvals` table (tied to `tool_call_id`) is deprecated and migrated.
+
+### Approval UX
+
+- **SSE/WebSocket push**: `run_events` with `event_type = 'approval_required'` and payload
+  `{approval_id, action, resource, reason, expires_at}`.
+- **UI**: Approval prompt rendered by the frontend as an actionable card (designer agent
+  for UI details).
+- **API**: `POST /api/v1/approvals/{id}/approve` and `POST /api/v1/approvals/{id}/deny`
+  with optional `reason` in body.
+- **API**: `GET /api/v1/approvals?status=pending` lists pending approvals for the user.
+
+---
+
+## Secrets Protection
+
+### Current state (M24b)
+
+Secrets are envelope-encrypted (AES-256-GCM) with an external master key. The vault
+resolves secrets by purpose (e.g., `mcp_oauth_access_token`). Access is gated by
+profile_id + secret_id. No per-read audit trail.
+
+### M25b hardening
+
+1. **Secret access goes through `authorize()`**: Every `Vault::resolve()` call checks
+   `authorize(actor, Action::AccessSecret{secret_id, purpose}, Resource::Secret(secret_id), ...)`.
+2. **Secret access logged**: Every resolve/create/rotate/delete writes a `secret_access_log`
+   row (migration 0028).
+3. **Agent secret access**: Agents never resolve secrets directly. Tool auth tokens are
+   injected by the server at tool dispatch time (vault injection, not agent resolution).
+   `agent_secret_permissions` table (migration 0027) controls which secrets an agent's
+   tools can use — the agent itself never sees the raw value.
+4. **Plugin secret access**: Plugins declare `secrets` permission domain at install time
+   with scope values that are vault secret reference IDs (never values). Runtime access
+   requires approval (ASK) and is audited.
+5. **Step-up auth for vault management**: `POST/PUT/DELETE /api/v1/vault/*` requires
+   `last_step_up_at < STEP_UP_MAX_AGE` (5 min) or re-authentication.
+
+---
+
+## Multi-User/Workspace Isolation
+
+### Current state (M24b)
+
+Workspace isolation is enforced at the SQL query level: every query filters by
+`workspace_id` (or `profile_id`) based on the authenticated user's memberships.
+Composite foreign keys enforce same-workspace references (migration 0010).
+
+### M25b hardening
+
+1. **All resource access goes through `authorize()`**: The authorization function checks
+   workspace membership for workspace-scoped resources. Opaque IDs are not authorization.
+2. **Cross-workspace access requires explicit policy**: By default, users can only access
+   resources in their own workspaces. Cross-workspace sharing requires an explicit
+   `authorization_policies` row or workspace membership.
+3. **Agent workspace scoping**: Agents inherit the workspace scope of their parent run.
+   An agent in workspace A cannot access workspace B's books, sandbox, or secrets.
+4. **Plugin workspace scoping**: Workspace-scoped plugins (migration 0020,
+   `plugins.workspace_id`) can only access that workspace's resources.
+5. **MCP server isolation**: MCP servers are profile-scoped. Tool calls from an MCP server
+   are authorized against the profile's policies.
+
+---
+
+## Enterprise Audit
+
+### API
+
+- `GET /api/v1/admin/audit?profile_id=&actor_kind=&actor_id=&action=&resource_type=&decision=&after=&before=&limit=` — requires ADMIN+ role.
+- `GET /api/v1/admin/audit/export?format=csv|json&after=&before=` — export for SIEM integration.
+- `GET /api/v1/admin/audit/summary?profile_id=&days=30` — summary: action counts by decision, top actors, policy effectiveness.
+
+### Retention
+
+- `audit_events.retention_policy` (migration 0028): `'permanent'` by default. Configurable
+  per profile to `'7_years'`, `'1_year'`, `'90_days'`.
+- A background task (configurable cron) deletes rows beyond the retention window.
+
+### Attribution guarantee
+
+Every `audit_events` row includes:
+- `actor_kind` + `actor_id`: who performed the action
+- `action` + `resource_type` + `resource_id`: what was done to what
+- `authorization_decision` + `authorization_reason`: what the authz engine decided and why
+- `authorization_policy_id`: which policy rule matched (traceability)
+- `request_id`: correlation ID for tracing across services
+- `profile_id` + `resource_workspace_id`: tenant + workspace scope
 
 ---
 
 ## API Changes
 
-### New endpoints
+### M25a new/modified endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/api/v1/capabilities` | None | Capability discovery. Always available. |
-| `POST` | `/api/v1/ui/preview` | User/Run | Preview/validate a UI package (no install). |
-| `POST` | `/api/v1/ui/install` | User/Run | Install with approve + digest verification. |
-| `GET` | `/api/v1/ui/packages` | User/Run | List UI packages for profile. |
-| `GET` | `/api/v1/ui/packages/{id}` | User/Run | Get package details + assets. |
-| `PATCH` | `/api/v1/ui/packages/{id}` | User | Update trust/state (admin action). |
-| `POST` | `/api/v1/ui/packages/{id}/activate` | User/Run | Activate (may require approval). |
-| `POST` | `/api/v1/ui/packages/{id}/approve` | User | Approve a pending activation. |
-| `POST` | `/api/v1/ui/packages/{id}/rollback` | User | Rollback to PREVIOUS. |
-| `DELETE` | `/api/v1/ui/packages/{id}` | User | Uninstall (rejects active/last-known-good). |
+| `GET` | `/api/v1/auth/methods` | User | List linked auth methods. |
+| `POST` | `/api/v1/auth/methods/webauthn/register` | User | Start WebAuthn registration (returns challenge). |
+| `POST` | `/api/v1/auth/methods/webauthn/complete` | User | Complete WebAuthn registration (verify attestation). |
+| `POST` | `/api/v1/auth/methods/webauthn/login` | None | Start WebAuthn login (returns challenge). |
+| `POST` | `/api/v1/auth/methods/webauthn/login/complete` | None | Complete WebAuthn login (verify assertion). |
+| `POST` | `/api/v1/auth/methods/oidc/start` | None | Start OIDC flow (returns redirect URL). |
+| `GET` | `/api/v1/auth/methods/oidc/callback` | None | OIDC callback (exchanges code for tokens). |
+| `DELETE` | `/api/v1/auth/methods/{id}` | User | Remove an auth method (cannot remove last). |
+| `POST` | `/api/v1/auth/sessions/revoke` | User | Revoke all other sessions. |
+| `GET` | `/api/v1/auth/sessions` | User | List active sessions with device info. |
+| `POST` | `/api/v1/auth/sessions/{hash}/revoke` | User | Revoke a specific session. |
+| `POST` | `/api/v1/auth/step-up` | User | Re-authenticate for sensitive operations. |
 
-### Server-side recovery route
+### M25b new/modified endpoints
 
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
-| `GET` | `/recovery` | None | Recovery UI SPA (login page if no session). |
-| `GET` | `/recovery/*` | None | Recovery UI static assets. |
+| `GET` | `/api/v1/admin/policies` | ADMIN+ | List authorization policies. |
+| `POST` | `/api/v1/admin/policies` | ADMIN+ | Create authorization policy. |
+| `PATCH` | `/api/v1/admin/policies/{id}` | ADMIN+ | Update authorization policy. |
+| `DELETE` | `/api/v1/admin/policies/{id}` | ADMIN+ | Delete authorization policy. |
+| `POST` | `/api/v1/admin/policies/reload` | ADMIN+ | Reload policy cache. |
+| `GET` | `/api/v1/approvals` | User | List pending/completed approvals. |
+| `GET` | `/api/v1/approvals/{id}` | User | Get approval details. |
+| `POST` | `/api/v1/approvals/{id}/approve` | User | Approve a pending approval. |
+| `POST` | `/api/v1/approvals/{id}/deny` | User | Deny a pending approval. |
+| `GET` | `/api/v1/admin/audit` | ADMIN+ | Query audit trail. |
+| `GET` | `/api/v1/admin/audit/export` | ADMIN+ | Export audit trail. |
+| `GET` | `/api/v1/admin/audit/summary` | ADMIN+ | Audit summary statistics. |
+| `GET` | `/api/v1/admin/secret-access` | ADMIN+ | Query secret access log. |
 
-### Modified static serving logic
+### Modified existing endpoints
 
-`router()` in `lib.rs` must change to serve the active UI package when one is set:
-
-```
-if active_ui_package is FULL_UI and state = 'active':
-    ServeDir::new(active_ui_package.install_path).fallback(ServeFile::new(entry_point))
-else if active_ui_package is THEME:
-    ServeDir::new(builtin_dist) with injected theme.css overlay
-else:
-    ServeDir::new(builtin_dist).fallback(ServeFile::new("index.html"))
-```
-
-This requires `AppState` to hold a cached reference to the active UI package (reloaded on
-activation/rollback). Use an `Arc<RwLock<Option<ActiveUiState>>>`.
+- All existing endpoints: middleware injects `authorize()` call before handler dispatch.
+  No API signature changes — authorization is transparent.
+- `GET /api/v1/capabilities`: add `auth.methods` field listing supported methods
+  (`["password", "webauthn", "oidc"]`).
+- `GET /api/v1/auth/me`: add `auth_methods_count` field.
+- `POST /api/v1/auth/login`: rate-limit hardening (IP-based + global limits).
+- `POST /api/v1/vault/secrets`: requires step-up auth or recent re-auth.
 
 ---
 
@@ -569,43 +718,31 @@ activation/rollback). Use an `Arc<RwLock<Option<ActiveUiState>>>`.
 
 | Module | File | Responsibility |
 |--------|------|----------------|
-| `ui_api` | `crates/gobrowse-server/src/ui_api.rs` | UI package CRUD, preview, install, activate, rollback, approval. |
-| `csp` | `crates/gobrowse-server/src/csp.rs` | CSP header computation and middleware. |
-| `capabilities_api` | `crates/gobrowse-server/src/capabilities_api.rs` | `GET /api/v1/capabilities` response builder. |
+| `authorize` | `crates/gobrowse-server/src/authorize.rs` | Centralized authorization engine: `authorize()`, permission matrix, policy evaluation, single-user-mode detection. |
+| `webauthn` | `crates/gobrowse-server/src/webauthn.rs` | WebAuthn registration + login: challenge generation, attestation/assertion verification, credential storage. |
+| `oidc` | `crates/gobrowse-server/src/oidc.rs` | OIDC Authorization Code Flow with PKCE: discovery, redirect, token exchange, userinfo, account linking. |
+| `session_manager` | `crates/gobrowse-server/src/session_manager.rs` | Session lifecycle management: creation, rotation, revocation, concurrent limits, step-up tracking, session events. |
+| `approval_api` | `crates/gobrowse-server/src/approval_api.rs` | Approval request CRUD, approve/deny handlers, notification dispatch. |
+| `admin_api` | `crates/gobrowse-server/src/admin_api.rs` | Admin endpoints: policy management, audit query/export, secret access log. |
+| `rate_limiter` | `crates/gobrowse-server/src/rate_limiter.rs` | Multi-dimensional rate limiting (per-IP, per-email, global) using sliding window counters. |
 
 ### Modified modules
 
 | Module | Change |
 |--------|--------|
-| `lib.rs` | Add `ActiveUiState`, `ui_packages_dir` to `AppState`; add UI + recovery routes; inject CSP middleware; modify SPA fallback logic. |
-| `config.rs` | Add `ui_packages_dir` to `FeatureSettings`. |
-| `main.rs` | Create `ui_packages_dir` on startup. |
-| `api.rs` | No changes (capabilities is a separate module). |
-| `auth.rs` | Add `require_user_or_run` helper for UI endpoints. |
-
-### ActiveUiState
-
-```rust
-#[derive(Clone)]
-pub struct ActiveUiState {
-    pub package_id: Uuid,
-    pub ui_kind: UiKind,        // THEME or FULL_UI
-    pub install_path: PathBuf,  // disk path for FULL_UI assets
-    pub entry_point: String,    // relative path to index.html
-    pub assets: Vec<UiAsset>,   // for CSP
-    pub theme_variables: Option<HashMap<String, String>>, // for THEME
-}
-
-#[derive(Clone)]
-pub struct UiAsset {
-    pub file_path: String,
-    pub content_type: String,
-    pub sha256_hash: String,
-}
-```
-
-`ActiveUiState` is loaded from DB on server startup and updated on activation/rollback.
-Stored in `AppState` as `Arc<RwLock<Option<ActiveUiState>>>`.
+| `auth.rs` | Add WebAuthn/OIDC login handlers, `auth_methods` CRUD, session listing/revocation, step-up auth, enhanced rate limiting. `require_user_or_run` → delegates to `authorize()`. |
+| `lib.rs` | Add `auth_policy_cache: Arc<RwLock<PolicyCache>>` to `AppState`. Add authorization middleware layer. |
+| `config.rs` | Add `WebAuthnSettings`, `OidcSettings`, `RateLimitSettings`, `SessionSettings` to `Settings`. |
+| `run_api.rs` | Replace ad-hoc `risk_class_for_tool` with `authorize()` call. Add `RiskClass` mapping for every tool (not just read/write). Context retrieval passes through `authorize()`. |
+| `plugin_api.rs` | Runtime permission enforcement via `authorize()` (not just install-time `validate_permissions`). Plugin sandbox op authorization. |
+| `mcp_client.rs` | Tool dispatch passes through `authorize()`. OAuth refresh audited. |
+| `sandbox_client.rs` / `sandbox_api.rs` | Sandbox operations pass through `authorize()`. |
+| `library_api.rs` | Book access checks via `authorize()` when scope/classification restricts. |
+| `vault.rs` / `vault_api.rs` | Secret access passes through `authorize()` + `secret_access_log`. Step-up auth required for mutations. |
+| `webhooks.rs` | Webhook delivery authorization. |
+| `outbound_http.rs` | No changes (SSRF checks are network-layer, not authz). |
+| `csp.rs` | No changes. |
+| `ui_api.rs` | No changes. |
 
 ---
 
@@ -613,432 +750,427 @@ Stored in `AppState` as `Arc<RwLock<Option<ActiveUiState>>>`.
 
 ### `gobrowse-web` changes
 
-- New `Page::UiPackages` variant for the side navigation.
-- New `UiPackagesPage` component:
-  - List installed UI packages with state, version, kind, trust.
-  - Activate button (with confirmation for FULL_UI packages).
-  - Rollback button (to PREVIOUS).
-  - Delete button (disabled for active and last-known-good).
-  - Install form: source URI + version + workspace selection.
-  - Preview/details view showing manifest, capabilities, asset list.
-- CSP awareness: the existing app MUST work with a restrictive CSP (no inline scripts,
-  hash-verified WASM). This is already the case — Leptos uses wasm-bindgen and doesn't
-  inject inline scripts.
-- Theme loading: if active UI package is THEME kind, the app loads theme CSS variables
-  by fetching `/api/v1/ui/packages/{id}/theme.css` (new endpoint that returns the CSS
-  override).
+All UI for M25a/M25b enterprise features MUST be routed to the designer agent (frontend-design skill).
+The following pages/components are REQUIRED but their internal design is NOT specified here:
 
-### `gobrowse-recovery` (new crate)
+1. **Auth Methods page**: List linked methods (password, passkeys, OIDC providers). Add/remove methods. Set primary method.
+2. **WebAuthn registration flow**: Guided passkey creation with platform/browser prompts.
+3. **OIDC login flow**: Redirect to provider, callback handling, account linking.
+4. **Sessions page**: List active sessions with device/browser info. Revoke individual or all other sessions.
+5. **Step-up auth modal**: Re-authentication prompt for sensitive operations.
+6. **Approval center**: Inbox of pending approvals with approve/deny buttons. Approval history.
+7. **Policy editor (admin)**: CRUD interface for authorization policies. Priority ordering, drag-to-reorder.
+8. **Audit viewer (admin)**: Queryable audit trail with filters (actor, action, resource, decision, date range). Export button.
+9. **Secret access log (admin)**: Queryable log of secret access events.
 
-- `crates/gobrowse-recovery/` — minimal Leptos SPA.
-- Separate `Cargo.toml` with `leptos`, `gloo-net`, `serde`, `serde_json`, `wasm-bindgen`.
-- No dependency on `gobrowse-core` or `gobrowse-server` — self-contained.
-- Pages:
-  - **Login**: same auth flow as main app (`POST /api/v1/auth/login`).
-  - **UI Packages**: list + activate + rollback + delete (same API as main app).
-  - **Restore Built-in**: one-click button that rolls back to built-in UI
-    (deactivates all packages, sets active to NULL).
-  - **Diagnostics**: shows server version, schema version, active UI info.
-- Styling: inline `<style>` block (no external CSS), minimal but readable.
-- Compiled via Trunk to `dist-recovery/`, installed at `/app/recovery/` in Docker image.
-- HTML `index.html` includes CSP meta tag as fallback, plus a `<noscript>` message.
+### `gobrowse-recovery` changes
 
-### UI-SDK.md (deliverable, not code)
-
-Stored at `docs/UI-SDK.md`. Contents:
-- Architecture overview: backend APIs, CSP model, security boundaries.
-- Manifest schema reference (full JSON schema).
-- THEME tutorial: how to create a theme package.
-- FULL_UI tutorial: how to scaffold a Leptos UI package.
-- Build/packaging commands.
-- Capabilities endpoint reference.
-- Testing/validation workflow.
-- Agent workflow: clone → edit → build → preview → request activation.
+- Add WebAuthn/OIDC login options to recovery login page.
+- Add "Revoke all sessions" button (break-glass).
 
 ---
 
 ## Security Requirements
 
-### CSP enforcement (server-authoritative)
+### Auth hardening (M25a)
 
-1. Every response serving UI assets (FULL_UI or built-in) MUST include a `Content-Security-Policy`
-   header computed from `ui_package_assets` hashes.
-2. `script-src`: only hash-verified sources. Never `'unsafe-inline'` or `'unsafe-eval'`.
-3. `style-src`: hash-verified for FULL_UI, `'self'` + hash for built-in with THEME overlay.
-4. `connect-src`: restricted to `public_origin` only.
-5. `frame-ancestors: 'none'` — prevents clickjacking.
-6. Recovery UI has its own CSP (computed from recovery WASM hash).
+1. WebAuthn: `attestation=none` (no hardware attestation — simplicity and privacy). RP ID from `public_origin`. User verification `preferred`. Resident key `preferred` (passkey).
+2. OIDC: Authorization Code Flow with PKCE (S256). State parameter with HMAC. `nonce` in ID token. Claims verified: `iss`, `aud`, `exp`, `iat`, `sub`, `nonce`. No implicit flow.
+3. Rate limiting: per-email (existing, 5/300s), per-IP (new, 20/300s), global (new, 100/60s per endpoint). Account lockout after 10 consecutive failures (30-minute lock).
+4. CSRF: extend `origin_guard` with Fetch Metadata checks. Add `SameSite=Strict` on session cookie (already `__Host-` prefix implies Secure+Path=/).
+5. Session rotation: on login (always), on role change (always), on password change (always), on sensitive operation (step-up). Increment `auth_epoch` on rotation.
+6. Session hardening: max idle 60 min, max absolute 24 h, max concurrent 10 (OWNER) / 5 (ADMIN) / 3 (MEMBER) / 1 (VIEWER). Idle timeout resets on activity.
 
-### Permission enforcement
+### Enterprise authorization (M25b)
 
-1. `DENY`: All mutating UI endpoints return `403 Forbidden` for non-OWNER callers.
-2. `ASK`: Agent-initiated activation returns `202 Accepted` with `approval_required: true`.
-   Activation completes only after user posts to `/approve`.
-3. `ALLOW_WORKSPACE`: Workspace-scoped packages (with `workspace_id` matching the agent's
-   workspace) auto-activate. Global packages require approval.
-4. `ALLOW_GLOBAL`: All packages auto-activate. Setting this level requires OWNER/ADMIN role;
-   audit-logged.
+1. Every resource access MUST go through `authorize()`. No direct DB queries that bypass authorization.
+2. Every authorization decision MUST be audited (actor, action, resource, decision, reason, policy_id).
+3. Agent tool dispatch MUST check `agent_tool_permissions` before execution. No default-allow for unknown tools.
+4. Context retrieval MUST filter out books the agent cannot read (by scope + classification).
+5. Secret access MUST be logged and step-up authenticated.
+6. Approval timeouts MUST be enforced (default 5 min, configurable). Expired approvals auto-deny.
+7. Policy cache MUST be invalidated on policy mutation. Stale cache window ≤ 1 second.
+8. Single-user mode MUST NOT bypass plugin/MCP/sandbox authorization (external actors always checked).
 
-### Digest verification
+### No regressions
 
-1. `POST /api/v1/ui/preview` downloads the source archive, extracts the manifest, computes
-   SHA-256 of the archive, returns digest + manifest.
-2. `POST /api/v1/ui/install` requires `expected_digest` matching the preview. Server
-   re-downloads, re-computes, rejects on mismatch (TOCTOU protection).
-3. Asset hashes in `ui_package_assets` are computed from extracted files, not from the
-   manifest (which could lie).
-
-### Agent guard
-
-1. Agent run context is identified via `require_user_or_run` — agent calls carry run-scoped
-   auth, not session cookies.
-2. Agent UI edits are NEVER silently activated. The `activate` endpoint checks
-   `ui_permission_level` and may require approval.
-3. Agent approval flow: activation creates a `ui_activation_request` row; user receives a
-   notification in the run events; user clicks approve/deny; the run loop's tool result
-   reflects the outcome.
+1. CSP stays strict (no unsafe-inline, no unsafe-eval).
+2. HttpOnly + Secure + SameSite=Strict session cookies preserved.
+3. Origin guard + Fetch Metadata checks preserved.
+4. Digest-verified artifacts (plugins, UI packages) preserved.
+5. Server-side auth always authoritative — no client-side claims trusted.
+6. No AI automatic elevation — agent approval required for ASK decisions.
+7. Wasm builds still `wasm-opt -Oz --enable-bulk-memory`.
+8. Docker image still minimal (debian:bookworm-slim + ca-certificates, no curl/git).
 
 ---
 
 ## Concurrency Requirements
 
-1. **Activation serialization**: `SELECT ... FOR UPDATE` on the `ui_packages` row being
-   activated, plus the currently-active row. This prevents race between two concurrent
-   activations.
-2. **Single active invariant**: enforced by the unique partial index
-   `ui_packages_one_active_per_profile`. Database layer, not application-level.
-3. **CSP hash refresh**: after activation, `ActiveUiState` is updated atomically via
-   `RwLock::write()`. New requests pick up the new CSP immediately.
-4. **Install concurrency**: two installs of the same name are serialized by the
-   `UNIQUE(profile_id, name)` constraint. Concurrent installs of different names are
-   independent.
-
----
-
-## Tests Required
-
-### Integration tests (new file: `tests/ui_packages_integration.rs`)
-
-| Test | What it verifies |
-|------|-----------------|
-| `preview_valid_ui_package` | Preview downloads, parses manifest, returns digest. |
-| `preview_invalid_manifest_rejects` | Broken manifest returns validation error. |
-| `install_requires_matching_digest` | Digest mismatch rejects install. |
-| `install_requires_approve` | `approve: false` rejects. |
-| `install_creates_companion_book` | Companion Book created with kind=GOBROWSE_UI. |
-| `activate_sets_active_and_previous` | Activation transitions states correctly. |
-| `activate_requires_approval_in_ask_mode` | ASK mode blocks agent activation. |
-| `activate_allows_workspace_scoped` | ALLOW_WORKSPACE permits workspace packages. |
-| `rollback_restores_previous` | Rollback swaps back to PREVIOUS. |
-| `delete_rejects_active` | Cannot delete active package. |
-| `delete_rejects_last_known_good` | Cannot delete only remaining package. |
-| `csp_header_present_on_ui_assets` | Responses include computed CSP. |
-| `csp_header_no_unsafe_inline` | CSP never contains unsafe-inline. |
-| `capabilities_endpoint_returns_tools` | GET /capabilities lists tools from AppState. |
-| `capabilities_endpoint_no_auth_required` | Unauthenticated access works. |
-| `recovery_ui_accessible` | GET /recovery returns recovery page. |
-| `recovery_ui_no_auth_required` | Recovery accessible without session. |
-| `schema_24_migration_applies` | Migration runs and schema_version = 24. |
-
-### Unit tests (in `ui_api.rs`)
-
-- Manifest validation: required fields, version format, ui_kind constraints.
-- State machine transitions: all valid and invalid transitions.
-- CSP header builder: correct format, hash ordering, no unsafe-inline.
-- Theme CSS generation: variable injection.
-
----
-
-## Deployment Considerations
-
-1. **Recovery UI in Docker image**: `crates/gobrowse-recovery/` compiled to WASM and placed at
-   `/app/recovery/` in the `Dockerfile` runtime stage. This adds a build dependency (Trunk)
-   to the Docker build but no runtime dependency.
-2. **UI packages directory**: `data/ui-packages` on the persistent volume, same pattern as
-   `data/plugins`. Created at startup via `tokio::fs::create_dir_all`.
-3. **Backward compatibility**: Existing profiles with no `ui_permission_level` get the
-   default `'ASK'`. No UI packages exist, so active UI is `BUILT_IN`. No behavioral change
-   for existing deployments.
-4. **Static asset serving change**: The `router()` function's SPA fallback now checks
-   `ActiveUiState`. When no custom UI is active, behavior is identical to current.
-5. **CSP for built-in UI**: When no custom UI is active, inject a CSP based on the built-in
-   WASM hash. This is a tightening — previously no CSP was sent. This MUST NOT break the
-   existing frontend. The built-in Leptos app already avoids inline scripts; CSP should be
-   compatible. If the existing app uses any inline style attributes, those must be replaced
-   with CSS classes (hash-verified style-src doesn't allow inline styles).
-
-6. **Schema version bump to 24**: Update assertions in:
-   - `postgres_integration.rs:42` (currently asserts `== 23`)
-   - `worktrees_integration.rs:50` (currently asserts `== 23`)
+1. **Policy cache**: `Arc<RwLock<HashMap<PolicyKey, CachedDecision>>>` with `RwLock::read()` for
+   authorization checks (hot path) and `RwLock::write()` for cache reload. No per-request locking
+   beyond the read guard.
+2. **Rate limiting**: sliding window counters in memory with `tokio::sync::Mutex` per bucket.
+   Counters expire after window elapses. No DB queries on the hot path.
+3. **Session revocation**: `session_revocations` table checked on every session validation.
+   Revoked sessions immediately invalid. Concurrent revocations are idempotent.
+4. **Approval serialization**: `SELECT ... FOR UPDATE` on `approval_requests` row during
+   approve/deny. Prevents double-processing.
+5. **Audit append**: existing append-only triggers prevent any concurrent modification.
+   New `authorization_decision` columns are write-once (set at INSERT, never updated).
 
 ---
 
 ## Ordered Implementation Steps (Batches)
 
-Each batch is self-contained, buildable, and verifiable. Sized for one cheaper-coder agent.
+### M25a Batch 1: Auth method infrastructure + rate limiter
 
-### Batch 1: Data model + migration (schema 24)
+**Schema**: Migration 0025 (auth_methods, session_events, session_revocations, user lockout).
 
 **Files**:
-- `crates/gobrowse-server/migrations/0024_ui_packages.sql` (new)
-- `crates/gobrowse-server/tests/postgres_integration.rs` (schema version → 24)
-- `crates/gobrowse-server/tests/worktrees_integration.rs` (schema version → 24)
-- `crates/gobrowse-core/src/library.rs` (add `GobrowseUi` to `BookKind`)
-- `crates/gobrowse-server/src/config.rs` (add `ui_packages_dir` to `FeatureSettings`)
-- `crates/gobrowse-server/src/main.rs` (create `ui_packages_dir` on startup)
+- `crates/gobrowse-server/migrations/0025_auth_hardening.sql` (new)
+- `crates/gobrowse-server/src/rate_limiter.rs` (new)
+- `crates/gobrowse-server/src/config.rs` (add RateLimitSettings, SessionSettings)
+- `crates/gobrowse-server/src/auth.rs` (integrate rate limiter, add session helpers)
+- `crates/gobrowse-server/src/session_manager.rs` (new)
+- `crates/gobrowse-server/src/lib.rs` (add to modules, no functional change)
+- `crates/gobrowse-server/tests/postgres_integration.rs` (schema version → 25)
+- `crates/gobrowse-server/tests/worktrees_integration.rs` (schema version → 25)
 
 **Steps**:
-1. Add `GobrowseUi` to `BookKind` enum in `gobrowse-core/src/library.rs`.
-2. Write migration `0024_ui_packages.sql`.
-3. Add `ui_packages_dir` to `FeatureSettings` (with default).
-4. Add `create_dir_all` for `ui_packages_dir` in `main.rs` serve command.
-5. Update schema version assertions in integration tests.
-6. Verify migration applies: `cargo run -p gobrowse-server --bin gobrowse -- migrate`
+1. Add `RateLimitSettings` and `SessionSettings` to `config.rs`.
+2. Build `rate_limiter.rs`: sliding window counters, per-IP, per-email, global, configurable windows.
+3. Write migration 0025.
+4. Add `auth_methods` CRUD to `auth.rs` (list, delete auth methods; backfill existing passwords).
+5. Build `session_manager.rs`: session creation with concurrent limits, session listing, revocation.
+6. Integrate rate limiter into login endpoint (IP-based + global, in addition to existing per-email).
+7. Update schema version assertions.
 
 **Acceptance**:
-- `cargo test -p gobrowse-core -- library` passes (BookKind exhaustiveness).
-- `cargo test -p gobrowse-server -- postgres_integration` passes.
-- `cargo run --bin gobrowse -- migrate` applies cleanly.
-- **Preserve M24**: `cargo fmt --check && cargo clippy --workspace -- -D warnings` passes.
-- **Preserve M24**: Schema 23 → 24 upgrade; old tests still pass.
+- Migration applies cleanly: `cargo run -p gobrowse-server --bin gobrowse -- migrate`
+- `POST /api/v1/auth/login` rate-limited: 20+ attempts from same IP in 300s → 429
+- `GET /api/v1/auth/methods` returns at least password method for existing users
+- `DELETE /api/v1/auth/methods/{id}` rejects last method
+- `GET /api/v1/auth/sessions` lists active sessions
+- `POST /api/v1/auth/sessions/{hash}/revoke` removes session
+- `POST /api/v1/auth/sessions/revoke` removes all other sessions
+- **Preserve M24/M24b**: `cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings`
+- **Preserve M24/M24b**: `cargo nextest run --workspace`
+- **Preserve M24/M24b**: No CSP regression, no WASM size increase > 2%, Docker image ≤ +3 MB
 
-### Batch 2: Capabilities endpoint + AppState wiring
+### M25a Batch 2: WebAuthn registration + login
 
 **Files**:
-- `crates/gobrowse-server/src/capabilities_api.rs` (new)
-- `crates/gobrowse-server/src/lib.rs` (add route + `ActiveUiState` field)
+- `crates/gobrowse-server/src/webauthn.rs` (new)
+- `crates/gobrowse-server/src/auth.rs` (add WebAuthn handlers)
+- `crates/gobrowse-server/src/lib.rs` (add routes, webauthn module)
+- `crates/gobrowse-server/src/config.rs` (add WebAuthnSettings: rp_id, rp_name, rp_origin)
 
 **Steps**:
-1. Create `capabilities_api.rs` with `get_capabilities` handler.
-2. Build response from `AppState.tool_descriptors`, `settings.features`, `settings.http`.
-3. Add `ActiveUiState` struct and `Arc<RwLock<Option<ActiveUiState>>>` to `AppState`.
-4. Add `GET /api/v1/capabilities` route.
-5. On startup, query DB for active UI package and populate `ActiveUiState`.
-6. Write unit test for capabilities response shape.
+1. Add `WebAuthnSettings` to config. RP ID defaults to `public_origin` host.
+2. Build `webauthn.rs`: challenge generation, `navigator.credentials.create()` options,
+   attestation verification (none), assertion verification, credential storage in
+   `auth_methods.method_data`.
+3. Registration flow: `POST /auth/methods/webauthn/register` → returns creation options →
+   browser creates credential → `POST /auth/methods/webauthn/complete` → verify + store.
+4. Login flow: `POST /auth/methods/webauthn/login` → returns request options →
+   browser gets assertion → `POST /auth/methods/webauthn/login/complete` → verify + create session.
+5. Integration tests for registration and login flows (mock WebAuthn server-side).
 
 **Acceptance**:
-- `curl http://127.0.0.1:8080/api/v1/capabilities` returns valid JSON with tools + features.
-- Response includes `ui.active_package_kind: "BUILT_IN"`.
-- Response includes all tool names from `tool_descriptors`.
-- **Preserve M24**: all existing tests pass; no schema version regression.
+- WebAuthn registration: create options returned, attestation verified, credential stored
+- WebAuthn login: assertion verified, session created
+- Invalid assertion → 401
+- Duplicate credential registration → 409
+- **Preserve M24/M24b**: Full CI green
+- **Preserve**: Password login still works (no regression)
 
-### Batch 3: UI package preview + install (server-side)
+### M25a Batch 3: OIDC login + CSRF hardening
 
 **Files**:
-- `crates/gobrowse-server/src/ui_api.rs` (new — preview + install handlers)
+- `crates/gobrowse-server/src/oidc.rs` (new)
+- `crates/gobrowse-server/src/auth.rs` (add OIDC handlers)
+- `crates/gobrowse-server/src/lib.rs` (add routes, extend origin_guard)
+- `crates/gobrowse-server/src/config.rs` (add OidcSettings)
+
+**Steps**:
+1. Add `OidcSettings` to config: `providers: Vec<OidcProvider>` with `issuer`, `client_id`,
+   `client_secret` (vault reference), `scopes`, `label`.
+2. Build `oidc.rs`: OIDC discovery (`.well-known/openid-configuration`), Authorization Code
+   Flow with PKCE (S256), token exchange, ID token verification (iss, aud, exp, iat, sub, nonce),
+   userinfo, account linking.
+3. Routes: `POST /auth/methods/oidc/start` (returns redirect URL), `GET /auth/methods/oidc/callback`
+   (exchanges code, creates/links user, creates session).
+4. Extend `origin_guard` middleware: add `Sec-Fetch-Mode: navigate` rejection on state-changing
+   endpoints, `Sec-Fetch-Dest` verification, COOP/COEP headers.
+5. Integration tests for OIDC flow (mock OIDC provider).
+
+**Acceptance**:
+- OIDC discovery fetches provider config
+- Authorization URL includes PKCE challenge + state
+- Callback verifies state, exchanges code, verifies ID token
+- New user: account created, linked to OIDC. Existing user by email: OIDC linked.
+- Sec-Fetch-Mode: navigate on POST /api/v1/conversations → 403
+- COOP/COEP headers present on all responses
+- **Preserve M24/M24b**: Full CI green
+
+### M25a Batch 4: Session hardening + step-up auth
+
+**Files**:
+- `crates/gobrowse-server/src/session_manager.rs` (extend)
+- `crates/gobrowse-server/src/auth.rs` (add step-up, session tracking)
+- `crates/gobrowse-server/migrations/0025_auth_hardening.sql` (already applied, no new migration)
+
+**Steps**:
+1. Concurrent session limit enforcement: on login, count active sessions; if ≥ limit, revoke
+   oldest session.
+2. Session idle timeout: `last_seen_at` updated on each authenticated request. Background task
+   expires idle sessions (every 60 s).
+3. Step-up auth: `POST /auth/step-up` accepts password/passkey → updates `last_step_up_at`.
+   Middleware checks step-up age for sensitive routes.
+4. Account lockout: after 10 consecutive login failures, set `locked_until = now() + 30 min`.
+   Lockout counts reset on successful login.
+5. `auth_epoch` incremented on: password change, session rotation all, forced logout.
+   Invalidates all existing sessions.
+6. Session events written on: created, rotated, expired, revoked, step_up, login, logout.
+
+**Acceptance**:
+- 11th concurrent session for VIEWER → 403
+- Idle session (60+ min) → expires, next request → 401
+- Step-up required for vault mutations: old session → 403, re-auth → 200
+- Account lockout after 10 failures → 423 Locked
+- Auth epoch increment → all sessions invalidated
+- Session events queryable per user
+- **Preserve M24/M24b**: Full CI green
+
+### M25b Batch 5: Centralized authorization engine
+
+**Schema**: Migration 0026 (authorization_policies, audit_events extension).
+
+**Files**:
+- `crates/gobrowse-server/src/authorize.rs` (new)
+- `crates/gobrowse-server/migrations/0026_authorization_policies.sql` (new)
+- `crates/gobrowse-server/src/lib.rs` (add `auth_policy_cache` to AppState, add authorize middleware)
+- `crates/gobrowse-server/src/admin_api.rs` (new — policy CRUD, reload)
+- `crates/gobrowse-server/tests/postgres_integration.rs` (schema version → 26)
+- `crates/gobrowse-server/tests/worktrees_integration.rs` (schema version → 26)
+
+**Steps**:
+1. Build `authorize.rs`: `Actor`, `Action`, `Resource` enums. `authorize()` function.
+   `is_single_user_mode()` detection. Permission matrix constants. Policy evaluation by
+   priority. Policy cache in `AppState`.
+2. Write migration 0026.
+3. Add policy CRUD to `admin_api.rs`: `GET/POST/PATCH/DELETE /api/v1/admin/policies`.
+4. Add `POST /api/v1/admin/policies/reload` to invalidate cache.
+5. Ship default policies as migration data (empty for single-user, sensible defaults for multi-user).
+6. Extend `audit_events` with authorization columns (migration 0026).
+7. Update audit helper in `auth.rs` to accept new fields.
+8. Unit tests for every permission matrix entry × decision.
+
+**Acceptance**:
+- `authorize(Human(OWNER), Create{Book}, ...)` → ALLOW in single-user mode
+- `authorize(Agent{...}, Execute{sandbox_rm, Destructive}, ...)` → DENY
+- Policy `(agent, write, ASK)` overrides `(agent, execute, ASK)` → effective: ASK
+- Policy cache: 1000 authz checks < 1 ms each
+- Admin policies CRUD works
+- Audit events include authorization_decision, reason, policy_id
+- **Preserve M24/M24b**: Full CI green
+
+### M25b Batch 6: Wire authorization into all call sites
+
+**Files**:
+- `crates/gobrowse-server/src/run_api.rs` (tool dispatch → authorize)
+- `crates/gobrowse-server/src/run_tools.rs` (RiskClass mapping upgrade)
+- `crates/gobrowse-server/src/plugin_api.rs` (runtime permission enforcement)
+- `crates/gobrowse-server/src/mcp_client.rs` (tool call authorization)
+- `crates/gobrowse-server/src/sandbox_api.rs` (sandbox op authorization)
+- `crates/gobrowse-server/src/library_api.rs` (book access for context)
+- `crates/gobrowse-server/src/vault_api.rs` (secret access authorization)
+- `crates/gobrowse-server/src/vault.rs` (secret access logging)
+- `crates/gobrowse-server/src/webhooks.rs` (delivery authorization)
+- `crates/gobrowse-server/src/lib.rs` (middleware integration)
+
+**Steps**:
+1. **Run API**: Replace `risk_class_for_tool` binary mapping with full 6-level `RiskClass`.
+   Before tool dispatch, call `authorize(Agent{...}, Execute{tool, risk}, ...)`.
+   AD-25.9: context retrieval passes books through `authorize()`.
+2. **Run tools**: Map each tool to its correct RiskClass (not just read/write):
+   `sandbox_exec` → Execute, `sandbox_remove` → Destructive, `terminal_kill` → Destructive,
+   `process_kill` → Destructive, `sandbox_mkdir` → Write, etc.
+3. **Plugin API**: At runtime (not just install-time), check plugin sandbox operations
+   against `plugin_permissions`. Call `authorize(Plugin{...}, Execute{tool, risk}, ...)`.
+4. **MCP client**: Before `tools/call`, call `authorize(Mcp{...}, Execute{tool, risk}, ...)`.
+   OAuth refresh: `authorize(Mcp{...}, AccessSecret{...}, ...)`.
+5. **Sandbox API**: Every sandbox endpoint calls `authorize(Human{...} or Agent{...}, Execute{...}, ...)`.
+6. **Library API**: Book creation/update/delete → `authorize()`. Context retrieval authorization
+   in `run_api::build_messages`.
+7. **Vault**: `Vault::resolve()` calls `authorize()` + writes `secret_access_log`.
+   Vault mutations require step-up auth.
+8. **Webhooks**: Delivery → `authorize(Webhook{...}, WebhookDeliver{...}, ...)`.
+9. Add authorization middleware layer in `router()` that extracts actor and injects into
+   request extensions (so handlers can access the pre-computed actor).
+
+**Acceptance**:
+- Agent calls `sandbox_exec` in workspace it belongs to → ALLOW (read tool)
+- Agent calls `sandbox_remove` → DENY (destructive, no policy)
+- Plugin with `filesystem_read` scope `/data/` tries to read `/etc/` → DENY (out of scope)
+- MCP tool call first time → ASK (approval required), subsequent → ALLOW (after policy)
+- Sandbox exec without sandbox enabled → 403
+- Book with `security_classification=RESTRICTED` omitted from agent context
+- Secret resolve logged in `secret_access_log`
+- **Preserve M24/M24b**: Full CI green
+
+### M25b Batch 7: Agent permissions + workspace isolation hardening
+
+**Schema**: Migration 0027 (agent_tool_permissions, agent_secret_permissions).
+
+**Files**:
+- `crates/gobrowse-server/migrations/0027_agent_permissions_isolation.sql` (new)
+- `crates/gobrowse-server/src/authorize.rs` (add agent permission checks)
+- `crates/gobrowse-server/src/run_api.rs` (integrate agent tool permissions)
+- `crates/gobrowse-server/tests/postgres_integration.rs` (schema version → 27)
+- `crates/gobrowse-server/tests/worktrees_integration.rs` (schema version → 27)
+
+**Steps**:
+1. Write migration 0027.
+2. `authorize.rs`: for `Actor::Agent`, check `agent_tool_permissions` for tool pattern match
+   + risk_class_limit. If no matching permission row, DENY by default.
+3. Agent secrets: `Vault::resolve()` checks `agent_secret_permissions` for agent actors.
+   Use count increment, expiry check.
+4. Workspace isolation: `authorize()` always checks `resource_workspace_id` against actor's
+   workspace membership. Cross-workspace access requires explicit policy.
+5. Integration tests for agent permission enforcement.
+
+**Acceptance**:
+- Agent with `tool_pattern='library_*' risk_class_limit='write'` can call `library_search` (read)
+  and `library_add` (write) but not `sandbox_exec` (no permission row) → DENY
+- Agent with expired `agent_secret_permissions` → DENY
+- Agent with exhausted `max_uses` → DENY
+- Cross-workspace agent → DENY without explicit policy
+- **Preserve M24/M24b**: Full CI green
+
+### M25b Batch 8: Approval system + notification dispatch
+
+**Schema**: New `approval_requests` table (replaces `approvals`), migration 0027.
+
+**Files**:
+- `crates/gobrowse-server/src/approval_api.rs` (new)
+- `crates/gobrowse-server/src/authorize.rs` (ASK decision → create approval)
+- `crates/gobrowse-server/src/realtime.rs` (extend — push approval events)
 - `crates/gobrowse-server/src/lib.rs` (add routes)
-- `crates/gobrowse-server/src/auth.rs` (add `require_user_or_run`)
 
 **Steps**:
-1. Add `require_user_or_run` helper to `auth.rs`.
-2. Implement `POST /api/v1/ui/preview`: download source, extract, validate manifest,
-   compute digest, return digest + manifest preview.
-3. Implement `POST /api/v1/ui/install`: re-download, re-verify digest, extract to
-   `ui_packages_dir/{id}`, compute asset hashes, create `ui_packages` row + assets +
-   companion Book (all in one transaction), set state to `staged`.
-4. Manifest validation: required fields, version format, ui_kind check.
-5. Integration tests for preview + install.
+1. Create `approval_requests` table in migration 0027.
+2. `authorize()`: when decision is ASK, create `approval_requests` row, return
+   `AuthorizationDecision::Ask { approval_id }`.
+3. `approval_api.rs`: `GET /approvals`, `GET /approvals/{id}`, `POST /approvals/{id}/approve`,
+   `POST /approvals/{id}/deny`.
+4. Notification: push `run_events` with `event_type='approval_required'` for agent-initiated
+   approvals. For human-initiated (MEMBER trying to write), push to workspace activity feed.
+5. Timeout: background task expires pending approvals past `expires_at`. Auto-deny.
+6. Migrate existing `approvals` table data to `approval_requests` (if any rows exist).
 
 **Acceptance**:
-- Preview returns digest for a valid UI package source.
-- Install with correct digest succeeds; incorrect digest fails.
-- Install creates companion Book (kind=GOBROWSE_UI).
-- Companion Book appears in `GET /library/search?q=&kind=GOBROWSE_UI`.
-- **Preserve M24**: full CI green.
+- Agent tool call triggers ASK → approval_requests row created
+- User approves → agent tool proceeds
+- User denies → agent gets DENY error
+- Timeout (5 min) → auto-deny
+- Approval events appear in run events / SSE stream
+- **Preserve M24/M24b**: Full CI green
 
-### Batch 4: CSP middleware + active UI serving
+### M25b Batch 9: Enterprise audit API + secret access hardening
+
+**Schema**: Migration 0028 (secret_access_log, audit_events retention).
 
 **Files**:
-- `crates/gobrowse-server/src/csp.rs` (new)
-- `crates/gobrowse-server/src/lib.rs` (inject CSP layer, modify SPA fallback)
+- `crates/gobrowse-server/migrations/0028_secrets_audit_enterprise.sql` (new)
+- `crates/gobrowse-server/src/admin_api.rs` (extend — audit query, export, summary)
+- `crates/gobrowse-server/src/vault.rs` (secret access logging)
+- `crates/gobrowse-server/tests/postgres_integration.rs` (schema version → 28)
+- `crates/gobrowse-server/tests/worktrees_integration.rs` (schema version → 28)
 
 **Steps**:
-1. Build `CspMiddleware` that reads `ActiveUiState` from `AppState` and injects
-   `Content-Security-Policy` header on asset responses.
-2. Compute CSP directives from `ui_package_assets` hashes.
-3. Enforce: no `'unsafe-inline'`, `script-src` = only hashes, `connect-src` = `public_origin`.
-4. Modify `router()` SPA fallback: when `ActiveUiState` has a `FULL_UI` package, serve
-   from `install_path` instead of built-in `dist/`. When `THEME`, serve built-in with
-   theme CSS injection.
-5. Add `/recovery` and `/recovery/*` routes (serve static recovery assets from
-   `/app/recovery/`).
-6. Add auto-fallback: if active UI package's WASM is missing, redirect `GET /` to `/recovery`.
+1. Write migration 0028.
+2. `secret_access_log`: `Vault::resolve()` writes a row on every secret resolution
+   (actor, purpose, access_type, decision, IP). Append-only trigger.
+3. Admin audit API: `GET /admin/audit` with filters (actor_kind, action, resource_type,
+   decision, after, before, limit, offset). `GET /admin/audit/export` (CSV/JSON).
+   `GET /admin/audit/summary` (counts by decision, top actors, policy effectiveness).
+4. Secret access API: `GET /admin/secret-access` with filters.
+5. Audit retention: background task deletes rows past `retention_policy`.
+6. Integration tests for audit query + export.
 
 **Acceptance**:
-- Responses for active FULL_UI include CSP header.
-- CSP header contains no `unsafe-inline`.
-- Built-in UI (no active package) includes CSP with built-in WASM hash.
-- Recovery UI is accessible at `/recovery`.
-- Recovery UI assets are served with correct CSP.
-- **Preserve M24**: existing frontend works with injected CSP (no breakage).
-- **Test**: `curl -I http://127.0.0.1:8080/` shows CSP header.
+- Secret resolve logs to `secret_access_log`
+- `GET /admin/audit?actor_kind=agent&decision=DENY` returns filtered results
+- `GET /admin/audit/export?format=csv` returns CSV
+- `GET /admin/audit/summary` returns correct counts
+- `secret_access_log` is append-only (UPDATE/DELETE rejected)
+- Retention background task deletes expired rows
+- **Preserve M24/M24b**: Full CI green
 
-### Batch 5: Activation, rollback, state machine
-
-**Files**:
-- `crates/gobrowse-server/src/ui_api.rs` (add activate, approve, rollback, delete handlers)
-- `crates/gobrowse-server/src/lib.rs` (add routes)
+### M25b Batch 10: Frontend integration + E2E + regression
 
 **Steps**:
-1. Implement state machine transitions in application code.
-2. `POST .../activate`: validate state = `candidate` (or `previous`), check permissions
-   (ui_permission_level + caller identity), set current active → `previous`, set target →
-   `active`, update `ActiveUiState`.
-3. `POST .../approve`: for `ASK`-blocked activations, user approves → transition to `active`.
-4. `POST .../rollback`: find `state = 'previous'`, set active → `rolled_back`, previous →
-   `active`. If no previous, deactivate to built-in.
-5. `DELETE .../{id}`: reject if `state = 'active'` or if it's the only package with
-   `state IN ('active', 'previous', 'candidate', 'validated')`.
-6. `PATCH .../{id}`: update trust, description. Cannot change state directly.
-7. All mutations serialize per package via `SELECT ... FOR UPDATE`.
-8. Integration tests for all transitions + permission checks.
-
-**Acceptance**:
-- Activate transitions candidate → active, previous active → previous.
-- Concurrent activate on same profile is serialized (no double-active).
-- Rollback restores previous.
-- Delete rejects active and last-known-good.
-- Permission level ASK blocks agent activation.
-- ALLOW_WORKSPACE permits workspace-scoped activation.
-- **Preserve M24**: full CI green.
-
-### Batch 6: Recovery UI crate + Docker integration
-
-**Files**:
-- `crates/gobrowse-recovery/Cargo.toml` (new)
-- `crates/gobrowse-recovery/src/main.rs` (new)
-- `crates/gobrowse-recovery/index.html` (new)
-- `crates/gobrowse-recovery/Trunk.toml` (new)
-- `Dockerfile` (add recovery build step)
-- `docker-compose.yml` (no changes needed)
-
-**Steps**:
-1. Scaffold `gobrowse-recovery` crate with minimal Leptos app.
-2. Build Login page, UI Package management page, Restore Built-in action.
-3. Configure Trunk to output to `dist-recovery/`.
-4. Add build step to `Dockerfile`: compile recovery WASM, copy to `/app/recovery/`.
-5. Verify recovery UI is accessible and functional.
-
-**Acceptance**:
-- `cargo clippy -p gobrowse-recovery --target wasm32-unknown-unknown -- -D warnings` passes.
-- `trunk build --release` produces valid WASM.
-- Recovery UI login works.
-- Recovery UI can list, activate, rollback, and delete UI packages.
-- Recovery UI restore-built-in works (deactivates all packages).
-- **Preserve M24**: Docker build still succeeds; final image under ~300 MB.
-- **Preserve M24**: `wasm-opt -Oz` applied to recovery WASM.
-
-### Batch 7: Frontend UI Packages page (gobrowse-web)
-
-**Files**:
-- `crates/gobrowse-web/src/app.rs` (add Page::UiPackages, UiPackagesPage component)
-
-**Steps**:
-1. Add `UiPackages` to the `Page` enum.
-2. Add "UI Packages" to the side navigation (under Library group or a new group).
-3. Build `UiPackagesPage` component: list, install form, activate/rollback/delete actions.
-4. Theme loading: if active package is THEME, fetch `/api/v1/ui/packages/{id}/theme` and
-   inject `<style id="gobrowse-theme">` into `<head>`.
-5. Wire up install form: source URI, kind selection, workspace.
-6. Add confirmation dialog for FULL_UI activation.
-
-**Acceptance**:
-- UI Packages page lists installed packages with state and kind.
-- Install form submits to `/api/v1/ui/preview` then `/api/v1/ui/install`.
-- Activate button works and updates the UI (theme change or FULL_UI switch).
-- Rollback restores previous UI.
-- Delete button rejects active/last-known-good with error message.
-- `trunk build --release` succeeds.
-- **Preserve M24**: `wasm-opt -Oz` applied; WASM size doesn't increase >10%.
-
-### Batch 8: UI-SDK.md + manifest schema + examples
-
-**Files**:
-- `docs/UI-SDK.md` (new)
-- `schema/ui-package-manifest.json` (new)
-- `examples/starter-ui/` (new directory with minimal theme package)
-
-**Steps**:
-1. Write `docs/UI-SDK.md`: architecture, manifest reference, tutorials, agent workflow.
-2. Create JSON Schema for `gobrowse-ui` manifest.
-3. Create `examples/starter-ui/` with a minimal THEME package (manifest.json + theme.css).
-4. Create `tools/ui-package` shell script: `build`, `package`, `validate`, `install` commands.
-
-**Acceptance**:
-- UI-SDK.md is complete, accurate, and LLM-readable (boring, explicit contracts).
-- JSON Schema validates the example manifest.
-- `tools/ui-package validate examples/starter-ui/` passes.
-- Agent can follow UI-SDK.md to create, build, and install a theme package.
-
-### Batch 9: Integration + E2E + regression
-
-**Steps**:
-1. Run full CI: `cargo fmt --check`, `cargo clippy --workspace -- -D warnings`,
+1. **Designer agent**: Route all UI components (auth methods, sessions, approval center,
+   policy editor, audit viewer) to the designer agent for implementation.
+2. Full CI: `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
    `cargo clippy -p gobrowse-web --target wasm32-unknown-unknown -- -D warnings`,
    `cargo clippy -p gobrowse-recovery --target wasm32-unknown-unknown -- -D warnings`,
    `cargo nextest run --workspace`.
-2. Docker build + smoke test: `docker build`, `docker compose up -d`, verify health,
-   verify capabilities endpoint, verify CSP header, verify recovery UI.
-3. Install a theme package, activate, verify theme applied.
-4. Rollback, verify built-in restored.
-5. Install a FULL_UI package (minimal), activate, verify CSP serves correct assets.
-6. Delete active → error. Delete last-known-good → error. Rollback then delete → success.
-7. Verify agent flow: preview → install → activate (blocked in ASK) → approve → active.
-8. Populate regression matrix: every M24 metric before/after M24b.
+3. Docker build + smoke test: verify health, all auth flows, authorization enforcement,
+   audit trail, CSP headers.
+4. Multi-user scenario test: create OWNER + MEMBER, verify MEMBER cannot delete workspace,
+   verify member write → approval, verify agent tool permissions.
+5. Single-user regression: verify no approvals required, no policy setup, everything works.
+6. Populate regression matrix against M24 optimization baselines.
 
 **Acceptance**:
-- All CI green.
-- Docker smoke passes.
-- No M24 regressions (image size ≤ +5 MB, WASM size ≤ +10%, context budget unchanged,
-  latency unchanged for non-UI endpoints).
-- Capabilities endpoint returns correct data.
-- CSP headers present and correct on all UI routes.
+- All CI green
+- Docker smoke passes
+- WebAuthn registration + login works end-to-end
+- OIDC login works end-to-end
+- Rate limiting triggers correctly
+- CSRF Fetch Metadata checks work
+- Session revocation works
+- Authorization engine: ALLOW/ASK/DENY decisions correct for every actor
+- Approval flow: request → notify → approve → proceed
+- Audit trail: every decision logged with attribution
+- Secret access logged
+- Single-user mode: no prompts, all ALLOW
+- **Preserve M24/M24b**: Image size ≤ +10 MB, WASM size ≤ +15%, context budget unchanged,
+  latency for non-auth endpoints ≤ +5%
 
 ---
 
-## Open Questions
+## Rollout / Rollback Plan
 
-1. **Inline style audit**: The existing `styles.css` uses CSS custom properties only (no
-   inline styles). The Leptos `view!` macro generates DOM elements; need to verify no
-   `style=` attributes are emitted. If any exist, they must be moved to classes for CSP
-   compatibility. **Batch 4 must audit this before enabling CSP on built-in UI.**
+### Rollout
 
-2. **Recovery UI WASM size**: The recovery UI should be minimal (<100 KB WASM). If it
-   grows larger, consider a pure HTML/CSS fallback instead of Leptos. **Batch 6 must
-   measure and stay under budget.**
+1. **M25a first**: Auth hardening ships independently. WebAuthn/OIDC, rate limiting, CSRF,
+   session hardening are additive — no breaking changes.
+2. **M25b batches 5-6**: Authorization engine ships with default policies that match existing
+   behavior (ALLOW for everything existing users already could do). No behavioral change.
+3. **M25b batches 7-9**: Enterprise features activate only when multi-user/workspace config
+   exists. Single-user installs see no change.
+4. **Schema migrations**: Apply sequentially (0025 → 0026 → 0027 → 0028). Each migration
+   is backward-compatible (additive columns, no drops).
 
-3. **FULL_UI CSP compatibility**: Third-party UI packages may break if they use inline
-   scripts or styles. The manifest validation should warn (not block) if the package
-   declares `"csp_compatible": false`. **Document in UI-SDK.md that CSP is mandatory.**
+### Rollback
 
-4. **Agent approval UX**: The approval flow inserts a run event that the frontend must
-   display as an actionable "Approve UI change" button. This requires a new run event
-   type (`ui_activation_request`). **Design the event payload in Batch 5.**
-
-5. **UI package build tooling**: The `tools/ui-package` script is a bash wrapper. For
-   FULL_UI packages, the build step requires Trunk+Rust toolchain — same as the built-in
-   UI. **Document this requirement in UI-SDK.md; do not bundle Trunk in the Docker image.**
-
-6. **Marketplace support**: The `source_type = 'marketplace'` is a placeholder. M24b does
-   NOT implement a UI package marketplace. The route accepts `local_package` and
-   `github_release` only. Marketplace is future work.
-
-7. **Workspace-scoped UI packages**: Workspace-scoped packages apply only when the user
-   is viewing that workspace. This adds complexity to the serving logic (active UI depends
-   on session's current workspace). **Defer to a later milestone; M24b uses profile-scoped
-   packages only.** The `workspace_id` column exists in the schema for future use but is
-   always NULL in M24b.
-
-8. **Theme CSS injection method**: THEME packages inject CSS custom properties. Options:
-   (a) serve a synthetic `theme.css` from `/api/v1/ui/active-theme.css` that the
-   frontend loads via `<link>`, (b) server injects `<style>` into index.html before
-   serving. **Decision: use (a) — the frontend fetches the theme CSS, simpler CSP model,
-   no HTML rewriting needed.** The `index.html` includes `<link rel="stylesheet"
-   href="/api/v1/ui/active-theme.css">` as an optional stylesheet.
+1. **Per-migration**: Each migration adds columns/tables only. No data is destroyed. Rollback
+   = deploy previous binary (which ignores new columns).
+2. **Auth methods**: Removing WebAuthn/OIDC support = deploy binary without those modules.
+   Users with only WebAuthn/OIDC methods would be locked out — password method is always
+   required as fallback (enforced: cannot delete last method, password method cannot be
+   deleted if it's the only method).
+3. **Authorization engine**: Policy cache can be cleared (`DELETE FROM authorization_policies`)
+   and engine falls back to permission matrix defaults. Single-user mode bypasses policies
+   entirely.
 
 ---
 
-## Validation Commands (exact, post-Batch 9)
+## Validation Commands (post-M25)
 
 ```bash
 # ---- Pre-flight ----
@@ -1051,39 +1183,143 @@ cargo clippy -p gobrowse-recovery --target wasm32-unknown-unknown -- -D warnings
 GOBROWSE_TEST_DATABASE_URL=postgres://gobrowse:test-only-password@localhost:5432/gobrowse_test \
   cargo nextest run --workspace
 
+# ---- Authorization engine unit tests ----
+cargo test -p gobrowse-server -- authorize::tests --nocapture
+
 # ---- WASM builds ----
 cd crates/gobrowse-web && trunk build --release && wasm-opt -Oz -o ../../dist/optimized.wasm ../../dist/*.wasm
 cd crates/gobrowse-recovery && trunk build --release
 
 # ---- Docker build + smoke ----
-docker build -t gobrowse-os-app:m24b .
-docker images gobrowse-os-app:m24b --format '{{.Size}}'
+docker build -t gobrowse-os-app:m25 .
+docker images gobrowse-os-app:m25 --format '{{.Size}}'
 docker compose up -d && sleep 15 && docker compose ps
 curl --fail http://127.0.0.1:8080/health/ready
 curl http://127.0.0.1:8080/api/v1/version
 curl http://127.0.0.1:8080/api/v1/capabilities | jq .
 curl -I http://127.0.0.1:8080/ 2>&1 | grep -i content-security-policy
-curl --fail http://127.0.0.1:8080/recovery
+curl -I http://127.0.0.1:8080/ 2>&1 | grep -i cross-origin
+
+# ---- Auth flow tests ----
+# Password login (existing)
+curl -X POST http://127.0.0.1:8080/api/v1/auth/login -H 'Content-Type: application/json' \
+  -d '{"email":"test@example.com","password":"test"}'
+
+# Auth methods
+curl http://127.0.0.1:8080/api/v1/auth/methods -b cookies.txt
+
+# Sessions
+curl http://127.0.0.1:8080/api/v1/auth/sessions -b cookies.txt
+
+# Rate limit test (run 25 times fast)
+for i in $(seq 1 25); do
+  curl -s -o /dev/null -w "%{http_code}\n" -X POST http://127.0.0.1:8080/api/v1/auth/login \
+    -H 'Content-Type: application/json' -d '{"email":"wrong@example.com","password":"wrong"}'
+done
+
+# ---- Authorization tests (multi-user, post-setup) ----
+# Admin: list policies
+curl http://127.0.0.1:8080/api/v1/admin/policies -b cookies.txt
+
+# Admin: query audit
+curl "http://127.0.0.1:8080/api/v1/admin/audit?limit=10&decision=DENY" -b cookies.txt
+
+# Admin: secret access log
+curl "http://127.0.0.1:8080/api/v1/admin/secret-access?limit=10" -b cookies.txt
+
+# Approvals
+curl http://127.0.0.1:8080/api/v1/approvals?status=pending -b cookies.txt
+
 docker compose down
 ```
 
 ---
 
-## `Preserve M24 Baseline` Checks (per batch)
+## `Preserve M24/M24b Baseline` Checks (per batch)
 
 Every batch MUST verify before completion:
 
 | Check | Command/Verification |
 |-------|---------------------|
-| No `unsafe` added | `rg 'unsafe\b' crates/ --include '*.rs'` — only existing `unsafe` in wasm-bindgen glue. |
+| No `unsafe` added | `rg 'unsafe\b' crates/ --include '*.rs'` — only existing `unsafe` in wasm-bindgen glue |
 | Clippy clean | `cargo clippy --workspace --all-targets -- -D warnings` |
 | Format clean | `cargo fmt --check` |
 | Tests pass | `cargo nextest run --workspace` |
-| Schema 23 still works | Integration tests asserting `schema_version == 24` pass; migration 0024 applies cleanly over 0023. |
-| Endpoint count preserved | Every existing `/api/v1/*` route still registered. |
-| Tool defs unmodified | `tool_definitions()` returns same set as M24. |
-| Context budget unchanged | `build_messages` budget logic untouched. |
-| WASM size ≤ M24 +10% | `ls -l dist/*.wasm` compared against M24 baseline (2,669,588 raw). |
-| Docker image ≤ M24 +5 MB | `docker images` compared against M24 baseline (~75 MB compressed). |
-| Lazy tool schemas still work | Round 1 still sends 3 base tools only. |
-| Sandbox lazy connection intact | `SandboxHandle` unchanged. |
+| Schema version correct | Migration applies cleanly; integration test assertions updated |
+| Endpoint count preserved | Every existing `/api/v1/*` route still registered |
+| Tool defs unmodified | `tool_definitions()` returns same set as M24 (risk classes may change from `"read"/"write"` to specific levels — that's intentional) |
+| Context budget unchanged | `build_messages` budget logic untouched except authorization filtering |
+| WASM size ≤ M24b +15% | `ls -l dist/*.wasm` compared against M24b baseline |
+| Docker image ≤ M24b +10 MB | `docker images` compared against M24b baseline |
+| Lazy tool schemas still work | Round 1 still sends 3 base tools only |
+| Sandbox lazy connection intact | `SandboxHandle` unchanged |
+| CSP strict (no unsafe-inline) | `curl -I http://127.0.0.1:8080/ \| grep CSP` — no `unsafe-inline`, no `unsafe-eval` |
+| Recovery UI accessible | `curl --fail http://127.0.0.1:8080/recovery` |
+| Single-user mode unbroken | One OWNER, one profile: all operations ALLOW, no approval prompts |
+
+---
+
+## Open Questions
+
+1. **WebAuthn library choice**: Options: `webauthn-rs` (mature, async), `passkey-rs` (lightweight),
+   or handwritten WebAuthn (minimal deps, more code). **Recommend**: `webauthn-rs` for spec
+   compliance and security review track record. Decision needed before Batch 2.
+
+2. **OIDC provider configuration**: Should the OIDC provider list be config-file-only (static)
+   or database-backed (runtime CRUD)? Config-file is simpler and more secure (no DB tampering).
+   **Recommend**: config-file only for M25a; database-backed in later milestone if needed.
+
+3. **Rate limiter storage**: In-memory (fast, lost on restart) vs Redis (shared, persistent)
+   vs PostgreSQL (durable, slower). Single-server deployments (the normal case) only need
+   in-memory. **Recommend**: in-memory with optional Redis backend gated by config flag.
+
+4. **Approval timeout UX**: When an approval times out, should the agent retry automatically
+   or fail permanently? **Recommend**: fail permanently with a clear error message; agent
+   can re-request if the user wants.
+
+5. **Audit retention background task**: Should retention cleanup run as a tokio background
+   task in the server process, or as a separate cron-like command (`gobrowse audit cleanup`)?
+   **Recommend**: background task in server (configurable interval, default 1 h) for
+   simplicity; separate command for manual runs.
+
+6. **Agent `permissions` JSONB migration**: The existing `agents.permissions` column is
+   unstructured JSONB. Should M25b migrate it to `agent_tool_permissions` rows?
+   **Recommend**: read `agents.permissions` at migration time and insert corresponding
+   `agent_tool_permissions` rows; drop the JSONB column after migration 0027.
+
+7. **Single-user mode detection trigger**: Is single-user mode re-evaluated on every
+   request or cached? Cached would be faster but could be stale after user/workspace
+   creation. **Recommend**: cached with `RwLock`, invalidated on user create/delete
+   and workspace create/delete. Stale window ≤ 1 write operation.
+
+8. **Frontend WebAuthn/OIDC UI**: The browser WebAuthn API requires user interaction
+   (navigator.credentials.create/get). The OIDC flow requires redirects. The frontend
+   designer agent must handle these browser-specific flows. **Recommend**: provide
+   the designer agent with WebAuthn browser API docs and OIDC flow diagrams.
+
+9. **MCP approval policy granularity**: Should MCP tool approval be per-server (first
+   tool call requires approval) or per-tool (each tool independently approved)?
+   **Recommend**: per-server default (matching existing behavior), with optional
+   per-tool override via `authorization_policies` rows scoped to `mcp_server`.
+
+10. **Plugin runtime permission enforcement mechanism**: How does the server enforce
+    that a plugin doesn't exceed its declared `filesystem_read` scope at runtime? The
+    sandbox client doesn't currently accept per-operation path restrictions.
+    **Recommend**: pass `allowed_paths` and `allowed_hosts` from `plugin_permissions`
+    to the sandbox client as operation parameters. Sandboxd enforces the restrictions.
+
+---
+
+## M24 Optimization Baseline (permanent, non-negotiable)
+
+All M25 builds MUST maintain the M24 optimization baseline confirmed at M24b:
+
+- `debian:bookworm-slim` + `ca-certificates` only (no curl/git)
+- `wasm-opt -Oz --enable-bulk-memory` on all WASM binaries
+- Lazy tool schemas: round 1 = 3 base tools only
+- Lazy sandbox connection via `SandboxHandle` (OnceLock)
+- Cheapest-capable routing via `cost_ranking`
+- `unsafe_code = "forbid"`, `clippy::all = "warn"`, Rust 1.94, edition 2024
+- Context budget: `build_messages` 2/3 recent, 1/3 optional, LIMIT 12 library, LIMIT 10 worktrees
+- Docker image: read_only, tmpfs /tmp, no-new-privileges, cap_drop: ALL
+- CSP strict: no unsafe-inline, hash-verified, server-authoritative
