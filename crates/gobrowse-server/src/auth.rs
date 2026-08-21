@@ -268,6 +268,16 @@ pub async fn login(
     Json(input): Json<LoginRequest>,
 ) -> Result<impl IntoResponse, AppError> {
     check_login_throttle(&state.pool, input.email.trim(), &state.settings.auth).await?;
+    // M25a: account lockout after consecutive failures.
+    let locked: Option<time::OffsetDateTime> = sqlx::query_scalar(
+        "SELECT locked_until FROM users WHERE lower(email) = lower($1) AND locked_until > now()",
+    )
+    .bind(input.email.trim())
+    .fetch_optional(&state.pool)
+    .await?;
+    if locked.is_some() {
+        return Err(AppError::Conflict("account is temporarily locked"));
+    }
     // M25a: in-memory per-IP + global sliding-window limits on top of the
     // existing per-email DB throttle.
     let ip = headers
@@ -308,11 +318,28 @@ pub async fn login(
         || row.is_none()
     {
         record_login_attempt(&state.pool, input.email.trim(), None, "failure").await?;
+        // M25a: increment consecutive-failure counter; lock after 10.
+        sqlx::query(
+            "UPDATE users SET consecutive_failures = consecutive_failures + 1, \
+             locked_until = CASE WHEN consecutive_failures + 1 >= 10 \
+               THEN now() + interval '30 minutes' ELSE locked_until END \
+             WHERE lower(email) = lower($1)",
+        )
+        .bind(input.email.trim())
+        .execute(&state.pool)
+        .await?;
         return Err(AppError::Unauthorized);
     }
     let row = row.expect("checked above");
     let user_id: Uuid = row.get("id");
     let mut tx = state.pool.begin().await?;
+    // M25a: reset failure counter + enforce concurrent-session limit.
+    sqlx::query("UPDATE users SET consecutive_failures = 0, locked_until = NULL WHERE id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+    let role: String = row.get("role");
+    crate::session_manager::enforce_concurrent_limit(&mut tx, user_id, &role).await?;
     let (cookie, user) = create_session(&state, &mut tx, user_id).await?;
     audit(
         &mut tx,
@@ -683,6 +710,17 @@ pub(crate) async fn create_session(
     .bind(now + Duration::minutes(state.settings.auth.session_idle_minutes))
     .bind(now + Duration::hours(state.settings.auth.session_absolute_hours))
     .execute(&mut **tx)
+    .await?;
+    // M25a: append-only session lifecycle event.
+    crate::session_manager::record_session_event(
+        tx,
+        &session_hash,
+        user_id,
+        "created",
+        None,
+        None,
+        serde_json::json!({}),
+    )
     .await?;
     let cookie = session_cookie(&token, state.settings.http.secure_cookies)?;
     Ok((
