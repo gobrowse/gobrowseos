@@ -32,8 +32,11 @@ RUN trunk build index.html --release --dist /workspace/dist
 RUN wasm-opt -Oz --enable-bulk-memory -o /workspace/dist/*.wasm /workspace/dist/*.wasm
 
 FROM debian:bookworm-slim AS runtime
+# Runtime needs no git or curl: the container healthcheck uses `gobrowse health`
+# (a self-contained HTTP probe against /health/ready) instead of curl, and the
+# binary is built in the builder stage, so source tooling is not required here.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git \
+    && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 gobrowse \
     && useradd --system --uid 10001 --gid gobrowse --home-dir /app --shell /usr/sbin/nologin gobrowse

@@ -42,6 +42,8 @@ enum Command {
     },
     /// Print effective non-secret configuration metadata.
     Config,
+    /// Probe the local readiness endpoint (used by the container healthcheck).
+    Health,
 }
 
 #[derive(Debug, Subcommand)]
@@ -120,6 +122,7 @@ async fn run() -> anyhow::Result<()> {
             println!("sandbox={}", settings.features.sandbox);
             Ok(())
         }
+        Command::Health => health().await,
     }
 }
 
@@ -186,6 +189,32 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
         error!("webhook scheduler worker did not stop before the shutdown deadline");
     }
     result
+}
+/// Probe the local server's readiness endpoint for the container healthcheck.
+///
+/// Reads `GOBROWSE_PORT` (default 8080) and issues a 5-second-timeboxed GET to
+/// `http://127.0.0.1:{port}/health/ready`. Exits successfully (0) when the
+/// endpoint returns `200 OK`, and fails (1) otherwise.
+async fn health() -> anyhow::Result<()> {
+    let port = std::env::var("GOBROWSE_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8080);
+    let url = format!("http://127.0.0.1:{port}/health/ready");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("build healthcheck HTTP client")?;
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("request {url}"))?;
+    if response.status() == reqwest::StatusCode::OK {
+        Ok(())
+    } else {
+        anyhow::bail!("readiness check returned {} on {url}", response.status())
+    }
 }
 
 async fn shutdown_signal() {

@@ -798,10 +798,15 @@ async fn execute_inner(
     let mut total_tool_calls = 0_usize;
     let mut output = String::new();
     let mut usage = None;
+    // Sandbox/terminal tools are advertised lazily: round 0 sends only the three
+    // base library tools. The first sandbox tool call flips `sandbox_activated`,
+    // and from then on the full suite is advertised for the rest of the run.
+    let mut sandbox_activated = false;
+
     let mut in_flight_messages = messages;
     let mut request = chat::request(
         in_flight_messages.clone(),
-        tool_defs.to_vec(),
+        active_tool_defs(&tool_defs, sandbox_activated),
         limits.output_limit,
     );
 
@@ -1048,25 +1053,36 @@ async fn execute_inner(
                 }
                 _ => {
                     if let Some(kind) = crate::run_tools::sandbox_tool_kind(name) {
-                        let tool = crate::run_tools::SandboxTool {
-                            state: state.clone(),
-                            kind,
-                        };
-                        let ctx = gobrowse_core::tools::ToolContext {
-                            call_id: Uuid::now_v7(),
-                            user_id: requested_by,
-                            profile_id,
-                            workspace_id,
-                            run_id,
-                            role: requester_role.clone(),
-                            network_policy: workspace_network_policy,
-                        };
-                        tokio::time::timeout(
-                            Duration::from_secs(10),
-                            tool.execute(&ctx, input.clone()),
-                        )
-                        .await
-                        .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
+                        // A sandbox tool was requested. It can only have been
+                        // advertised (and thus legitimately called) when a sandbox
+                        // client is configured; if not, the model called a tool it
+                        // could never have seen — refuse cleanly rather than panic.
+                        if state.sandbox.is_none() {
+                            Err(gobrowse_core::tools::ToolError::InvalidInput)
+                        } else {
+                            // First sandbox tool use unlocks the full suite for the
+                            // remaining rounds (no flicker).
+                            sandbox_activated = true;
+                            let tool = crate::run_tools::SandboxTool {
+                                state: state.clone(),
+                                kind,
+                            };
+                            let ctx = gobrowse_core::tools::ToolContext {
+                                call_id: Uuid::now_v7(),
+                                user_id: requested_by,
+                                profile_id,
+                                workspace_id,
+                                run_id,
+                                role: requester_role.clone(),
+                                network_policy: workspace_network_policy,
+                            };
+                            tokio::time::timeout(
+                                Duration::from_secs(10),
+                                tool.execute(&ctx, input.clone()),
+                            )
+                            .await
+                            .unwrap_or(Err(gobrowse_core::tools::ToolError::Timeout))
+                        }
                     } else {
                         Err(gobrowse_core::tools::ToolError::InvalidInput)
                     }
@@ -1149,13 +1165,38 @@ async fn execute_inner(
         // Rebuild request with accumulated messages and tools for next round.
         request = chat::request(
             in_flight_messages.clone(),
-            tool_defs.to_vec(),
+            active_tool_defs(&tool_defs, sandbox_activated),
             limits.output_limit,
         );
     }
 
     // Exceeded max rounds without a text response.
     Err(("tool_limit", "too many tool rounds in a single run"))
+}
+/// Selects the tool definitions advertised to the model for the current round.
+///
+/// Round 0 (and every round before a sandbox tool has been used) sends only the
+/// three base library tools, so the ~15 sandbox/terminal schemas are omitted from
+/// the provider payload on every run that never touches the sandbox. Once any
+/// sandbox tool has been executed (`sandbox_activated`), the full suite stays
+/// advertised for the remainder of the run — no per-round flicker.
+fn active_tool_defs(
+    all: &[gobrowse_core::model::ToolDefinition],
+    sandbox_activated: bool,
+) -> Vec<gobrowse_core::model::ToolDefinition> {
+    if sandbox_activated {
+        all.to_vec()
+    } else {
+        all.iter()
+            .filter(|t| {
+                matches!(
+                    t.id.as_str(),
+                    "library_search" | "library_add" | "library_load"
+                )
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 async fn flush_text_events(

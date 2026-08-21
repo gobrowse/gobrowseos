@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use gobrowse_core::library::{RankingWeights, TaskClass, task_capability_map};
 use gobrowse_core::model::ModelRoute;
+use tracing::debug;
 
 /// A model-task route mapping from the `model_task_routes` table.
 #[derive(Debug, Clone)]
@@ -348,13 +349,29 @@ pub fn select_model_for_task(
         return (route.preferred_model_id.clone(), reason);
     }
 
-    // Fall back to default (first model in fallback chain)
-    if let Some(default_model) = fallback_chain.first() {
-        let model_id = default_model.identity.model.clone();
+    // Fall back to the cheapest-capable model. Every route in the chain is
+    // equally capable (a text-capable chat model); prefer the lowest
+    // cost_ranking. The tie-break preserves order, so when costs are equal
+    // (the default 0.0) the primary model (chain index 0) is selected —
+    // keeping primary-model-first semantics.
+    if let Some((_, route)) = fallback_chain
+        .iter()
+        .enumerate()
+        .min_by(|(ia, a), (ib, b)| a.cost_ranking.total_cmp(&b.cost_ranking).then(ia.cmp(ib)))
+    {
+        let model_id = route.identity.model.clone();
+        let cost = route.cost_ranking;
+        debug!(
+            task_class = %format!("{:?}", task_class).to_lowercase(),
+            model_id = %model_id,
+            cost_ranking = cost,
+            "select_model_for_task: no task route; selected cheapest-capable fallback"
+        );
         let reason = format!(
             "no task-specific routing configured for '{}'; \
-             using profile default (highest-priority enabled chat model).",
-            format!("{:?}", task_class).to_lowercase()
+             selected cheapest-capable model '{}' (cost_ranking={}) among {} equally-capable route(s).",
+            format!("{:?}", task_class).to_lowercase(),
+            model_id, cost, fallback_chain.len()
         );
         (model_id, reason)
     } else {
@@ -436,5 +453,47 @@ mod tests {
         let reason = generate_routing_reason(&book, Some(TaskClass::Coding), &signals);
         assert!(reason.contains("Capability match"));
         assert!(reason.contains("high trust"));
+    }
+    #[test]
+    fn test_select_model_for_task_prefers_cheapest_capable() {
+        use gobrowse_core::fake_model::FakeModelProvider;
+        use gobrowse_core::model::ModelIdentity;
+        use std::sync::Arc;
+
+        let mk = |model: &str, cost: f32| ModelRoute {
+            provider: Arc::new(FakeModelProvider::new(model, [])),
+            identity: ModelIdentity {
+                provider: "p".into(),
+                model: model.into(),
+            },
+            supports_tools: false,
+            cost_ranking: cost,
+        };
+        // All routes are equally capable; the strictly cheapest must win.
+        let chain = vec![mk("primary", 1.0), mk("cheapest", 0.2), mk("mid", 0.5)];
+        let (model_id, reason) = select_model_for_task(TaskClass::GeneralQA, &[], &chain);
+        assert_eq!(model_id, "cheapest");
+        assert!(reason.contains("cheapest-capable"));
+    }
+
+    #[test]
+    fn test_select_model_for_task_keeps_primary_when_costs_equal() {
+        use gobrowse_core::fake_model::FakeModelProvider;
+        use gobrowse_core::model::ModelIdentity;
+        use std::sync::Arc;
+
+        let mk = |model: &str, cost: f32| ModelRoute {
+            provider: Arc::new(FakeModelProvider::new(model, [])),
+            identity: ModelIdentity {
+                provider: "p".into(),
+                model: model.into(),
+            },
+            supports_tools: false,
+            cost_ranking: cost,
+        };
+        // Equal cost (the default 0.0) preserves primary-model-first: index 0 wins.
+        let chain = vec![mk("primary", 0.0), mk("other", 0.0)];
+        let (model_id, _) = select_model_for_task(TaskClass::Coding, &[], &chain);
+        assert_eq!(model_id, "primary");
     }
 }

@@ -267,9 +267,9 @@ pub async fn load_routes(
              SELECT route.fallback_model_id,route.position+1 FROM model_fallback_routes route \
              JOIN primary_model ON primary_model.id=route.primary_model_id WHERE route.profile_id=$1 \
          ) \
-         SELECT m.id,m.model_reference,m.capabilities,p.id AS provider_id,p.provider_type,p.base_url,p.secret_reference \
+         SELECT m.id,m.model_reference,m.capabilities,p.id AS provider_id,p.provider_type,p.base_url,p.secret_reference,m.cost_ranking \
          FROM route_ids route JOIN models m ON m.id=route.model_id JOIN providers p ON p.id=m.provider_id \
-         WHERE p.profile_id=$1 AND p.enabled AND m.enabled AND 'text'=ANY(m.capabilities) ORDER BY route.position",
+         WHERE p.profile_id=$1 AND p.enabled AND m.enabled AND 'text'=ANY(m.capabilities) ORDER BY (route.position = 0) DESC, m.cost_ranking ASC NULLS LAST, route.position",
     )
     .bind(profile_id)
     .bind(requested_model_id)
@@ -345,9 +345,11 @@ pub async fn load_routes(
         let provider_id: String = row.get("provider_id");
         let model_reference: String = row.get("model_reference");
         let capabilities: Vec<String> = row.get("capabilities");
+        let cost_ranking: f32 = row.get("cost_ranking");
         let supports_tools = capabilities.iter().any(|c| c == "tool_calls");
         routes.push(ModelRoute {
             supports_tools,
+            cost_ranking,
             provider: Arc::new(HttpChatProvider {
                 id: provider_id.clone(),
                 provider_type,

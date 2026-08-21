@@ -94,6 +94,7 @@ mod tests {
         let routes = vec![
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -102,6 +103,7 @@ mod tests {
             },
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: second,
                 identity: ModelIdentity {
                     provider: "second".into(),
@@ -130,6 +132,7 @@ mod tests {
         let routes = vec![
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -138,6 +141,7 @@ mod tests {
             },
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: second.clone(),
                 identity: ModelIdentity {
                     provider: "second".into(),
@@ -173,6 +177,7 @@ mod tests {
         let routes = vec![
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -181,6 +186,7 @@ mod tests {
             },
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: second,
                 identity: ModelIdentity {
                     provider: "second".into(),
@@ -206,6 +212,7 @@ mod tests {
         let routes = vec![
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: first,
                 identity: ModelIdentity {
                     provider: "first".into(),
@@ -214,6 +221,7 @@ mod tests {
             },
             ModelRoute {
                 supports_tools: false,
+                cost_ranking: 0.0,
                 provider: second.clone(),
                 identity: ModelIdentity {
                     provider: "second".into(),

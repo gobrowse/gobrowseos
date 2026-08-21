@@ -184,6 +184,10 @@ pub struct ModelRoute {
     pub provider: Arc<dyn ModelProvider>,
     pub identity: ModelIdentity,
     pub supports_tools: bool,
+    /// Cheapest-capable routing tie-break. Lower values are preferred when
+    /// multiple routes are equally capable. Defaults to 0.0 (kept for
+    /// backward compatibility; a 0.0 cost never discounts an explicit primary).
+    pub cost_ranking: f32,
 }
 
 /// Opens a model stream using the first route that accepts the request.
