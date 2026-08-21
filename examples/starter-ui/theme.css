@@ -1,0 +1,16 @@
+/* starter-theme — optional file. The server can also generate theme.css from manifest.theme.variables.
+   Override CSS custom properties here. The built-in styles.css defines :root with
+   --ink, --canvas, --surface, --muted, --rule, --blue, --teal, --prov-* etc.
+   This file is served as /api/v1/ui/packages/{id}/theme.css or /api/v1/ui/active-theme.css
+   when the package is active.
+*/
+
+:root {
+  --ink: #0f172a;
+  --canvas: #f8f6f0;
+  --surface: #ffffff;
+  --muted: #607178;
+  --rule: #c8d2d0;
+  --blue: #2457d6;
+  --teal: #0f766e;
+}

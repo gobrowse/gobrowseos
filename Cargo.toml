@@ -5,6 +5,7 @@ members = [
     "crates/gobrowse-sandboxd",
     "crates/gobrowse-server",
     "crates/gobrowse-web",
+    "crates/gobrowse-recovery",
 ]
 
 [workspace.package]

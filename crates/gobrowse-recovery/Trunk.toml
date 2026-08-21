@@ -1,0 +1,11 @@
+[build]
+target = "index.html"
+dist = "../../dist-recovery"
+public_url = "/recovery/"
+
+[watch]
+ignore = ["../../target", "../../dist-recovery"]
+
+[serve]
+address = "127.0.0.1"
+port = 8081

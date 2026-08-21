@@ -1,0 +1,35 @@
+{
+  "kind": "gobrowse-ui",
+  "manifest_version": 1,
+  "name": "starter-theme",
+  "version": "1.0.0",
+  "ui_kind": "THEME",
+  "description": "Starter theme — warm paper, ink, and teal. Copy this directory, rename, and edit theme.variables.",
+  "publisher": {
+    "name": "Gobrowse OS",
+    "url": "https://github.com/gobrowseos/gobrowseos"
+  },
+  "license": "MIT",
+  "api_version": "v1",
+  "min_api_version": "v1",
+  "entry": null,
+  "capabilities": [],
+  "permissions": {
+    "ui_kind": "THEME"
+  },
+  "theme": {
+    "variables": {
+      "--ink": "#0f172a",
+      "--canvas": "#f8f6f0",
+      "--surface": "#ffffff",
+      "--muted": "#607178",
+      "--rule": "#c8d2d0",
+      "--blue": "#2457d6",
+      "--teal": "#0f766e"
+    }
+  },
+  "source": {
+    "repository": "https://github.com/gobrowseos/gobrowseos",
+    "revision": "main"
+  }
+}

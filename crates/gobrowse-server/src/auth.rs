@@ -527,6 +527,16 @@ pub async fn audit(
     Ok(())
 }
 
+pub async fn require_user_or_run(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedUser, AppError> {
+    // M24b: UI endpoints accept both human (session cookie) and agent (run token) auth.
+    // Agent path reuses session auth for now; run-scoped tokens will be added when the
+    // run worker exposes them. Until then, fall back to session auth.
+    require_user(state, headers).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

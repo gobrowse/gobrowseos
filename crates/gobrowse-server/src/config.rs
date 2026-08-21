@@ -151,6 +151,9 @@ pub struct FeatureSettings {
     /// startup). Staging subdirectories are cleaned up after each install.
     #[serde(default = "default_plugins_dir")]
     pub plugins_dir: PathBuf,
+    /// Root directory for UI package artifacts (M24b).
+    #[serde(default = "default_ui_packages_dir")]
+    pub ui_packages_dir: PathBuf,
     /// GitHub API base URL override (test mirrors / self-hosted proxies).
     /// Defaults to `https://api.github.com` when unset.
     #[serde(default)]
@@ -163,6 +166,10 @@ pub struct FeatureSettings {
 
 fn default_plugins_dir() -> PathBuf {
     PathBuf::from("./data/plugins")
+}
+
+fn default_ui_packages_dir() -> PathBuf {
+    PathBuf::from("./data/ui-packages")
 }
 
 const fn default_sandbox_socket_timeout_seconds() -> u64 {
@@ -188,6 +195,7 @@ impl Default for FeatureSettings {
             sandbox_socket_timeout_seconds: default_sandbox_socket_timeout_seconds(),
             sandbox_plugin_image: None,
             plugins_dir: default_plugins_dir(),
+            ui_packages_dir: default_ui_packages_dir(),
             github_api_base_url: None,
             github_raw_base_url: None,
         }

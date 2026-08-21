@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://gobrowse.os/schema/ui-package-manifest.json",
+  "title": "Gobrowse UI package manifest",
+  "type": "object",
+  "required": ["kind", "manifest_version", "name", "version", "ui_kind", "api_version"],
+  "additionalProperties": true,
+  "properties": {
+    "kind": {
+      "type": "string",
+      "const": "gobrowse-ui",
+      "description": "Package kind discriminant."
+    },
+    "manifest_version": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest schema version."
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[a-z0-9][a-z0-9-_\\.]*$",
+      "description": "Unique per profile, DNS-like."
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+.*$",
+      "description": "Semver-ish, e.g. 1.0.0"
+    },
+    "ui_kind": {
+      "type": "string",
+      "enum": ["THEME", "FULL_UI"],
+      "description": "THEME overrides CSS variables; FULL_UI replaces the WASM frontend."
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "publisher": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "maxLength": 200 },
+        "url": { "type": "string", "format": "uri", "maxLength": 2048 }
+      }
+    },
+    "license": {
+      "type": "string",
+      "maxLength": 64,
+      "description": "SPDX identifier, e.g. MIT"
+    },
+    "api_version": {
+      "type": "string",
+      "const": "v1"
+    },
+    "min_api_version": {
+      "type": "string",
+      "enum": ["v1"]
+    },
+    "entry": {
+      "type": ["string", "null"],
+      "description": "FULL_UI: relative path to index.html; THEME: null",
+      "maxLength": 1024
+    },
+    "capabilities": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1, "maxLength": 64 },
+      "maxItems": 32,
+      "description": "Free-form capability tags, e.g. conversations, library"
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "ui_kind": { "type": "string", "enum": ["THEME", "FULL_UI"] }
+      }
+    },
+    "theme": {
+      "type": ["object", "null"],
+      "description": "THEME: {variables: {--ink: #...}}; FULL_UI: null",
+      "properties": {
+        "variables": {
+          "type": "object",
+          "propertyNames": { "pattern": "^--[a-z0-9-]+$" },
+          "additionalProperties": { "type": "string", "minLength": 1, "maxLength": 256 }
+        }
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "repository": { "type": "string", "format": "uri", "maxLength": 2048 },
+        "revision": { "type": "string", "maxLength": 256 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "ui_kind": { "const": "THEME" } } },
+      "then": { "properties": { "entry": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "ui_kind": { "const": "FULL_UI" } } },
+      "then": {
+        "properties": { "entry": { "type": "string", "minLength": 1 } },
+        "required": ["entry"]
+      }
+    }
+  ]
+}

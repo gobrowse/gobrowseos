@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# tools/ui-package — build / package / validate / install helper for gobrowse-ui packages
+# Usage: tools/ui-package <validate|preview|install|package|build> [args]
+# See docs/UI-SDK.md for the contract.
+set -euo pipefail
+
+BASE_URL="${GOBROWSE_BASE_URL:-http://127.0.0.1:8080}"
+SCHEMA="schema/ui-package-manifest.json"
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  tools/ui-package validate <path>               # validate manifest.json against JSON Schema
+  tools/ui-package preview  <path> [--json]      # POST /api/v1/ui/preview, print digest
+  tools/ui-package install  <path> --approve [--base-url URL]  # preview+install, print id/state
+  tools/ui-package package  <path> [--out out.tar.gz]          # tar czf manifest + assets, print sha256
+  tools/ui-package build    <path>               # trunk build --release (FULL_UI)
+USAGE
+  exit 1
+}
+
+die() { echo "error: $*" >&2; exit 1; }
+
+# Resolve manifest path: <path>/manifest.json or <path> itself if it's a file
+resolve_manifest() {
+  local p="$1"
+  if [[ -f "$p/manifest.json" ]]; then echo "$p/manifest.json"
+  elif [[ -f "$p" ]]; then echo "$p"
+  else die "no manifest.json at $p"
+  fi
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  validate)
+    path="${1:-}"; [[ -n "$path" ]] || usage
+    mf="$(resolve_manifest "$path")"
+    echo "→ validating $mf against $SCHEMA"
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - <<PY
+import json, sys, pathlib
+schema_path = pathlib.Path("$SCHEMA")
+manifest_path = pathlib.Path("$mf")
+try:
+    import jsonschema  # type: ignore
+    has_js = True
+except ImportError:
+    has_js = False
+schema = json.loads(schema_path.read_text())
+manifest = json.loads(manifest_path.read_text())
+if has_js:
+    from jsonschema import validate, ValidationError
+    try:
+        validate(manifest, schema)
+        print("✓ manifest valid")
+    except ValidationError as e:
+        print(f"✗ schema violation: {e.message} at {list(e.path)}", file=sys.stderr)
+        sys.exit(1)
+else:
+    # Fallback: minimal checks without jsonschema library
+    required = ["kind","manifest_version","name","version","ui_kind","api_version"]
+    missing = [k for k in required if k not in manifest]
+    if missing:
+        print(f"✗ missing required fields: {missing}", file=sys.stderr)
+        sys.exit(1)
+    if manifest.get("kind") != "gobrowse-ui":
+        print("✗ kind must be gobrowse-ui", file=sys.stderr); sys.exit(1)
+    if manifest.get("manifest_version") != 1:
+        print("✗ manifest_version must be 1", file=sys.stderr); sys.exit(1)
+    if manifest.get("ui_kind") not in ("THEME","FULL_UI"):
+        print("✗ ui_kind must be THEME or FULL_UI", file=sys.stderr); sys.exit(1)
+    if manifest.get("api_version") != "v1":
+        print("✗ api_version must be v1", file=sys.stderr); sys.exit(1)
+    print("✓ manifest valid (fallback checks)")
+PY
+    else
+      # very minimal jq fallback
+      if ! command -v jq >/dev/null 2>&1; then die "need python3 or jq to validate"; fi
+      jq -e '.kind=="gobrowse-ui" and .manifest_version==1 and (.ui_kind=="THEME" or .ui_kind=="FULL_UI")' "$mf" >/dev/null || die "manifest failed minimal jq checks"
+      echo "✓ manifest valid (jq fallback)"
+    fi
+    ;;
+
+  preview)
+    path="${1:-}"; [[ -n "$path" ]] || usage
+    # allow --json flag
+    json_flag=""
+    for a in "$@"; do [[ "$a" == "--json" ]] && json_flag="1"; done
+    mf="$(resolve_manifest "$path")"
+    # Build inline source_uri as inline:JSON
+    manifest_json="$(cat "$mf")"
+    # Escape for JSON string: use python to build request
+    python3 - <<PY
+import json, pathlib, urllib.request, os, sys
+base = os.environ.get("GOBROWSE_BASE_URL", "$BASE_URL")
+mf = pathlib.Path("$mf").read_text()
+body = json.dumps({"source_type":"local_package","source_uri":"inline:"+mf,"manifest": json.loads(mf)})
+req = urllib.request.Request(base+"/api/v1/ui/preview", data=body.encode(), headers={"Content-Type":"application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req) as resp:
+        data = resp.read().decode()
+        j = json.loads(data)
+        if "$json_flag" == "1":
+            print(json.dumps(j, indent=2))
+        else:
+            print(f"digest: {j.get('digest')}")
+            print(f"ui_kind: {j.get('ui_kind')}")
+            print(f"capabilities: {j.get('capabilities')}")
+            print(json.dumps(j.get('manifest'), indent=2))
+except Exception as e:
+    print(f"preview failed: {e}", file=sys.stderr)
+    if hasattr(e, 'read'):
+        try:
+            print(e.read().decode(), file=sys.stderr)
+        except: pass
+    sys.exit(1)
+PY
+    ;;
+
+  install)
+    path="${1:-}"; [[ -n "$path" ]] || usage
+    approve=""
+    base_override=""
+    for a in "$@"; do
+      [[ "$a" == "--approve" ]] && approve="1"
+      [[ "$a" == "--base-url" ]] && base_override="next"
+    done
+    [[ "$approve" == "1" ]] || die "install requires --approve"
+    # two-step: preview to get digest, then install
+    mf="$(resolve_manifest "$path")"
+    python3 - <<PY
+import json, pathlib, urllib.request, os, sys
+base = os.environ.get("GOBROWSE_BASE_URL", "$BASE_URL")
+mf_text = pathlib.Path("$mf").read_text()
+mf_json = json.loads(mf_text)
+# preview
+body = json.dumps({"source_type":"local_package","source_uri":"inline:"+mf_text,"manifest": mf_json})
+req = urllib.request.Request(base+"/api/v1/ui/preview", data=body.encode(), headers={"Content-Type":"application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req) as resp:
+        j = json.loads(resp.read().decode())
+        digest = j["digest"]
+        print(f"preview digest: {digest}", file=sys.stderr)
+except Exception as e:
+    print(f"preview failed: {e}", file=sys.stderr)
+    sys.exit(1)
+# install
+body2 = json.dumps({"source_type":"local_package","source_uri":"inline:"+mf_text,"expected_digest": digest, "approve": True, "manifest": mf_json})
+req2 = urllib.request.Request(base+"/api/v1/ui/install", data=body2.encode(), headers={"Content-Type":"application/json"}, method="POST")
+try:
+    with urllib.request.urlopen(req2) as resp2:
+        j2 = json.loads(resp2.read().decode())
+        print(json.dumps(j2, indent=2))
+except Exception as e:
+    print(f"install failed: {e}", file=sys.stderr)
+    try:
+        print(e.read().decode(), file=sys.stderr)
+    except: pass
+    sys.exit(1)
+PY
+    ;;
+
+  package)
+    path="${1:-}"; [[ -n "$path" ]] || usage
+    out="ui-package.tar.gz"
+    for i in "$@"; do
+      if [[ "$i" == "--out" ]]; then
+        # next arg is out
+        shift
+        out="$1"
+      fi
+    done
+    # If path is directory, tar its contents; else tar the file
+    if [[ -d "$path" ]]; then
+      tar czf "$out" -C "$path" .
+    else
+      tar czf "$out" -C "$(dirname "$path")" "$(basename "$path")"
+    fi
+    sha256sum "$out" | awk '{print $1 "  "$2}'
+    echo "wrote $out"
+    ;;
+
+  build)
+    path="${1:-}"; [[ -n "$path" ]] || usage
+    if ! command -v trunk >/dev/null 2>&1; then die "trunk not found (cargo install trunk)"; fi
+    (cd "$path" && trunk build --release)
+    echo "built $path/dist"
+    ;;
+
+  *) usage ;;
+esac

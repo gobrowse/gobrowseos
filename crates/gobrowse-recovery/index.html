@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0f1419" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'unsafe-inline' 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" />
+    <style>
+      :root{--bg:#0f1419;--card:#1a232e;--border:#2a3441;--fg:#e6e8eb;--muted:#8a9099;--accent:#7ea0ff;--accent-2:#ff7aa2;--ok:#4ade80;--warn:#facc15}
+      *{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial;background:var(--bg);color:var(--fg);min-height:100vh}
+      a{color:var(--accent)}header{padding:16px 20px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;gap:12px}
+      header h1{margin:0;font-size:16px;letter-spacing:-.02em}header span{color:var(--muted);font-size:12px}
+      main{max-width:980px;margin:0 auto;padding:24px;display:grid;gap:16px}
+      .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+      @media(max-width:800px){.grid{grid-template-columns:1fr}}
+      .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px}
+      .card h2{margin:0 0 8px;font-size:14px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+      input,button,select{font:inherit}
+      input,select{width:100%;background:#0f1419;border:1px solid var(--border);color:var(--fg);padding:10px 12px;border-radius:10px}
+      button{background:var(--accent);color:#0f1419;border:0;padding:10px 14px;border-radius:10px;font-weight:600;cursor:pointer}
+      button.secondary{background:transparent;color:var(--fg);border:1px solid var(--border)}
+      button.danger{background:var(--accent-2);color:#0f1419}
+      button:disabled{opacity:.5;cursor:not-allowed}
+      .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+      .badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--border);color:var(--muted)}
+      .badge.active{background:var(--ok);color:#0f1419;border-color:var(--ok)}
+      .badge.previous{background:var(--warn);color:#0f1419;border-color:var(--warn)}
+      .item{display:grid;gap:8px;padding:12px;border:1px solid var(--border);border-radius:12px;background:#141e2a}
+      .item h3{margin:0;font-size:15px}
+      .muted{color:var(--muted);font-size:13px}
+      .error{color:var(--accent-2);font-size:13px}
+      .ok{color:var(--ok);font-size:13px}
+      pre{margin:8px 0;padding:10px;background:#0f1419;border:1px solid var(--border);border-radius:10px;overflow:auto;font-size:12px}
+      noscript{display:block;padding:12px;background:#1a232e;border:1px solid var(--border);border-radius:10px;color:var(--warn)}
+    </style>
+    <title>Gobrowse OS — Recovery</title>
+  </head>
+  <body>
+    <noscript>Recovery requires JavaScript for full functionality, but the API endpoints remain accessible.</noscript>
+  </body>
+</html>

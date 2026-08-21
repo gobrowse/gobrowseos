@@ -1106,6 +1106,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "gobrowse-recovery"
+version = "0.1.0"
+dependencies = [
+ "gloo-net",
+ "leptos",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "gobrowse-sandboxd"
 version = "0.1.0"
 dependencies = [

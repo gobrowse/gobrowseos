@@ -47,7 +47,7 @@ async fn worktree_database_constraints_match_pure_validation_and_quarantine_is_a
             .fetch_one(&pool)
             .await
             .expect("read schema version");
-    assert_eq!(version, 23);
+    assert_eq!(version, 24);
     let branch_fixtures = [
         ("agent/task-safe", true),
         ("agent/closing]bracket", true),

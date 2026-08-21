@@ -787,7 +787,8 @@ impl Tool for LibraryLoadTool {
             }
             Some(gobrowse_core::library::BookKind::Autobiography)
             | None
-            | Some(gobrowse_core::library::BookKind::Source) => {
+            | Some(gobrowse_core::library::BookKind::Source)
+            | Some(gobrowse_core::library::BookKind::GobrowseUi) => {
                 metrics.source_book_loads = metrics.source_book_loads.saturating_add(1);
             }
         }

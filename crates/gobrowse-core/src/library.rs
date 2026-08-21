@@ -85,6 +85,8 @@ pub enum BookKind {
     Mcp,
     Plugin,
     Autobiography,
+    /// Custom UI package (M24b).
+    GobrowseUi,
 }
 
 /// Lifecycle state of a plugin, matching the `plugins.state` column vocabulary.
@@ -484,6 +486,7 @@ mod tests {
             (BookKind::Mcp, "MCP"),
             (BookKind::Plugin, "PLUGIN"),
             (BookKind::Autobiography, "AUTOBIOGRAPHY"),
+            (BookKind::GobrowseUi, "GOBROWSE_UI"),
         ] {
             assert_eq!(
                 serde_json::to_string(&kind).unwrap(),

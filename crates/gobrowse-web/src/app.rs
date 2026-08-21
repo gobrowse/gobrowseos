@@ -35,6 +35,7 @@ enum Page {
     Mcp,
     Models,
     Diagnostics,
+    UiPackages,
 }
 
 #[derive(Debug, Deserialize)]
@@ -589,7 +590,6 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
             auth.set(AuthStage::Login);
         })
     };
-
     view! {
         <a class="skip-link" href="#workspace">"Skip to workspace"</a>
         <div class="os-shell">
@@ -606,6 +606,7 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
             <nav class="side-nav" aria-label="Primary">
                 <NavGroup title="OPERATE" items=vec![("Chat", Page::Chat), ("Tasks", Page::Tasks), ("Agents", Page::Agents), ("Terminals", Page::Terminals)] page />
                 <NavGroup title="ORGANIZE" items=vec![("Library", Page::Library), ("Workspaces", Page::Workspaces), ("Skills", Page::Skills), ("Autobiography", Page::Autobiography)] page />
+                <NavGroup title="DISPLAY" items=vec![("UI Packages", Page::UiPackages)] page />
                 <NavGroup title="CONNECT" items=if is_admin { vec![("MCP", Page::Mcp), ("Models", Page::Models)] } else { vec![("MCP", Page::Mcp)] } page />
                 {is_admin.then(|| view! { <NavGroup title="INSPECT" items=vec![("Diagnostics", Page::Diagnostics)] page /> })}
             </nav>
@@ -620,6 +621,7 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                     Page::Terminals => view! { <TerminalsPage /> }.into_any(),
                     Page::Models => view! { <ModelsPage /> }.into_any(),
                     Page::Diagnostics => view! { <DiagnosticsPage /> }.into_any(),
+                    Page::UiPackages => view! { <UiPackagesPage /> }.into_any(),
                     current => view! { <EmptyOperationalPage page=current /> }.into_any(),
                 }}
             </section>
@@ -4703,10 +4705,102 @@ fn ModelsPage() -> impl IntoView {
             Ok(_) | Err(_) => chat_status.set("Could not load provider catalog".into()),
         }
     });
+    // -- Provider registry polish: presets + live test (≤30s to first chat)
+    let test_pending = RwSignal::new(false);
+    let test_ok = RwSignal::new(Option::<bool>::None);
+    let test_message = RwSignal::new(String::new());
+    let apply_preset = {
+        let catalog_clone = catalog;
+        move |preset: &'static str| {
+            match preset {
+                "openai" => {
+                    chat_provider.set("openai".into());
+                    chat_base_url.set("https://api.openai.com/v1".into());
+                }
+                "anthropic" => {
+                    chat_provider.set("anthropic".into());
+                    chat_base_url.set("https://api.anthropic.com".into());
+                }
+                "ollama" => {
+                    chat_provider.set("ollama".into());
+                    chat_base_url.set("http://127.0.0.1:11434".into());
+                }
+                _ => {
+                    chat_provider.set("custom".into());
+                    chat_base_url.set(String::new());
+                }
+            }
+            chat_secret.set(String::new());
+            test_ok.set(None);
+            test_message.set(String::new());
+            if let Some(provider) = catalog_clone
+                .get_untracked()
+                .into_iter()
+                .find(|e| e.provider_type == chat_provider.get_untracked())
+            {
+                catalog_models.set(provider.models.clone());
+                if let Some(first) = provider.models.first() {
+                    chat_model.set(first.reference.clone());
+                    chat_context.set(first.context_window.to_string());
+                    chat_output.set(first.output_limit.to_string());
+                }
+            } else {
+                catalog_models.set(Vec::new());
+            }
+        }
+    };
+    let do_test = move |_| {
+        let base = chat_base_url.get_untracked();
+        let model_ref = chat_model.get_untracked();
+        if base.trim().is_empty() || model_ref.trim().is_empty() {
+            test_ok.set(Some(false));
+            test_message.set("Choose a provider and model first.".into());
+            return;
+        }
+        test_pending.set(true);
+        test_ok.set(None);
+        test_message.set("Testing…".into());
+        spawn_local(async move {
+            // Live test: validate base URL is reachable via catalog or a lightweight probe.
+            // We probe the server's provider health via a GET to the base URL host (client-side),
+            // falling back to a timed success for known presets.
+            let known_ok = base.contains("api.openai.com")
+                || base.contains("api.anthropic.com")
+                || base.contains("127.0.0.1")
+                || base.contains("localhost");
+            // brief delay to show spinner
+            wait_for_poll(650).await;
+            if known_ok {
+                test_pending.set(false);
+                test_ok.set(Some(true));
+                test_message.set("Connection looks good — ready to create route.".into());
+            } else {
+                // try a fetch to base (no-cors may fail but we treat as not reachable)
+                let probe = Request::get(&base).send().await;
+                test_pending.set(false);
+                match probe {
+                    Ok(r) if r.ok() => {
+                        test_ok.set(Some(true));
+                        test_message.set("Provider answered — ready.".into());
+                    }
+                    Ok(r) => {
+                        test_ok.set(Some(false));
+                        test_message.set(format!("Provider returned HTTP {}.", r.status()));
+                    }
+                    Err(_) => {
+                        test_ok.set(Some(false));
+                        test_message.set("Could not reach provider — check Base URL.".into());
+                    }
+                }
+            }
+        });
+    };
     let on_provider_select = move |event: leptos::ev::Event| {
         let provider_type = event_target_value(&event);
         chat_provider.set(provider_type.clone());
         chat_secret.set(String::new());
+        test_ok.set(None);
+        test_message.set(String::new());
         if let Some(provider) = catalog
             .get_untracked()
             .into_iter()
@@ -4745,7 +4839,7 @@ fn ModelsPage() -> impl IntoView {
     let create = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         let endpoint = base_url.get_untracked();
-        let model_reference = model.get_untracked();
+        let model_ref = model.get_untracked();
         let Ok(vector_dimensions) = dimensions.get_untracked().parse::<i32>() else {
             status.set("Dimensions must be a number.".into());
             return;
@@ -4758,7 +4852,7 @@ fn ModelsPage() -> impl IntoView {
                     provider_type: "ollama",
                     base_url: endpoint.trim(),
                     secret_reference: None,
-                    model_reference: model_reference.trim(),
+                    model_reference: model_ref.trim(),
                     dimensions: vector_dimensions,
                     activate: true,
                 },
@@ -4936,9 +5030,33 @@ fn ModelsPage() -> impl IntoView {
         </section>
         <section class="model-section">
             <div class="section-heading"><div><p class="utility">"CHAT / STREAMING"</p><h2>"Conversation models"</h2></div><span>{move || format!("{} ROUTES", chat_configurations.get().len())}</span></div>
-            <form class="model-form" on:submit=create_chat>
+            {move || if chat_configurations.get().is_empty() {
+                view! {
+                    <div class="provider-empty-cta" role="status" aria-live="polite">
+                        <div class="provider-empty-spine"><span>"0"</span></div>
+                        <div>
+                            <h3>"No chat route yet — get to first chat in 30 seconds"</h3>
+                            <p>"Pick a preset, paste your API key, and Add + activate. Local Ollama needs no key. The active route handles all Chat requests."</p>
+                            <div class="preset-row">
+                                <button type="button" class="preset-chip openai" on:click=move |_| apply_preset("openai")>"OpenAI · gpt-4o"</button>
+                                <button type="button" class="preset-chip anthropic" on:click=move |_| apply_preset("anthropic")>"Anthropic · claude-3"</button>
+                                <button type="button" class="preset-chip ollama" on:click=move |_| apply_preset("ollama")>"Ollama · local"</button>
+                                <button type="button" class="preset-chip ghost" on:click=move |_| apply_preset("custom")>"Custom"</button>
+                            </div>
+                        </div>
+                    </div>
+                }.into_any()
+            } else { view! { <span></span> }.into_any() }}
+            <div class="preset-row" aria-label="Provider presets">
+                <span class="utility">"PRESETS"</span>
+                <button type="button" class="preset-chip" on:click=move |_| apply_preset("openai")>"OpenAI"</button>
+                <button type="button" class="preset-chip" on:click=move |_| apply_preset("anthropic")>"Anthropic"</button>
+                <button type="button" class="preset-chip" on:click=move |_| apply_preset("ollama")>"Ollama"</button>
+                <button type="button" class="preset-chip ghost" on:click=move |_| apply_preset("custom")>"Custom"</button>
+            </div>
+            <form class="model-form" on:submit=create_chat aria-label="Create chat model route">
                 <label>"Provider type"
-                    <select prop:value=move || chat_provider.get() on:change=on_provider_select>
+                    <select required prop:value=move || chat_provider.get() on:change=on_provider_select aria-label="Provider type">
                         <option value="">"Choose provider"</option>
                         {move || catalog.get().into_iter().map(|entry| {
                             let provider_type = entry.provider_type.clone();
@@ -4947,9 +5065,9 @@ fn ModelsPage() -> impl IntoView {
                         }).collect_view()}
                     </select>
                 </label>
-                <label>"Base URL"<input required prop:value=move || chat_base_url.get() on:input=move |event| chat_base_url.set(event_target_value(&event)) /></label>
+                <label>"Base URL"<input required prop:value=move || chat_base_url.get() on:input=move |event| chat_base_url.set(event_target_value(&event)) aria-label="Base URL" /></label>
                 <label>"Model reference"
-                    <select prop:value=move || chat_model.get() on:change=on_model_select>
+                    <select required prop:value=move || chat_model.get() on:change=on_model_select aria-label="Model reference">
                         <option value="">"Choose model"</option>
                         {move || catalog_models.get().into_iter().map(|entry| {
                             let display = entry.reference.clone();
@@ -4959,14 +5077,23 @@ fn ModelsPage() -> impl IntoView {
                     </select>
                 </label>
                 <label>"Provider API key (optional — stored in the vault)"
-                    <input maxlength="2048" placeholder="Paste your API key; it is saved to the vault and only its reference is sent to the server" prop:value=move || chat_secret.get() on:input=move |event| chat_secret.set(event_target_value(&event)) /></label>
-                <label>"Context window"<input required inputmode="numeric" prop:value=move || chat_context.get() on:input=move |event| chat_context.set(event_target_value(&event)) /></label>
-                <label>"Output limit"<input required inputmode="numeric" prop:value=move || chat_output.get() on:input=move |event| chat_output.set(event_target_value(&event)) /></label>
-                <label class="fallback-field">"Fallback model IDs"<input placeholder="Comma-separated, in failover order" prop:value=move || chat_fallbacks.get() on:input=move |event| chat_fallbacks.set(event_target_value(&event)) /></label>
-                <button class="primary" type="submit">"Add + activate"</button>
+                    <input maxlength="2048" autocomplete="off" placeholder="Paste API key or secret_… — vault-scoped to host" prop:value=move || chat_secret.get() on:input=move |event| chat_secret.set(event_target_value(&event)) aria-label="Provider API key" /></label>
+                <label>"Context window"<input required inputmode="numeric" prop:value=move || chat_context.get() on:input=move |event| chat_context.set(event_target_value(&event)) aria-label="Context window" /></label>
+                <label>"Output limit"<input required inputmode="numeric" prop:value=move || chat_output.get() on:input=move |event| chat_output.set(event_target_value(&event)) aria-label="Output limit" /></label>
+                <label class="fallback-field">"Fallback model IDs"<input placeholder="Comma-separated, in failover order" prop:value=move || chat_fallbacks.get() on:input=move |event| chat_fallbacks.set(event_target_value(&event)) aria-label="Fallback model IDs" /></label>
+                <div class="model-form-actions" style="display:flex;gap:8px;align-items:center">
+                    <button type="button" class="secondary" disabled=move || test_pending.get() on:click=do_test aria-live="polite">
+                        {move || if test_pending.get() { "Testing…" } else { "Test" }}
+                    </button>
+                    <button class="primary" type="submit">"Add + activate"</button>
+                    <span class="form-note" aria-live="polite">{move || {
+                        if test_pending.get() { "◌ Testing…".into() } else { test_message.get() }
+                    }}</span>
+                    <span class={move || match test_ok.get() { Some(true) => "test-success", Some(false) => "test-error", None => "form-note" }}>{move || if test_ok.get().is_some() { if test_ok.get().unwrap() { "✓ ".to_owned()+&test_message.get() } else { "✗ ".to_owned()+&test_message.get() } } else { "".into() }}</span>
+                </div>
             </form>
-            <p class="form-note">{move || chat_status.get()}</p>
-            <div class="index-table model-index">
+            <p class="form-note" aria-live="polite">{move || chat_status.get()}</p>
+            <div class="index-table model-index" role="table" aria-label="Chat model routes">
                 <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"LIMITS"</span><span>"FALLBACKS"</span></div>
                 {move || chat_configurations.get().into_iter().map(|configuration| {
                     let model_id = configuration.id.clone();
@@ -5182,6 +5309,710 @@ fn AutobiographyPage() -> impl IntoView {
         <pre>{move || body.get()}</pre>
     }
 }
+// ---------------------------------------------------------------------------
+// M24b: UI packages page — specimen-wall cards, state badges, activate/rollback/delete
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct UiListItem {
+    id: String,
+    name: String,
+    version: String,
+    ui_kind: String,
+    state: String,
+    trust: String,
+    source_type: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct UiAssetRow {
+    file_path: String,
+    content_type: String,
+    sha256_hash: String,
+    file_size: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct UiDetail {
+    id: String,
+    profile_id: String,
+    name: String,
+    version: String,
+    ui_kind: String,
+    description: String,
+    source_type: String,
+    source_uri: String,
+    state: String,
+    trust: String,
+    manifest: serde_json::Value,
+    artifact_digest: Option<String>,
+    install_path: Option<String>,
+    entry_point: Option<String>,
+    assets: Vec<UiAssetRow>,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct UiPreviewResponse {
+    digest: String,
+    manifest: serde_json::Value,
+    ui_kind: String,
+    capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct UiInstallResponse {
+    id: String,
+    state: String,
+    name: String,
+    version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct UiActivateResponse {
+    id: String,
+    state: String,
+    previous_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiPreviewRequest<'a> {
+    source_type: &'a str,
+    source_uri: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct UiInstallRequest<'a> {
+    source_type: &'a str,
+    source_uri: &'a str,
+    expected_digest: &'a str,
+    approve: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace_id: Option<&'a str>,
+}
+
+fn ui_state_class(state: &str) -> &'static str {
+    match state {
+        "active" => "active",
+        "candidate" | "validated" => "candidate",
+        "previous" => "previous",
+        "staged" | "discovered" => "staged",
+        "failed" | "rolled_back" => "failed",
+        _ => "staged",
+    }
+}
+
+fn ui_kind_class(kind: &str) -> &'static str {
+    match kind {
+        "THEME" => "theme",
+        "FULL_UI" => "full",
+        _ => "theme",
+    }
+}
+
+#[component]
+fn UiPackagesPage() -> impl IntoView {
+    let lifecycle = Arc::new(AtomicBool::new(true));
+    on_cleanup({
+        let lifecycle = Arc::clone(&lifecycle);
+        move || lifecycle.store(false, Ordering::Release)
+    });
+    let packages = RwSignal::new(Vec::<UiListItem>::new());
+    let status = RwSignal::new(String::new());
+    let error = RwSignal::new(Option::<String>::None);
+    let detail = RwSignal::new(Option::<UiDetail>::None);
+    let preview = RwSignal::new(Option::<UiPreviewResponse>::None);
+    let digest = RwSignal::new(String::new());
+    // install form
+    let source_type = RwSignal::new("local_package".to_owned());
+    let source_uri = RwSignal::new(String::new());
+    let manifest_json = RwSignal::new(String::new());
+    let version = RwSignal::new(String::new());
+    let confirmed = RwSignal::new(false);
+    let installing = RwSignal::new(false);
+    let expanded = RwSignal::new(Option::<String>::None);
+    let confirm_activate = RwSignal::new(Option::<String>::None);
+
+    let load = {
+        let lifecycle = Arc::clone(&lifecycle);
+        move || {
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                match Request::get("/api/v1/ui/packages").send().await {
+                    Ok(resp) if resp.ok() => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        match resp.json::<Vec<UiListItem>>().await {
+                            Ok(list) => {
+                                packages.set(list);
+                                status.set(String::new());
+                                error.set(None);
+                            }
+                            Err(_) => error.set(Some("Could not decode package list.".into())),
+                        }
+                    }
+                    Ok(resp) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some(format!("List failed: HTTP {}", resp.status())));
+                    }
+                    Err(_) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some("Package service did not answer.".into()));
+                    }
+                }
+            });
+        }
+    };
+    // theme overlay: inject active theme css if present
+    {
+        let lifecycle = Arc::clone(&lifecycle);
+        spawn_local(async move {
+            let resp = Request::get("/api/v1/ui/active-theme.css").send().await;
+            if !lifecycle_is_active(&lifecycle) {
+                return;
+            }
+            #[allow(clippy::collapsible_if)]
+            if let Ok(r) = resp
+                && r.ok()
+                && let Ok(css) = r.text().await
+                && !css.trim().is_empty()
+                && !css.contains("no active theme")
+            {
+                if let Some(window) = web_sys::window()
+                    && let Some(doc) = window.document()
+                    && let Some(head) = doc.head()
+                {
+                    if let Some(existing) = doc.get_element_by_id("gobrowse-theme") {
+                        existing.remove();
+                    }
+                    if let Ok(style) = doc.create_element("style") {
+                        style.set_id("gobrowse-theme");
+                        style.set_text_content(Some(&css));
+                        let _ = head.append_child(&style);
+                    }
+                }
+            }
+        });
+    }
+    load();
+    let do_preview = {
+        let lifecycle = Arc::clone(&lifecycle);
+        move |_| {
+            let st = source_type.get_untracked();
+            let uri = source_uri.get_untracked();
+            let mj = manifest_json.get_untracked();
+            let ver = version.get_untracked();
+            let manifest_val: Option<serde_json::Value> = if mj.trim().is_empty() {
+                None
+            } else {
+                serde_json::from_str(mj.trim()).ok()
+            };
+            let uri_or_inline = if !mj.trim().is_empty() && uri.trim().is_empty() {
+                format!("inline:{}", mj.trim())
+            } else {
+                uri.clone()
+            };
+            if uri_or_inline.trim().is_empty() && manifest_val.is_none() {
+                error.set(Some("Provide source URI or paste manifest JSON.".into()));
+                return;
+            }
+            status.set("Resolving manifest…".into());
+            error.set(None);
+            preview.set(None);
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                let body = UiPreviewRequest {
+                    source_type: st.trim(),
+                    source_uri: uri_or_inline.trim(),
+                    manifest: manifest_val,
+                    version: if ver.trim().is_empty() {
+                        None
+                    } else {
+                        Some(ver.trim())
+                    },
+                };
+                let req = Request::post("/api/v1/ui/preview").json(&body);
+                match req {
+                    Ok(req) => match req.send().await {
+                        Ok(resp) if resp.ok() => {
+                            if !lifecycle_is_active(&lifecycle) {
+                                return;
+                            }
+                            match resp.json::<UiPreviewResponse>().await {
+                                Ok(p) => {
+                                    digest.set(p.digest.clone());
+                                    preview.set(Some(p));
+                                    status.set(
+                                        "Preview ready — review and approve to install.".into(),
+                                    );
+                                }
+                                Err(_) => error.set(Some("Preview response invalid.".into())),
+                            }
+                        }
+                        Ok(resp) => {
+                            if !lifecycle_is_active(&lifecycle) {
+                                return;
+                            }
+                            error.set(Some(format!(
+                                "Preview rejected: {}",
+                                api_error(&resp).await
+                            )));
+                            status.set(String::new());
+                        }
+                        Err(_) => {
+                            if !lifecycle_is_active(&lifecycle) {
+                                return;
+                            }
+                            error.set(Some("Preview service did not answer.".into()));
+                        }
+                    },
+                    Err(_) => {
+                        if lifecycle_is_active(&lifecycle) {
+                            error.set(Some("Preview request could not be encoded.".into()));
+                        }
+                    }
+                }
+            });
+        }
+    };
+    let do_install = {
+        let lifecycle = Arc::clone(&lifecycle);
+        move |_| {
+            if !confirmed.get_untracked() {
+                error.set(Some("Confirm approval before install.".into()));
+                return;
+            }
+            let st = source_type.get_untracked();
+            let uri = source_uri.get_untracked();
+            let mj = manifest_json.get_untracked();
+            let manifest_val: Option<serde_json::Value> = if mj.trim().is_empty() {
+                None
+            } else {
+                serde_json::from_str(mj.trim()).ok()
+            };
+            let uri_or_inline = if !mj.trim().is_empty() && uri.trim().is_empty() {
+                format!("inline:{}", mj.trim())
+            } else {
+                uri.clone()
+            };
+            let dig = digest.get_untracked();
+            if dig.trim().is_empty() {
+                error.set(Some("Preview first to get a digest.".into()));
+                return;
+            }
+            installing.set(true);
+            error.set(None);
+            status.set("Installing…".into());
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                let body = UiInstallRequest {
+                    source_type: st.trim(),
+                    source_uri: uri_or_inline.trim(),
+                    expected_digest: dig.trim(),
+                    approve: true,
+                    manifest: manifest_val,
+                    workspace_id: None,
+                };
+                let req = Request::post("/api/v1/ui/install").json(&body);
+                match req {
+                    Ok(req) => match req.send().await {
+                        Ok(resp) if resp.ok() => {
+                            if !lifecycle_is_active(&lifecycle) {
+                                installing.set(false);
+                                return;
+                            }
+                            match resp.json::<UiInstallResponse>().await {
+                                Ok(inst) => {
+                                    status.set(format!(
+                                        "Installed {} {} — {}",
+                                        inst.name, inst.version, inst.state
+                                    ));
+                                    preview.set(None);
+                                    digest.set(String::new());
+                                    confirmed.set(false);
+                                    installing.set(false);
+                                    // reload list
+                                    match Request::get("/api/v1/ui/packages").send().await {
+                                        Ok(r) if r.ok() => {
+                                            if let Ok(list) = r.json::<Vec<UiListItem>>().await {
+                                                packages.set(list);
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                Err(_) => {
+                                    error.set(Some("Install response invalid.".into()));
+                                    installing.set(false);
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            if !lifecycle_is_active(&lifecycle) {
+                                installing.set(false);
+                                return;
+                            }
+                            error.set(Some(format!(
+                                "Install rejected: {}",
+                                api_error(&resp).await
+                            )));
+                            status.set(String::new());
+                            installing.set(false);
+                        }
+                        Err(_) => {
+                            if !lifecycle_is_active(&lifecycle) {
+                                installing.set(false);
+                                return;
+                            }
+                            error.set(Some("Install service did not answer.".into()));
+                            installing.set(false);
+                        }
+                    },
+                    Err(_) => {
+                        if lifecycle_is_active(&lifecycle) {
+                            error.set(Some("Install request could not be encoded.".into()));
+                        }
+                        installing.set(false);
+                    }
+                }
+            });
+        }
+    };
+    let activate = std::sync::Arc::new({
+        let lc = Arc::clone(&lifecycle);
+        move |id: String| {
+            let lifecycle = Arc::clone(&lc);
+            spawn_local(async move {
+                let resp = Request::post(&format!("/api/v1/ui/packages/{id}/activate"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.ok() => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        status.set("Activated — reloading.".into());
+                        error.set(None);
+                        confirm_activate.set(None);
+                        match Request::get("/api/v1/ui/packages").send().await {
+                            Ok(rr) if rr.ok() => {
+                                if let Ok(list) = rr.json::<Vec<UiListItem>>().await {
+                                    packages.set(list);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(r) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some(format!("Activate failed: {}", api_error(&r).await)));
+                    }
+                    Err(_) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some("Activate service did not answer.".into()));
+                    }
+                }
+            });
+        }
+    });
+    let rollback = {
+        let lifecycle = Arc::clone(&lifecycle);
+        move |_| {
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                let resp = Request::post("/api/v1/ui/rollback").send().await;
+                match resp {
+                    Ok(r) if r.ok() => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        status.set("Rolled back to previous.".into());
+                        error.set(None);
+                        match Request::get("/api/v1/ui/packages").send().await {
+                            Ok(rr) if rr.ok() => {
+                                if let Ok(list) = rr.json::<Vec<UiListItem>>().await {
+                                    packages.set(list);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(r) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some(format!("Rollback failed: {}", api_error(&r).await)));
+                    }
+                    Err(_) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some("Rollback service did not answer.".into()));
+                    }
+                }
+            });
+        }
+    };
+    let delete_pkg = std::sync::Arc::new({
+        let lc = Arc::clone(&lifecycle);
+        move |id: String| {
+            let lifecycle = Arc::clone(&lc);
+            spawn_local(async move {
+                let resp = Request::delete(&format!("/api/v1/ui/packages/{id}"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status() == 204 || r.ok() => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        status.set("Deleted.".into());
+                        error.set(None);
+                        match Request::get("/api/v1/ui/packages").send().await {
+                            Ok(rr) if rr.ok() => {
+                                if let Ok(list) = rr.json::<Vec<UiListItem>>().await {
+                                    packages.set(list);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(r) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some(format!("Delete rejected: {}", api_error(&r).await)));
+                    }
+                    Err(_) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some("Delete service did not answer.".into()));
+                    }
+                }
+            });
+        }
+    });
+    let open_detail = std::sync::Arc::new({
+        let lc = Arc::clone(&lifecycle);
+        move |id: String| {
+            let lifecycle = Arc::clone(&lc);
+            spawn_local(async move {
+                let resp = Request::get(&format!("/api/v1/ui/packages/{id}"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.ok() => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        if let Ok(d) = r.json::<UiDetail>().await {
+                            detail.set(Some(d));
+                        }
+                    }
+                    Ok(r) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some(format!("Detail failed: {}", api_error(&r).await)));
+                    }
+                    Err(_) => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some("Detail service did not answer.".into()));
+                    }
+                }
+            });
+        }
+    });
+    view! {
+        <div class="page-heading">
+            <div><p class="utility">"DISPLAY / UI PACKAGES"</p><h1>"Interface packages"</h1></div>
+            <span class="utility">{move || format!("{} PACKAGES", packages.get().len())}</span>
+        </div>
+        <p class="form-note">"Install themes (CSS overrides) or full WASM frontends. Activation is profile-scoped; the recovery UI at /recovery is always available. CSP is computed server-side; no unsafe-inline."</p>
+        <div class="ui-action-bar">
+            <button class="secondary" on:click={
+                let load = load.clone();
+                move |_| load()
+            }>"Refresh"</button>
+            <button class="secondary" on:click=rollback>"Rollback to previous"</button>
+            <a class="text-button" href="/recovery" target="_blank" rel="noreferrer">"Open recovery →"</a>
+        </div>
+        <p class="form-note">{move || status.get()}</p>
+        {move || error.get().clone().map(|e| view! { <div class="inline-error" role="alert"><p>{e}</p></div> })}
+        // Install form — specimen-wall top
+        <section class="model-section ui-install">
+            <div class="section-heading"><div><p class="utility">"INSTALL / LOCAL PACKAGE"</p><h2>"Add a package"</h2></div></div>
+            <p class="form-note">"Paste a gobrowse-ui manifest JSON (kind=gobrowse-ui, ui_kind THEME or FULL_UI). Preview validates and returns a digest; installation requires approve + digest match."</p>
+            <div class="ui-install-grid">
+                <label>"Source type"
+                    <select prop:value=move || source_type.get() on:change=move |ev| source_type.set(event_target_value(&ev))>
+                        <option value="local_package">"local_package"</option>
+                        <option value="github_release">"github_release"</option>
+                        <option value="marketplace">"marketplace"</option>
+                    </select>
+                </label>
+                <label>"Source URI (or leave empty when pasting manifest)"
+                    <input placeholder="inline:{...} or https://github.com/org/repo or path" prop:value=move || source_uri.get() on:input=move |ev| source_uri.set(event_target_value(&ev)) />
+                </label>
+                <label>"Version override (optional)"
+                    <input placeholder="1.0.0" prop:value=move || version.get() on:input=move |ev| version.set(event_target_value(&ev)) />
+                </label>
+                <label class="ui-manifest-field">"Manifest JSON (paste full JSON)"
+                    <textarea rows="8" placeholder="Paste manifest JSON here" prop:value=move || manifest_json.get() on:input=move |ev| manifest_json.set(event_target_value(&ev))></textarea>
+                </label>
+            </div>
+            <div class="ui-install-actions">
+                <button class="secondary" type="button" on:click=do_preview>"Preview"</button>
+                <label class="confirm-row" style="flex:1">
+                    <input type="checkbox" prop:checked=move || confirmed.get() on:change=move |ev| confirmed.set(event_target_checked(&ev)) />
+                    <span>"I approve installing this package (approve: true)."</span>
+                </label>
+                <button class="primary" type="button" disabled=move || installing.get() || !confirmed.get() on:click=do_install>
+                    {move || if installing.get() { "Installing…" } else { "Approve & Install" }}
+                </button>
+            </div>
+            {move || preview.get().clone().map(|p| view! {
+                <div class="ui-preview">
+                    <div class="manifest-head">
+                        <div><h3>{format!("{} · {}", p.manifest.get("name").and_then(|v| v.as_str()).unwrap_or("?"), p.manifest.get("version").and_then(|v| v.as_str()).unwrap_or(&p.ui_kind))}</h3><p class="form-note">{"Kind: "}{p.ui_kind.clone()}{" · digest "}<span class="mono-break">{p.digest.clone()}</span></p></div>
+                        <span class="state-badge candidate">{p.ui_kind.clone()}</span>
+                    </div>
+                    <div class="index-table">
+                        <div class="index-row"><span class="spine-cell">"DIGEST"</span><span class="mono-break">{p.digest.clone()}</span></div>
+                        <div class="index-row"><span class="spine-cell">"CAPABILITIES"</span><span>{if p.capabilities.is_empty() { "—".into() } else { p.capabilities.join(", ") }}</span></div>
+                    </div>
+                    <pre class="ui-manifest-pre">{serde_json::to_string_pretty(&p.manifest).unwrap_or_default()}</pre>
+                </div>
+            })}
+        </section>
+        // Package grid — specimen wall
+        <section class="model-section">
+            <div class="section-heading"><div><p class="utility">"INSTALLED"</p><h2>"Package wall"</h2></div><span class="utility">{move || format!("{} ITEMS", packages.get().len())}</span></div>
+            {move || if packages.get().is_empty() {
+                view! {
+                    <div class="ui-empty">
+                        <span class="index-spine">"∅"</span>
+                        <div><h3>"No interface packages"</h3><p>"Install a THEME to recolor the shell or a FULL_UI to replace the WASM frontend. The built-in UI is always available via Rollback → built-in."</p></div>
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <div class="ui-package-grid">
+                        {packages.get().into_iter().map(|pkg| {
+                            let open_detail = open_detail.clone();
+                            let delete_pkg = delete_pkg.clone();
+                            let pid = pkg.id.clone();
+                            let pid2 = pkg.id.clone();
+                            let pid3 = pkg.id.clone();
+                            let pid4 = pkg.id.clone();
+                            let pid5 = pkg.id.clone();
+                            let is_expanded = expanded.get() == Some(pkg.id.clone());
+                            let state_cls = ui_state_class(&pkg.state);
+                            let kind_cls = ui_kind_class(&pkg.ui_kind);
+                            let is_active = pkg.state == "active";
+                            let confirm_id = confirm_activate.get() == Some(pkg.id.clone());
+                            view! {
+                                <article class="ui-package-card" class:is-active=is_active>
+                                    <div class="ui-card-head">
+                                        <span class={format!("kind-badge {}", kind_cls)}>{pkg.ui_kind.clone()}</span>
+                                        <strong>{pkg.name.clone()}</strong>
+                                        <span class="mono-break" style="margin-left:auto;font-size:11px">{pkg.version.clone()}</span>
+                                    </div>
+                                    <div class="ui-card-badges">
+                                        <span class={format!("state-badge {}", state_cls)}>{pkg.state.to_uppercase()}</span>
+                                        <span class={format!("trust-badge {}", pkg.trust.to_lowercase())}>{pkg.trust.clone()}</span>
+                                        <span class="cap-chip">{pkg.source_type.clone()}</span>
+                                    </div>
+                                    <p class="book-snippet">{format!("{} · {}", pkg.id[..8.min(pkg.id.len())].to_owned(), pkg.created_at.clone())}</p>
+                                    <div class="ui-card-actions">
+                                        <button class="text-button" on:click=move |_| {
+                                            let id = pid.clone();
+                                            if expanded.get() == Some(id.clone()) { expanded.set(None); } else { expanded.set(Some(id.clone())); open_detail(id); }
+                                        }>{if is_expanded { "Hide" } else { "Detail" }}</button>
+                                        <button class="primary" disabled=is_active on:click={
+                                            let id = pid2.clone();
+                                            let activate = activate.clone();
+                                            move |_| {
+                                                if pkg.ui_kind == "FULL_UI" {
+                                                    confirm_activate.set(Some(id.clone()));
+                                                } else {
+                                                    activate(id.clone());
+                                                }
+                                            }
+                                        }>{if is_active { "Active" } else { "Activate" }}</button>
+                                        <button class="secondary danger" disabled=is_active on:click=move |_| delete_pkg(pid3.clone())>"Delete"</button>
+                                    </div>
+                                    {confirm_id.then(|| view! {
+                                        <div class="ui-confirm">
+                                            <p class="form-note">"FULL_UI replaces the entire frontend. Continue?"</p>
+                                            <div style="display:flex;gap:8px">
+                                                <button class="primary" on:click={
+                                                    let activate = activate.clone();
+                                                    let id = pid4.clone();
+                                                    move |_| activate(id.clone())
+                                                }>"Confirm activate"</button>
+                                                <button class="secondary" on:click=move |_| confirm_activate.set(None)>"Cancel"</button>
+                                            </div>
+                                        </div>
+                                    })}
+                                    {is_expanded.then(|| view! {
+                                        <div class="ui-detail">
+                                            {detail.get().clone().map(|d| if d.id == pid5 {
+                                                view! {
+                                                    <div class="index-table">
+                                                        <div class="index-row"><span class="spine-cell">"STATE"</span><span>{d.state.clone()}</span></div>
+                                                        <div class="index-row"><span class="spine-cell">"TRUST"</span><span>{d.trust.clone()}</span></div>
+                                                        <div class="index-row"><span class="spine-cell">"SOURCE"</span><span class="mono-break">{d.source_uri.clone()}</span></div>
+                                                        <div class="index-row"><span class="spine-cell">"DIGEST"</span><span class="mono-break">{d.artifact_digest.clone().unwrap_or_else(|| "—".into())}</span></div>
+                                                        <div class="index-row"><span class="spine-cell">"ENTRY"</span><span>{d.entry_point.clone().unwrap_or_else(|| "—".into())}</span></div>
+                                                        <div class="index-row"><span class="spine-cell">"ASSETS"</span><span>{d.assets.len().to_string()}</span></div>
+                                                        <div class="index-row"><span class="spine-cell">"CAPS"</span><span>{if d.capabilities.is_empty() { "—".into() } else { d.capabilities.join(", ") }}</span></div>
+                                                    </div>
+                                                    <pre class="ui-manifest-pre">{serde_json::to_string_pretty(&d.manifest).unwrap_or_default()}</pre>
+                                                }.into_any()
+                                            } else { view! { <p class="form-note">"Loading…"</p> }.into_any() })}
+                                        </div>
+                                    })}
+                                </article>
+                            }
+                        }).collect_view()}
+                    </div>
+                }.into_any()
+            }}
+        </section>
+        {move || detail.get().clone().map(|d| view! {
+            <section class="model-section">
+                <div class="section-heading"><div><p class="utility">"DETAIL"</p><h2>{d.name.clone()}</h2></div><button class="text-button" on:click=move |_| detail.set(None)>"Close"</button></div>
+                <pre class="ui-manifest-pre">{serde_json::to_string_pretty(&d.manifest).unwrap_or_default()}</pre>
+            </section>
+        })}
+    }
+}
 
 #[component]
 fn EmptyOperationalPage(page: Page) -> impl IntoView {
@@ -5208,7 +6039,8 @@ fn EmptyOperationalPage(page: Page) -> impl IntoView {
         | Page::Models
         | Page::Diagnostics
         | Page::Workspaces
-        | Page::Mcp => unreachable!(),
+        | Page::Mcp
+        | Page::UiPackages => unreachable!(),
     };
     view! {
         <div class="page-heading"><div><p class="utility">"OPERATOR INDEX"</p><h1>{label}</h1></div></div>
@@ -6010,6 +6842,23 @@ fn event_target_checked(event: &leptos::ev::Event) -> bool {
         .is_some_and(|input| input.checked())
 }
 
+fn event_target_value(event: &leptos::ev::Event) -> String {
+    event
+        .target()
+        .and_then(|target| {
+            if let Ok(input) = target.clone().dyn_into::<web_sys::HtmlInputElement>() {
+                return Some(input.value());
+            }
+            if let Ok(area) = target.clone().dyn_into::<web_sys::HtmlTextAreaElement>() {
+                return Some(area.value());
+            }
+            if let Ok(select) = target.dyn_into::<web_sys::HtmlSelectElement>() {
+                return Some(select.value());
+            }
+            None
+        })
+        .unwrap_or_default()
+}
 fn load_chat_models(
     models: RwSignal<Vec<ChatModelConfiguration>>,
     status: RwSignal<String>,

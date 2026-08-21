@@ -317,6 +317,7 @@ pub(crate) async fn load_book_content(
         Some("MCP") => BookKind::Mcp,
         Some("PLUGIN") => BookKind::Plugin,
         Some("AUTOBIOGRAPHY") => BookKind::Autobiography,
+        Some("GOBROWSE_UI") => BookKind::GobrowseUi,
         Some(_) => return Err(AppError::Validation("book has an unknown kind".into())),
     };
     let book_type_enum = parse_book_type(&book_type)?;
@@ -367,6 +368,23 @@ pub(crate) async fn load_book_content(
         BookKind::Mcp => load_mcp_payload(state, profile_id, &metadata, &meta, component).await?,
         BookKind::Plugin => {
             load_plugin_payload(state, profile_id, &metadata, &meta, component).await?
+        }
+        BookKind::GobrowseUi => {
+            let bounded = truncate_chars(&body, SOURCE_BODY_MAX_CHARS);
+            LoadedBookPayload {
+                book_id,
+                kind: Some(BookKind::GobrowseUi),
+                loaded_chars: bounded.chars().count(),
+                tools_discovered: 0,
+                tools_loaded: 0,
+                payload: serde_json::json!({
+                    "kind": "GOBROWSE_UI", "body": bounded, "revision": meta.revision, "metadata": metadata
+                }),
+                title: meta.title.clone(),
+                book_type: meta.book_type,
+                trust: meta.trust,
+                revision: meta.revision,
+            }
         }
     };
     Ok(loaded)

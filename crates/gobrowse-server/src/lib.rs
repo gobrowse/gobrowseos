@@ -1,9 +1,11 @@
 pub mod api;
 pub mod auth;
 pub mod autobiography_api;
+pub mod capabilities_api;
 pub mod chat;
 pub mod config;
 pub mod conversation_api;
+pub mod csp;
 pub mod db;
 pub mod doctor;
 pub mod embedding;
@@ -24,6 +26,7 @@ pub mod sandbox_api;
 pub mod sandbox_client;
 pub mod skills_api;
 pub mod task_api;
+pub mod ui_api;
 pub mod usage_api;
 pub mod vault;
 pub mod vault_api;
@@ -33,13 +36,21 @@ pub mod worktree_api;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
+use crate::{
+    auth::PasswordRuntime,
+    config::Settings,
+    error::AppError,
+    plugin_github::{GitHubMarketplace, GitHubReleaseSource},
+    sandbox_client::{SandboxClient, SandboxClientError, SandboxConfig},
+    vault::Vault,
+};
 use axum::{
     Router,
     body::Body,
-    extract::{DefaultBodyLimit, Request, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{Method, StatusCode, header},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use sqlx::PgPool;
@@ -50,18 +61,8 @@ use tower_http::{
     compression::CompressionLayer,
     request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     sensitive_headers::SetSensitiveRequestHeadersLayer,
-    services::{ServeDir, ServeFile},
     timeout::TimeoutLayer,
     trace::TraceLayer,
-};
-
-use crate::{
-    auth::PasswordRuntime,
-    config::Settings,
-    error::AppError,
-    plugin_github::{GitHubMarketplace, GitHubReleaseSource},
-    sandbox_client::{SandboxClient, SandboxClientError, SandboxConfig},
-    vault::Vault,
 };
 
 /// Lazily-connected sandbox client.
@@ -93,6 +94,50 @@ impl SandboxHandle {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum UiKind {
+    Theme,
+    FullUi,
+}
+
+impl std::str::FromStr for UiKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "THEME" => Ok(Self::Theme),
+            "FULL_UI" => Ok(Self::FullUi),
+            other => Err(format!("unknown ui_kind {other}")),
+        }
+    }
+}
+
+impl std::fmt::Display for UiKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Theme => write!(f, "THEME"),
+            Self::FullUi => write!(f, "FULL_UI"),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UiAsset {
+    pub file_path: String,
+    pub content_type: String,
+    pub sha256_hash: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActiveUiState {
+    pub package_id: uuid::Uuid,
+    pub ui_kind: UiKind,
+    pub install_path: std::path::PathBuf,
+    pub entry_point: String,
+    pub assets: Vec<UiAsset>,
+    pub theme_variables: Option<std::collections::HashMap<String, String>>,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
@@ -114,6 +159,8 @@ pub struct AppState {
     /// Cached tool descriptors for the run loop. Computed at startup to avoid
     /// rebuilding per request.
     pub tool_descriptors: Arc<Vec<gobrowse_core::model::ToolDefinition>>,
+    /// Active UI package state (M24b). Populated from DB on startup and updated on activation/rollback.
+    pub active_ui: Arc<RwLock<Option<ActiveUiState>>>,
 }
 
 impl AppState {
@@ -143,6 +190,8 @@ impl AppState {
         let plugin_source = GitHubReleaseSource::from_settings(&settings.features);
         let plugin_marketplace = GitHubMarketplace::from_settings(&settings.features);
         let tool_descriptors = Arc::new(crate::run_tools::tool_definitions(sandbox.is_some()));
+        // Load active UI package from DB (M24b). Best-effort: missing table before migration 0024 yields None.
+        let active_ui_state = load_active_ui_state(&pool).await.unwrap_or(None);
         Ok(Self {
             pool,
             settings: Arc::new(settings),
@@ -154,6 +203,7 @@ impl AppState {
             plugin_marketplace,
             mcp_clients: mcp_client::McpClientPool::new(),
             tool_descriptors,
+            active_ui: Arc::new(RwLock::new(active_ui_state)),
         })
     }
 
@@ -169,9 +219,60 @@ impl AppState {
     }
 }
 
+async fn load_active_ui_state(pool: &PgPool) -> Result<Option<ActiveUiState>, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT id, ui_kind, install_path, entry_point, manifest \
+         FROM ui_packages WHERE state = 'active' LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    use sqlx::Row;
+    let id: uuid::Uuid = row.get("id");
+    let ui_kind_str: String = row.get("ui_kind");
+    let ui_kind = ui_kind_str.parse().unwrap_or(UiKind::Theme);
+    let install_path: Option<String> = row.get("install_path");
+    let entry_point: Option<String> = row.get("entry_point");
+    let manifest: serde_json::Value = row.get("manifest");
+    let assets = sqlx::query(
+        "SELECT file_path, content_type, sha256_hash FROM ui_package_assets WHERE ui_package_id = $1",
+    )
+    .bind(id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|r| UiAsset {
+        file_path: r.get("file_path"),
+        content_type: r.get("content_type"),
+        sha256_hash: r.get("sha256_hash"),
+    })
+    .collect::<Vec<_>>();
+    let theme_variables = if ui_kind == UiKind::Theme {
+        manifest
+            .get("theme")
+            .and_then(|t| t.get("variables"))
+            .and_then(|v| {
+                serde_json::from_value::<std::collections::HashMap<String, String>>(v.clone()).ok()
+            })
+    } else {
+        None
+    };
+    Ok(Some(ActiveUiState {
+        package_id: id,
+        ui_kind,
+        install_path: install_path
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("./data/ui-packages")),
+        entry_point: entry_point.unwrap_or_else(|| "index.html".to_string()),
+        assets,
+        theme_variables,
+    }))
+}
+
 pub fn router(state: AppState) -> Router {
-    let static_dir = state.settings.http.static_dir.clone();
-    let index_file = static_dir.join("index.html");
     let api = Router::new()
         .route("/setup", get(auth::setup_status))
         .route("/setup/owner", post(auth::create_owner))
@@ -180,6 +281,7 @@ pub fn router(state: AppState) -> Router {
         .route("/auth/me", get(auth::me))
         .route("/auth/rotate", post(auth::rotate_sessions))
         .route("/version", get(api::version))
+        .route("/capabilities", get(capabilities_api::get_capabilities))
         .route(
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
@@ -318,7 +420,23 @@ pub fn router(state: AppState) -> Router {
             post(plugin_api::activate),
         )
         .route("/plugins/{id}/rollback", post(plugin_api::rollback))
-        // --- End Lane C ------------------------------------------------------
+        // --- M24b: UI packages ------------------------------------------------
+        .route("/ui/preview", post(ui_api::preview))
+        .route("/ui/install", post(ui_api::install))
+        .route("/ui/packages", get(ui_api::list))
+        .route(
+            "/ui/packages/{id}",
+            get(ui_api::get)
+                .patch(ui_api::patch)
+                .delete(ui_api::delete_package),
+        )
+        .route("/ui/packages/{id}/activate", post(ui_api::activate))
+        .route("/ui/packages/{id}/approve", post(ui_api::approve))
+        .route("/ui/packages/{id}/rollback", post(ui_api::rollback_by_id))
+        .route("/ui/rollback", post(ui_api::rollback))
+        .route("/ui/packages/{id}/theme.css", get(ui_api::theme_css))
+        .route("/ui/active-theme.css", get(ui_api::active_theme_css))
+        // --- End M24b --------------------------------------------------------
         .route(
             "/skills",
             get(skills_api::list_skills).post(skills_api::create_skill),
@@ -416,8 +534,10 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health/live", get(api::live))
         .route("/health/ready", get(api::ready))
+        .route("/recovery", get(recovery_handler))
+        .route("/recovery/{*path}", get(recovery_asset_handler))
         .nest("/api/v1", api)
-        .fallback_service(ServeDir::new(static_dir).fallback(ServeFile::new(index_file)))
+        .fallback(fallback_handler)
         .layer(DefaultBodyLimit::max(
             state.settings.http.request_body_limit_bytes,
         ))
@@ -436,6 +556,10 @@ pub fn router(state: AppState) -> Router {
         ))
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            csp::csp_middleware_async,
+        ))
         .layer(middleware::from_fn_with_state(state.clone(), origin_guard))
         .with_state(state)
 }
@@ -485,6 +609,133 @@ async fn origin_guard(
         }
     }
     Ok(next.run(request).await)
+}
+
+async fn recovery_handler() -> impl IntoResponse {
+    let html = r#"<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Gobrowse OS — Recovery</title><style>:root{--bg:#0f1419;--fg:#e6e8eb;--accent:#7ea0ff;--muted:#8a9099;--card:#1a232e;--border:#2a3441}*{box-sizing:border-box}body{margin:0;font-family:ui-sans-serif,system-ui,-apple-system,Arial;background:var(--bg);color:var(--fg);display:grid;place-items:center;min-height:100vh;padding:24px}a{color:var(--accent)}.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:28px;max-width:560px;width:100%;box-shadow:0 10px 30px rgba(0,0,0,.35)}h1{margin:0 0 8px;font-size:22px;letter-spacing:-.02em}p{margin:8px 0;color:var(--muted);line-height:1.5}code{background:#0f1419;border:1px solid var(--border);padding:2px 6px;border-radius:6px}.btn{display:inline-block;margin-top:16px;background:var(--accent);color:#0f1419;padding:10px 14px;border-radius:10px;text-decoration:none;font-weight:600}</style></head><body><div class="card"><h1>Recovery</h1><p>Built-in recovery UI is always available. Use it to manage UI packages, rollback, or restore the built-in interface.</p><p>Endpoints: <code>GET /api/v1/capabilities</code> · <code>GET /api/v1/ui/packages</code></p><a class="btn" href="/api/v1/capabilities">View capabilities</a><p style="margin-top:16px"><a href="/">Back to app</a> · <a href="/recovery">Recovery</a></p><noscript><p>This page works without JavaScript. Use the API directly if needed.</p></noscript></div></body></html>"#;
+    axum::response::Html(html)
+}
+
+async fn recovery_asset_handler(
+    State(state): State<AppState>,
+    Path(path): Path<String>,
+) -> impl IntoResponse {
+    // Try to serve from recovery dir on disk if present; otherwise return recovery HTML.
+    let recovery_dirs: Vec<std::path::PathBuf> = vec![
+        std::path::PathBuf::from("/app/recovery"),
+        std::path::PathBuf::from("./dist-recovery"),
+        std::path::PathBuf::from("./crates/gobrowse-recovery/dist"),
+        state.settings.http.static_dir.join("recovery"),
+    ];
+    for base in &recovery_dirs {
+        let candidate = base.join(&path);
+        if candidate.is_file()
+            && let Ok(bytes) = tokio::fs::read(&candidate).await
+        {
+            let ct = if path.ends_with(".wasm") {
+                "application/wasm"
+            } else if path.ends_with(".js") {
+                "application/javascript"
+            } else if path.ends_with(".css") {
+                "text/css"
+            } else if path.ends_with(".html") {
+                "text/html"
+            } else {
+                "application/octet-stream"
+            };
+            let mut resp = bytes.into_response();
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(ct));
+            return resp;
+        }
+    }
+    recovery_handler().await.into_response()
+}
+
+async fn fallback_handler(State(state): State<AppState>, request: Request<Body>) -> Response {
+    let path = request.uri().path().to_owned();
+    // Bypass API and health (already matched) — serve SPA.
+    // If active UI is FULL_UI, try to serve from its install_path first.
+    let active = state.active_ui.read().await.clone();
+    if let Some(active) = active
+        && active.ui_kind == UiKind::FullUi
+    {
+        let rel = path.trim_start_matches('/');
+        let candidate = if rel.is_empty() || rel == "/" {
+            active.install_path.join(&active.entry_point)
+        } else {
+            active.install_path.join(rel)
+        };
+        if candidate.is_file()
+            && let Ok(bytes) = tokio::fs::read(&candidate).await
+        {
+            let ct = if candidate.extension().and_then(|e| e.to_str()) == Some("wasm") {
+                "application/wasm"
+            } else if candidate.extension().and_then(|e| e.to_str()) == Some("js") {
+                "application/javascript"
+            } else if candidate.extension().and_then(|e| e.to_str()) == Some("css") {
+                "text/css"
+            } else {
+                "text/html"
+            };
+            let mut resp = bytes.into_response();
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(ct));
+            return resp;
+        }
+        // If entry point missing, redirect to recovery
+        let entry_exists = active.install_path.join(&active.entry_point).is_file();
+        if !entry_exists {
+            return axum::response::Redirect::temporary("/recovery").into_response();
+        }
+        // Fall back to entry point for SPA routing
+        if let Ok(bytes) = tokio::fs::read(active.install_path.join(&active.entry_point)).await {
+            let mut resp = bytes.into_response();
+            resp.headers_mut().insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/html"),
+            );
+            return resp;
+        }
+    }
+    // Default: serve from built-in static_dir
+    let static_dir = state.settings.http.static_dir.clone();
+    let rel = path.trim_start_matches('/');
+    if !rel.is_empty() && !rel.contains("..") {
+        let candidate = static_dir.join(rel);
+        if candidate.is_file()
+            && let Ok(bytes) = tokio::fs::read(&candidate).await
+        {
+            let ct = if rel.ends_with(".wasm") {
+                "application/wasm"
+            } else if rel.ends_with(".js") {
+                "application/javascript"
+            } else if rel.ends_with(".css") {
+                "text/css"
+            } else if rel.ends_with(".html") {
+                "text/html"
+            } else {
+                "application/octet-stream"
+            };
+            let mut resp = bytes.into_response();
+            resp.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static(ct));
+            return resp;
+        }
+    }
+    // SPA fallback to index.html
+    let index = static_dir.join("index.html");
+    if let Ok(bytes) = tokio::fs::read(&index).await {
+        let mut resp = bytes.into_response();
+        resp.headers_mut().insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/html"),
+        );
+        return resp;
+    }
+    // If static index missing (e.g., in tests), return minimal HTML
+    let html = r#"<!doctype html><html><head><meta charset="utf-8"><title>Gobrowse OS</title></head><body><div id="app">Gobrowse OS</div><script type="module">import init from "/pkg/gobrowse_web.js"; init();</script></body></html>"#;
+    axum::response::Html(html).into_response()
 }
 
 #[cfg(test)]

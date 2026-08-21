@@ -134,6 +134,9 @@ async fn serve(settings: Settings) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(&settings.features.plugins_dir)
         .await
         .context("create plugins directory")?;
+    tokio::fs::create_dir_all(&settings.features.ui_packages_dir)
+        .await
+        .context("create ui-packages directory")?;
     let bind = settings.http.bind;
     let state = AppState::new(pool, settings)
         .await
