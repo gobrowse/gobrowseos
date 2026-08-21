@@ -33,6 +33,7 @@ pub mod ui_api;
 pub mod usage_api;
 pub mod vault;
 pub mod vault_api;
+pub mod webauthn;
 pub mod webhook_scheduler;
 pub mod webhooks;
 pub mod worktree_api;
@@ -170,6 +171,8 @@ pub struct AppState {
     pub builtin_csp_hashes: Arc<crate::csp::BuiltinCspHashes>,
     /// In-memory sliding-window rate limiter (per-IP, global).
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
+    /// WebAuthn passkey manager (None when unconfigured).
+    pub webauthn: Option<crate::webauthn::WebauthnManager>,
 }
 
 impl AppState {
@@ -224,6 +227,7 @@ impl AppState {
             script_hashes,
             style_hashes,
         };
+        let webauthn = crate::webauthn::WebauthnManager::from_settings(&settings).ok();
         Ok(Self {
             pool,
             settings: Arc::new(settings),
@@ -238,6 +242,7 @@ impl AppState {
             active_ui: Arc::new(RwLock::new(active_ui_state)),
             builtin_csp_hashes: Arc::new(builtin_csp_hashes),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new()),
+            webauthn,
         })
     }
 
@@ -323,6 +328,22 @@ pub fn router(state: AppState) -> Router {
             post(auth::revoke_one_session),
         )
         .route("/auth/step-up", post(auth::step_up))
+        .route(
+            "/auth/methods/webauthn/register",
+            post(crate::webauthn::start_registration),
+        )
+        .route(
+            "/auth/methods/webauthn/complete",
+            post(crate::webauthn::complete_registration),
+        )
+        .route(
+            "/auth/methods/webauthn/login",
+            post(crate::webauthn::start_login),
+        )
+        .route(
+            "/auth/methods/webauthn/login/complete",
+            post(crate::webauthn::complete_login),
+        )
         .route("/version", get(api::version))
         .route("/capabilities", get(capabilities_api::get_capabilities))
         .route(

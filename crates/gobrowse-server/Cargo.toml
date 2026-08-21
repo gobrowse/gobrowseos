@@ -46,6 +46,7 @@ uuid.workspace = true
 zeroize.workspace = true
 zip.workspace = true
 percent-encoding = "2.3.1"
+webauthn-rs = { version = "0.5.5", features = ["resident-key-support"] }
 
 [dev-dependencies]
 http-body-util = "0.1.3"

@@ -657,7 +657,7 @@ pub async fn require_user(
     })
 }
 
-async fn create_session(
+pub(crate) async fn create_session(
     state: &AppState,
     tx: &mut Transaction<'_, Postgres>,
     user_id: Uuid,
