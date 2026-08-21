@@ -2,13 +2,15 @@
 
 WHAT GOBROWSE IS: Self-hosted agent OS. Workspace = 4 crates (core, server `gobrowse`, web Leptos/WASM, sandboxd). Rootless-podman sandbox + retrieval-driven Library + plugin runtime.
 
-ACTIVE MILESTONE: M23 — Adaptive Capability Router (implementation complete, deployed to m22test). Next: M24 — Full Token, Runtime, Container & Architecture Optimization.
+ACTIVE MILESTONE: M24 — Full Token, Runtime, Container & Architecture Optimization (implementation + verification complete, DEPLOYED + ACCEPTED IN PROD 2026-08-21).
 
 CURRENT ARCHITECTURE: books table = Library registry (kind: SOURCE/SKILL/MCP/PLUGIN/AUTOBIOGRAPHY). Server → sandboxd Unix socket (token+peer-uid) → rootless podman. M23 adds: TaskClass classification (rule-first + model fallback), capability ranking with task-aware signals, model_task_routes for task-specific model overrides, book_usage_stats via trigger, per-category context budget, UI Context Inspector panel (Budget/Why Loaded/Model tabs).
 
 WHAT JUST CHANGED: M23 implementation complete. Docker image gobrowse-os-app:m23 deployed to m22test (8082). Schema 22 (model_task_routes + book_usage_stats). task_class "Coding" verified for coding request. Code not yet committed.
 
 WHAT WORKS (verified on prod m22test @ localhost:8082): login; sandbox terminal; source-book create+search; plugin install/upgrade/rollback; Library grid; marketplace search; schema 22; doctor sandbox PASS; M23 task classification (Coding for coding requests); context endpoint with budget breakdown.
+PROD VERIFIED (2026-08-21, ssh root@178.128.179.216): /health/ready 200; /api/v1/version schema 23; healthcheck healthy (0 restarts, 0 log errors); UI assets /pkg/gobrowse-web.js + .wasm + css all 200; disk 9.0G free.
+Rollback: DB dump backups/gobrowse-m24-pre-20260821-130148.dump (BACKUP_VERIFY_OK), image gobrowse-os-app:m21-final-rollback (cc8ef3648130), compose docker-compose.yml.pre-m24 (+ .pre-m24-curl-fix).
 
 WHAT DOES NOT YET EXIST: M24 implementation (defined in roadmap only). M24b (after M24). Full routing verification with capability ranking and model selection (needs model_task_routes configured).
 
