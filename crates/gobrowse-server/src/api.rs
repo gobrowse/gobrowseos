@@ -1,4 +1,8 @@
-use axum::{Json, extract::State, http::HeaderMap};
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+};
 use gobrowse_core::VersionInfo;
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
@@ -124,6 +128,61 @@ pub async fn create_workspace(
         created_at: now,
         updated_at: now,
     }))
+}
+
+/// Delete a workspace. Refuses while worktrees or workspace-scoped
+/// conversations exist (409 with a hint). OWNER/ADMIN only.
+pub async fn delete_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<bool> =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id=$1 AND profile_id=$2)")
+            .bind(id)
+            .bind(user.profile_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owned != Some(true) {
+        return Err(AppError::NotFound);
+    }
+    let worktrees: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM worktrees WHERE workspace_id=$1 AND status <> 'deleted'",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    let conversations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM conversations WHERE workspace_id=$1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if worktrees > 0 || conversations > 0 {
+        return Err(AppError::Conflict(
+            "delete the workspace's worktrees and conversations first",
+        ));
+    }
+    sqlx::query("DELETE FROM workspaces WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "workspace.deleted",
+        "workspace",
+        Some(id.to_string()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn list_workspaces(

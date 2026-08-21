@@ -357,6 +357,7 @@ pub fn router(state: AppState) -> Router {
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
         )
+        .route("/workspaces/{id}", delete(api::delete_workspace))
         .route(
             "/conversations",
             get(conversation_api::list_conversations).post(conversation_api::create_conversation),
@@ -407,6 +408,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/embeddings/configurations",
             get(embedding_api::list_configurations).post(embedding_api::create_configuration),
+        )
+        .route(
+            "/embeddings/configurations/{id}",
+            delete(embedding_api::delete_configuration),
         )
         .route(
             "/embeddings/configurations/{id}/activate",
@@ -468,7 +473,9 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/{id}/deliver", post(webhooks::receive_webhook))
         .route(
             "/library/books/{id}",
-            get(library_api::get_book).put(library_api::update_book),
+            get(library_api::get_book)
+                .put(library_api::update_book)
+                .delete(library_api::delete_book),
         )
         .route(
             "/library/books/{id}/history",
@@ -515,6 +522,7 @@ pub fn router(state: AppState) -> Router {
             "/skills",
             get(skills_api::list_skills).post(skills_api::create_skill),
         )
+        .route("/skills/{id}", delete(skills_api::delete_skill))
         .route(
             "/skills/{skill_id}/revisions",
             get(skills_api::history).post(skills_api::create_revision),
@@ -817,23 +825,6 @@ async fn fallback_handler(State(state): State<AppState>, request: Request<Body>)
     axum::response::Html(html).into_response()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unsafe_methods_are_enumerated() {
-        assert!(matches!(
-            Method::POST,
-            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-        ));
-        assert!(!matches!(
-            Method::GET,
-            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
-        ));
-    }
-}
-
 /// OIDC auth routes (no-op without the `oidc` feature).
 fn oidc_router() -> axum::Router<AppState> {
     #[cfg(feature = "oidc")]
@@ -852,3 +843,21 @@ fn oidc_router() -> axum::Router<AppState> {
         axum::Router::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsafe_methods_are_enumerated() {
+        assert!(matches!(
+            Method::POST,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ));
+        assert!(!matches!(
+            Method::GET,
+            Method::POST | Method::PUT | Method::PATCH | Method::DELETE
+        ));
+    }
+}
+

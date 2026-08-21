@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     Json,
     extract::{Path, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
 };
 use gobrowse_core::library::{
     Book, BookKind, BookScope, BookType, EmbeddingStatus, Provenance, RankingWeights,
@@ -655,6 +655,48 @@ fn mcp_error_to_app(error: crate::mcp_client::McpClientError) -> AppError {
 /// the full body (SOURCE/AUTOBIOGRAPHY), the active skill revision, the MCP
 /// tool list (or one tool schema via `?component=`), or the plugin component
 /// manifest. Same resolution and authorization as the `library_load` tool.
+/// Delete a book (owner/ADMIN; refuses managed Conversation/Autobiography).
+pub async fn delete_book(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let row = sqlx::query(
+        "SELECT book_type FROM books WHERE id=$1 AND profile_id=$2          AND ($3 IN ('OWNER','ADMIN') OR created_by_user_id=$4)",
+    )
+    .bind(id)
+    .bind(user.profile_id)
+    .bind(&user.role)
+    .bind(user.id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    let book_type: String = row.get("book_type");
+    if matches!(book_type.as_str(), "CONVERSATION" | "AUTOBIOGRAPHY") {
+        return Err(AppError::Conflict(
+            "managed Books must be deleted through their dedicated workflow",
+        ));
+    }
+    sqlx::query("DELETE FROM books WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "library.book_deleted",
+        "book",
+        Some(id.to_string()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn load_book(
     State(state): State<AppState>,
     headers: HeaderMap,

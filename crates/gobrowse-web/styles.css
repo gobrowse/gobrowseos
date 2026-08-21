@@ -657,6 +657,20 @@ kbd { padding: 2px 6px; border: 1px solid var(--line); border-bottom-width: 2px;
 .test-success { color: var(--teal); font-size: 12.5px; font-weight: 650; }
 .test-error { color: var(--vermillion); font-size: 12.5px; font-weight: 650; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.live-hint { color: var(--slate); font: 600 10px var(--mono); letter-spacing: 0.06em; animation: pulse 1s infinite; }
+.icon-button { min-width: 32px; height: 32px; padding: 0 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); font-size: 13px; line-height: 1; }
+.icon-button:hover { border-color: var(--line-strong); background: var(--fog-2); }
+.icon-button.danger { color: var(--vermillion); border-color: var(--line); background: var(--surface); }
+.icon-button.danger:hover { border-color: var(--vermillion); background: #fdf0ed; color: var(--vermillion); }
+.primary.danger { background: var(--vermillion); border-color: var(--vermillion); color: #fff; }
+.primary.danger:hover { background: #b91c1c; border-color: #b91c1c; }
+.model-route-row { grid-template-columns: 72px minmax(0, 1.4fr) 120px minmax(0, 1fr); align-items: center; }
+.workspace-picker { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; padding: 12px 14px; border: 1px solid var(--line); border-left-width: 4px; border-left-color: var(--indigo); border-radius: var(--radius); background: var(--surface); margin: 14px 0; box-shadow: var(--paper-shadow); }
+.workspace-picker-label { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 12px; color: var(--slate); }
+.workspace-picker-label select { height: 32px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); padding: 0 10px; min-width: 180px; }
+.workspace-picker .form-note { flex: 1 1 200px; min-width: 180px; }
+.delete-confirm { max-width: 520px; border-left: 4px solid var(--vermillion); }
+.delete-confirm h3 { color: var(--vermillion); }
 
 
 /* — chat markdown + tool cards + streaming (UI batch) — */

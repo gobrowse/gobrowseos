@@ -127,6 +127,64 @@ pub async fn create_configuration(
     ))
 }
 
+/// Delete an embedding configuration. Refuses when it is the profile's
+/// active embedding model or has queued/running jobs.
+pub async fn delete_configuration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<bool> = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM embedding_models em JOIN providers p ON p.id=em.provider_id          WHERE em.id=$1 AND p.profile_id=$2)",
+    )
+    .bind(&id)
+    .bind(user.profile_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owned != Some(true) {
+        return Err(AppError::NotFound);
+    }
+    let active: Option<String> =
+        sqlx::query_scalar("SELECT active_embedding_model_id FROM profiles WHERE id=$1")
+            .bind(user.profile_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if active.as_deref() == Some(id.as_str()) {
+        return Err(AppError::Conflict(
+            "cannot delete the active embedding model; select another first",
+        ));
+    }
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM embedding_jobs WHERE embedding_model_id=$1 AND status IN ('queued','running')",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if jobs > 0 {
+        return Err(AppError::Conflict(
+            "cannot delete an embedding model with jobs in progress",
+        ));
+    }
+    sqlx::query("DELETE FROM embedding_models WHERE id=$1")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "embedding.configuration_deleted",
+        "embedding_model",
+        Some(id.clone()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_configurations(
     State(state): State<AppState>,
     headers: HeaderMap,

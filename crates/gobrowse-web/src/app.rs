@@ -2,7 +2,8 @@
     clippy::redundant_locals,
     clippy::manual_strip,
     clippy::collapsible_if,
-    clippy::skip_while_next
+    clippy::skip_while_next,
+    clippy::clone_on_copy
 )]
 use gloo_net::http::Request;
 use leptos::prelude::*;
@@ -328,8 +329,11 @@ struct CreateConversationRequest<'a> {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
 struct EmbeddingConfiguration {
     id: String,
+    #[serde(default)]
+    provider_id: String,
     display_name: String,
     provider_type: String,
     model_reference: String,
@@ -384,6 +388,13 @@ struct CreateChatModelConfiguration<'a> {
 }
 
 #[derive(Debug, Serialize)]
+struct StoreSecretPayload<'a> {
+    purpose: &'a str,
+    allowed_hosts: Vec<String>,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ProviderTestRequest<'a> {
     base_url: &'a str,
     #[serde(default)]
@@ -429,6 +440,7 @@ fn store_selected_workspace(value: &Option<String>) {
 struct SecretMeta {
     id: String,
 }
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct AutobiographyResponse {
     id: String,
@@ -1086,7 +1098,10 @@ fn ChatPage(user_id: String) -> impl IntoView {
             return;
         }
         let workspace_id = selected_workspace.get_untracked();
-        let workspace_id = workspace_id.as_deref().filter(|s| !s.trim().is_empty()).map(|s| s.to_owned());
+        let workspace_id = workspace_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.to_owned());
         status.set("Creating conversation...".into());
         let lifecycle = Arc::clone(&create_lifecycle);
         spawn_local(async move {
@@ -1436,6 +1451,41 @@ fn ChatPage(user_id: String) -> impl IntoView {
                 <span class="model-chip">{move || chat_models.get().into_iter().find(|model| model.active).map_or_else(|| "NO ACTIVE MODEL".into(), |model| format!("{} / {}", model.provider_type.to_uppercase(), model.model_reference))}</span>
                 {ContextInspector(ContextInspectorProps { active_run })}
             </div>
+        </div>
+        <div class="workspace-picker" role="region" aria-label="Workspace scope">
+            <label class="workspace-picker-label">
+                <span class="utility">"WORKSPACE"</span>
+                <select
+                    aria-label="Workspace"
+                    prop:value=move || selected_workspace.get().unwrap_or_default()
+                    on:change=move |event| {
+                        let value = event_target_value(&event);
+                        if value.trim().is_empty() {
+                            selected_workspace.set(None);
+                        } else {
+                            selected_workspace.set(Some(value));
+                        }
+                    }
+                >
+                    <option value="">"All workspaces"</option>
+                    {move || workspaces.get().into_iter().map(|ws| {
+                        let ws_id = ws.id.clone();
+                        let ws_title = ws.title.clone();
+                        view! { <option value=ws_id>{ws_title}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            <span class="form-note">{move || {
+                if let Some(id) = selected_workspace.get() {
+                    if let Some(ws) = workspaces.get().into_iter().find(|w| w.id == id) {
+                        format!("Chatting in {} — new conversations will be scoped here.", ws.title)
+                    } else {
+                        "Workspace scope active — new conversations scoped to selection.".into()
+                    }
+                } else {
+                    "No workspace filter — conversations span all workspaces.".into()
+                }
+            }}</span>
         </div>
         <div class="workspace-picker" role="region" aria-label="Workspace scope">
             <label class="workspace-picker-label">
@@ -5529,38 +5579,148 @@ fn ModelsPage() -> impl IntoView {
             Ok(_) | Err(_) => chat_status.set("Could not load provider catalog".into()),
         }
     });
-    // -- Provider registry polish: presets + live test (≤30s to first chat)
     let test_pending = RwSignal::new(false);
+    let live_pending = RwSignal::new(false);
     let test_ok = RwSignal::new(Option::<bool>::None);
     let test_message = RwSignal::new(String::new());
+    let live_generation = RwSignal::new(0_u32);
+    let delete_target = RwSignal::new(Option::<DeleteTarget>::None);
+    let do_live_fetch = {
+        let catalog = catalog;
+        let catalog_models = catalog_models;
+        let chat_model = chat_model;
+        let chat_context = chat_context;
+        let chat_output = chat_output;
+        let chat_status = chat_status;
+        let live_pending = live_pending;
+        let test_ok = test_ok;
+        let test_message = test_message;
+        let test_pending = test_pending;
+        move |base: String, api_key: String, manual: bool| {
+            let trimmed = base.trim().to_owned();
+            if trimmed.is_empty() {
+                return;
+            }
+            let _catalog_snapshot = catalog.get_untracked();
+            if manual {
+                test_pending.set(true);
+                test_ok.set(None);
+                test_message.set("Testing…".into());
+            } else {
+                live_pending.set(true);
+            }
+            spawn_local(async move {
+                let payload = ProviderTestRequest {
+                    base_url: &trimmed,
+                    api_key: if api_key.trim().is_empty() {
+                        None
+                    } else {
+                        Some(api_key.trim())
+                    },
+                };
+                let request = Request::post("/api/v1/providers/test").json(&payload);
+                let response = match request {
+                    Ok(req) => req.send().await,
+                    Err(_) => {
+                        live_pending.set(false);
+                        test_pending.set(false);
+                        test_ok.set(Some(false));
+                        test_message.set("Could not encode provider test request.".into());
+                        return;
+                    }
+                };
+                match response {
+                    Ok(resp) if resp.ok() => match resp.json::<ProviderTestResponse>().await {
+                        Ok(data) => {
+                            live_pending.set(false);
+                            test_pending.set(false);
+                            if data.ok && !data.models.is_empty() {
+                                catalog_models.set(data.models.clone());
+                                if let Some(first) = data.models.first() {
+                                    let current = chat_model.get_untracked();
+                                    let still_valid =
+                                        data.models.iter().any(|m| m.reference == current);
+                                    if !still_valid {
+                                        chat_model.set(first.reference.clone());
+                                        if first.context_window > 0 {
+                                            chat_context.set(first.context_window.to_string());
+                                        }
+                                        if first.output_limit > 0 {
+                                            chat_output.set(first.output_limit.to_string());
+                                        }
+                                    }
+                                }
+                                test_ok.set(Some(true));
+                                test_message.set(data.detail.clone());
+                                chat_status.set(format!("Live models loaded — {}.", data.detail));
+                            } else if data.ok {
+                                test_ok.set(Some(true));
+                                test_message.set(data.detail.clone());
+                                chat_status.set(data.detail);
+                            } else {
+                                test_ok.set(Some(false));
+                                test_message.set(data.detail.clone());
+                                if !manual {
+                                    chat_status.set(format!(
+                                        "Live probe failed — using catalog. {}",
+                                        data.detail
+                                    ));
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            live_pending.set(false);
+                            test_pending.set(false);
+                            test_ok.set(Some(false));
+                            test_message.set("Provider test response was not valid.".into());
+                        }
+                    },
+                    Ok(resp) => {
+                        live_pending.set(false);
+                        test_pending.set(false);
+                        let msg = api_error(&resp).await;
+                        test_ok.set(Some(false));
+                        test_message.set(msg.clone());
+                        if !manual {
+                            chat_status.set(format!("Live probe failed — using catalog. {msg}"));
+                        }
+                    }
+                    Err(_) => {
+                        live_pending.set(false);
+                        test_pending.set(false);
+                        test_ok.set(Some(false));
+                        test_message.set("Provider service did not answer.".into());
+                        if !manual {
+                            chat_status.set(
+                                "Live probe failed — using catalog. Provider did not answer."
+                                    .into(),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    };
+    let do_live_fetch_manual = do_live_fetch.clone();
     let apply_preset = {
         let catalog_clone = catalog;
+        let do_live_fetch = do_live_fetch.clone();
         move |preset: &'static str| {
-            match preset {
-                "openai" => {
-                    chat_provider.set("openai".into());
-                    chat_base_url.set("https://api.openai.com/v1".into());
-                }
-                "anthropic" => {
-                    chat_provider.set("anthropic".into());
-                    chat_base_url.set("https://api.anthropic.com".into());
-                }
-                "ollama" => {
-                    chat_provider.set("ollama".into());
-                    chat_base_url.set("http://127.0.0.1:11434".into());
-                }
-                _ => {
-                    chat_provider.set("custom".into());
-                    chat_base_url.set(String::new());
-                }
-            }
+            let (provider_type, base) = match preset {
+                "openai" => ("openai", "https://api.openai.com/v1"),
+                "anthropic" => ("anthropic", "https://api.anthropic.com"),
+                "ollama" => ("ollama", "http://127.0.0.1:11434"),
+                _ => ("custom", ""),
+            };
+            chat_provider.set(provider_type.to_owned());
+            chat_base_url.set(base.to_owned());
             chat_secret.set(String::new());
             test_ok.set(None);
             test_message.set(String::new());
             if let Some(provider) = catalog_clone
                 .get_untracked()
                 .into_iter()
-                .find(|e| e.provider_type == chat_provider.get_untracked())
+                .find(|e| e.provider_type == provider_type)
             {
                 catalog_models.set(provider.models.clone());
                 if let Some(first) = provider.models.first() {
@@ -5571,76 +5731,47 @@ fn ModelsPage() -> impl IntoView {
             } else {
                 catalog_models.set(Vec::new());
             }
+            if !base.is_empty() {
+                do_live_fetch(base.to_owned(), String::new(), false);
+            }
         }
     };
     let do_test = move |_| {
         let base = chat_base_url.get_untracked();
-        let model_ref = chat_model.get_untracked();
-        if base.trim().is_empty() || model_ref.trim().is_empty() {
+        let key = chat_secret.get_untracked();
+        if base.trim().is_empty() {
             test_ok.set(Some(false));
-            test_message.set("Choose a provider and model first.".into());
+            test_message.set("Enter a Base URL first.".into());
             return;
         }
-        test_pending.set(true);
-        test_ok.set(None);
-        test_message.set("Testing…".into());
-        spawn_local(async move {
-            // Live test: validate base URL is reachable via catalog or a lightweight probe.
-            // We probe the server's provider health via a GET to the base URL host (client-side),
-            // falling back to a timed success for known presets.
-            let known_ok = base.contains("api.openai.com")
-                || base.contains("api.anthropic.com")
-                || base.contains("127.0.0.1")
-                || base.contains("localhost");
-            // brief delay to show spinner
-            wait_for_poll(650).await;
-            if known_ok {
-                test_pending.set(false);
-                test_ok.set(Some(true));
-                test_message.set("Connection looks good — ready to create route.".into());
-            } else {
-                // try a fetch to base (no-cors may fail but we treat as not reachable)
-                let probe = Request::get(&base).send().await;
-                test_pending.set(false);
-                match probe {
-                    Ok(r) if r.ok() => {
-                        test_ok.set(Some(true));
-                        test_message.set("Provider answered — ready.".into());
-                    }
-                    Ok(r) => {
-                        test_ok.set(Some(false));
-                        test_message.set(format!("Provider returned HTTP {}.", r.status()));
-                    }
-                    Err(_) => {
-                        test_ok.set(Some(false));
-                        test_message.set("Could not reach provider — check Base URL.".into());
-                    }
-                }
-            }
-        });
+        do_live_fetch_manual(base, key, true);
     };
-    let on_provider_select = move |event: leptos::ev::Event| {
-        let provider_type = event_target_value(&event);
-        chat_provider.set(provider_type.clone());
-        chat_secret.set(String::new());
-        test_ok.set(None);
-        test_message.set(String::new());
-        if let Some(provider) = catalog
-            .get_untracked()
-            .into_iter()
-            .find(|entry| entry.provider_type == provider_type)
-        {
-            chat_base_url.set(provider.base_url.clone());
-            catalog_models.set(provider.models.clone());
-            chat_status.set(String::new());
-            if let Some(first) = provider.models.first() {
-                chat_model.set(first.reference.clone());
-                chat_context.set(first.context_window.to_string());
-                chat_output.set(first.output_limit.to_string());
+    let on_provider_select = {
+        let do_live_fetch = do_live_fetch.clone();
+        move |event: leptos::ev::Event| {
+            let provider_type = event_target_value(&event);
+            chat_provider.set(provider_type.clone());
+            test_ok.set(None);
+            test_message.set(String::new());
+            if let Some(provider) = catalog
+                .get_untracked()
+                .into_iter()
+                .find(|entry| entry.provider_type == provider_type)
+            {
+                chat_base_url.set(provider.base_url.clone());
+                catalog_models.set(provider.models.clone());
+                chat_status.set(String::new());
+                if let Some(first) = provider.models.first() {
+                    chat_model.set(first.reference.clone());
+                    chat_context.set(first.context_window.to_string());
+                    chat_output.set(first.output_limit.to_string());
+                }
+                let key = chat_secret.get_untracked();
+                do_live_fetch(provider.base_url.clone(), key, false);
+            } else {
+                catalog_models.set(Vec::new());
+                chat_status.set("Choose a provider and model from the catalog".into());
             }
-        } else {
-            catalog_models.set(Vec::new());
-            chat_status.set("Choose a provider and model from the catalog".into());
         }
     };
     let on_model_select = move |event: leptos::ev::Event| {
@@ -5655,10 +5786,145 @@ fn ModelsPage() -> impl IntoView {
             chat_output.set(model.output_limit.to_string());
         }
     };
+    let on_base_url_input = {
+        let do_live_fetch = do_live_fetch.clone();
+        move |event: leptos::ev::Event| {
+            let value = event_target_value(&event);
+            chat_base_url.set(value.clone());
+            let next_gen = live_generation.get_untracked().wrapping_add(1);
+            live_generation.set(next_gen);
+            let key = chat_secret.get_untracked();
+            let do_live_fetch = do_live_fetch.clone();
+            spawn_local(async move {
+                wait_for_poll(520).await;
+                if live_generation.get_untracked() != next_gen {
+                    return;
+                }
+                let trimmed = value.trim().to_owned();
+                if trimmed.len() < 8 {
+                    return;
+                }
+                do_live_fetch(trimmed, key, false);
+            });
+        }
+    };
+    let on_secret_input = {
+        let do_live_fetch = do_live_fetch.clone();
+        move |event: leptos::ev::Event| {
+            let value = event_target_value(&event);
+            chat_secret.set(value.clone());
+            let base = chat_base_url.get_untracked();
+            if base.trim().is_empty() || value.trim().is_empty() {
+                return;
+            }
+            let next_gen = live_generation.get_untracked().wrapping_add(1);
+            live_generation.set(next_gen);
+            let do_live_fetch = do_live_fetch.clone();
+            spawn_local(async move {
+                wait_for_poll(700).await;
+                if live_generation.get_untracked() != next_gen {
+                    return;
+                }
+                do_live_fetch(base, value, false);
+            });
+        }
+    };
     let detect = move |_| {
         if !detecting.get_untracked() {
             load_auto_detect(detected, detecting, status);
         }
+    };
+    let delete_provider = {
+        let chat_status = chat_status;
+        let chat_configurations = chat_configurations;
+        let status = status;
+        let configurations = configurations;
+        let lifecycle = Arc::clone(&lifecycle);
+        std::sync::Arc::new(move |id: String| {
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                let response = Request::delete(&format!("/api/v1/providers/{id}"))
+                    .send()
+                    .await;
+                match response {
+                    Ok(resp) if resp.status() == 204 => {
+                        chat_status.set("Provider deleted.".into());
+                        status.set("Provider deleted.".into());
+                        load_chat_models(chat_configurations, chat_status, Arc::clone(&lifecycle));
+                        load_configurations(configurations, status);
+                    }
+                    Ok(resp) if resp.status() == 409 => {
+                        let msg = api_error(&resp).await;
+                        chat_status.set(format!("Cannot delete provider: {msg}"));
+                        status.set(format!("Cannot delete provider: {msg}"));
+                    }
+                    Ok(resp) => {
+                        let msg = api_error(&resp).await;
+                        chat_status.set(format!("Delete failed: {msg}"));
+                        status.set(format!("Delete failed: {msg}"));
+                    }
+                    Err(_) => {
+                        chat_status.set("Provider service did not answer.".into());
+                        status.set("Provider service did not answer.".into());
+                    }
+                }
+            });
+        })
+    };
+    let delete_model = {
+        let chat_status = chat_status;
+        let chat_configurations = chat_configurations;
+        let lifecycle = Arc::clone(&lifecycle);
+        std::sync::Arc::new(move |id: String| {
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                let response = Request::delete(&format!("/api/v1/models/{id}"))
+                    .send()
+                    .await;
+                match response {
+                    Ok(resp) if resp.status() == 204 => {
+                        chat_status.set("Model deleted.".into());
+                        load_chat_models(chat_configurations, chat_status, Arc::clone(&lifecycle));
+                    }
+                    Ok(resp) if resp.status() == 409 => {
+                        let msg = api_error(&resp).await;
+                        chat_status.set(format!("Cannot delete model: {msg}"));
+                    }
+                    Ok(resp) => {
+                        let msg = api_error(&resp).await;
+                        chat_status.set(format!("Delete failed: {msg}"));
+                    }
+                    Err(_) => chat_status.set("Model service did not answer.".into()),
+                }
+            });
+        })
+    };
+    #[allow(unused)]
+    let delete_embedding_provider = {
+        let status = status;
+        let configurations = configurations;
+        std::sync::Arc::new(move |id: String| {
+            spawn_local(async move {
+                let response = Request::delete(&format!("/api/v1/providers/{id}"))
+                    .send()
+                    .await;
+                match response {
+                    Ok(resp) if resp.status() == 204 => {
+                        status.set("Provider deleted.".into());
+                        load_configurations(configurations, status);
+                    }
+                    Ok(resp) if resp.status() == 409 => {
+                        let msg = api_error(&resp).await;
+                        status.set(format!("Cannot delete provider: {msg}"));
+                    }
+                    Ok(resp) => {
+                        let msg = api_error(&resp).await;
+                        status.set(format!("Delete failed: {msg}"));
+                    }
+                    Err(_) => status.set("Provider service did not answer.".into()),
+                }
+            });
+        })
     };
     let create = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
@@ -5889,7 +6155,10 @@ fn ModelsPage() -> impl IntoView {
                         }).collect_view()}
                     </select>
                 </label>
-                <label>"Base URL"<input required prop:value=move || chat_base_url.get() on:input=move |event| chat_base_url.set(event_target_value(&event)) aria-label="Base URL" /></label>
+                <label>"Base URL"
+                    <input required prop:value=move || chat_base_url.get() on:input=on_base_url_input aria-label="Base URL" />
+                </label>
+                {move || if live_pending.get() { view! { <span class="live-hint">"live"</span> }.into_any() } else { view! { <span></span> }.into_any() }}
                 <label>"Model reference"
                     <select required prop:value=move || chat_model.get() on:change=on_model_select aria-label="Model reference">
                         <option value="">"Choose model"</option>
@@ -5901,7 +6170,7 @@ fn ModelsPage() -> impl IntoView {
                     </select>
                 </label>
                 <label>"Provider API key (optional — stored in the vault)"
-                    <input maxlength="2048" autocomplete="off" placeholder="Paste API key or secret_… — vault-scoped to host" prop:value=move || chat_secret.get() on:input=move |event| chat_secret.set(event_target_value(&event)) aria-label="Provider API key" /></label>
+                    <input maxlength="2048" autocomplete="off" placeholder="Paste API key or secret_… — vault-scoped to host" prop:value=move || chat_secret.get() on:input=on_secret_input aria-label="Provider API key" /></label>
                 <label>"Context window"<input required inputmode="numeric" prop:value=move || chat_context.get() on:input=move |event| chat_context.set(event_target_value(&event)) aria-label="Context window" /></label>
                 <label>"Output limit"<input required inputmode="numeric" prop:value=move || chat_output.get() on:input=move |event| chat_output.set(event_target_value(&event)) aria-label="Output limit" /></label>
                 <label class="fallback-field">"Fallback model IDs"<input placeholder="Comma-separated, in failover order" prop:value=move || chat_fallbacks.get() on:input=move |event| chat_fallbacks.set(event_target_value(&event)) aria-label="Fallback model IDs" /></label>
@@ -5918,19 +6187,65 @@ fn ModelsPage() -> impl IntoView {
             </form>
             <p class="form-note" aria-live="polite">{move || chat_status.get()}</p>
             <div class="index-table model-index" role="table" aria-label="Chat model routes">
-                <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"LIMITS"</span><span>"FALLBACKS"</span></div>
+                <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"LIMITS"</span><span>"ACTIONS"</span></div>
                 {move || chat_configurations.get().into_iter().map(|configuration| {
                     let model_id = configuration.id.clone();
+                    let provider_id = configuration.provider_id.clone();
+                    let model_label = format!("{} / {}", configuration.display_name, configuration.model_reference);
+                    let provider_label = format!("{} ({})", configuration.provider_type, &provider_id[..8.min(provider_id.len())]);
                     let activate_lifecycle = Arc::clone(&lifecycle);
-                    view! { <div class="index-row"><span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
-                        <strong>{format!("{} / {}", configuration.display_name, configuration.model_reference)}</strong>
-                        <span>{format!("{} · {}K / {}", configuration.provider_type, configuration.context_window / 1000, configuration.output_limit)}</span>
-                        <button class="text-button" disabled=configuration.active on:click=move |_| activate_chat_model(model_id.clone(), chat_configurations, chat_status, Arc::clone(&activate_lifecycle))>
-                            {if configuration.active { format!("{} FALLBACKS", configuration.fallback_model_ids.len()) } else { "Activate".into() }}
-                        </button>
-                    </div> }
+                    let delete_target_model = delete_target;
+                    let delete_target_provider = delete_target;
+                    view! {
+                        <div class="index-row model-route-row">
+                            <span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
+                            <div style="display:grid;gap:4px;min-width:0">
+                                <strong style="overflow-wrap:anywhere">{model_label.clone()}</strong>
+                                <span class="utility" style="font-size:10px">{provider_label.clone()}</span>
+                            </div>
+                            <span>{format!("{} · {}K / {}", configuration.provider_type, configuration.context_window / 1000, configuration.output_limit)}</span>
+                            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+                                <button class="text-button" disabled=configuration.active on:click=move |_| activate_chat_model(model_id.clone(), chat_configurations, chat_status, Arc::clone(&activate_lifecycle))>
+                                    {if configuration.active { format!("{} FALLBACKS", configuration.fallback_model_ids.len()) } else { "Activate".into() }}
+                                </button>
+                                <button class="icon-button danger" type="button" title="Delete model" aria-label=format!("Delete model {}", configuration.model_reference) on:click=move |_| delete_target_model.set(Some(DeleteTarget::Model { id: configuration.id.clone(), label: format!("{} / {}", configuration.display_name, configuration.model_reference) }))>"🗑"</button>
+                                <button class="icon-button danger" type="button" title="Delete provider (and its models)" aria-label=format!("Delete provider {}", configuration.provider_type) on:click=move |_| delete_target_provider.set(Some(DeleteTarget::Provider { id: configuration.provider_id.clone(), label: configuration.provider_type.clone() }))>"⌫"</button>
+                            </div>
+                        </div>
+                    }
                 }).collect_view()}
             </div>
+            {move || {
+                let dp = std::sync::Arc::clone(&delete_provider);
+                let dm = std::sync::Arc::clone(&delete_model);
+                delete_target.get().clone().map(|target| {
+                let (title, body, is_provider) = match target.clone() {
+                    DeleteTarget::Provider { id, label } => (format!("Delete provider {label}?"), format!("This will permanently delete the provider and ALL its models. This cannot be undone. Provider id: {}", &id[..8.min(id.len())]), true),
+                    DeleteTarget::Model { id, label } => (format!("Delete model {label}?"), format!("This will permanently delete the model. If it is the active route, the delete will be refused (409). Id: {}", &id[..8.min(id.len())]), false),
+                };
+                let confirm_target = target.clone();
+                let dp_inner = std::sync::Arc::clone(&dp);
+                let dm_inner = std::sync::Arc::clone(&dm);
+                view! {
+                    <div class="modal-backdrop" role="dialog" aria-modal="true">
+                        <div class="modal delete-confirm">
+                            <div class="modal-head"><h3>{title.clone()}</h3><button class="text-button" on:click=move |_| delete_target.set(None)>"✕"</button></div>
+                            <p class="form-note">{body.clone()}</p>
+                            <p class="error-note" style="font-size:13px">{if is_provider { "All models under this provider will be removed." } else { "The model record will be removed." }}</p>
+                            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+                                <button class="secondary" on:click=move |_| delete_target.set(None)>"Cancel"</button>
+                                <button class="primary danger" on:click=move |_| {
+                                    match confirm_target.clone() {
+                                        DeleteTarget::Provider { id, .. } => dp_inner(id),
+                                        DeleteTarget::Model { id, .. } => dm_inner(id),
+                                    }
+                                    delete_target.set(None);
+                                }>"Delete"</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            })}}
         </section>
         <section class="model-section">
         <div class="section-heading"><div><p class="utility">"LIBRARY / RETRIEVAL"</p><h2>"Embedding models"</h2></div></div>
@@ -5942,12 +6257,19 @@ fn ModelsPage() -> impl IntoView {
         </form>
         <p class="form-note">{move || status.get()}</p>
         <div class="index-table">
-            <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"PROVIDER"</span><span>"VECTOR"</span></div>
-            {move || configurations.get().into_iter().map(|configuration| view! {
-                <div class="index-row"><span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
-                <strong>{format!("{} / {}", configuration.display_name, configuration.model_reference)}</strong>
-                <span>{format!("{} · {}", configuration.provider_type, &configuration.id[..8.min(configuration.id.len())])}</span>
-                <span>{format!("{}D", configuration.dimensions)}</span></div>
+            <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"PROVIDER"</span><span>"ACTIONS"</span></div>
+            {move || configurations.get().into_iter().map(|configuration| {
+                let provider_id = configuration.provider_id.clone();
+                view! {
+                    <div class="index-row">
+                        <span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
+                        <strong>{format!("{} / {}", configuration.display_name, configuration.model_reference)}</strong>
+                        <span>{format!("{} · {}", configuration.provider_type, &configuration.id[..8.min(configuration.id.len())])}</span>
+                        <div style="display:flex;gap:6px">
+                            <button class="icon-button danger" type="button" title="Delete provider" aria-label=format!("Delete provider {}", configuration.provider_type) on:click=move |_| delete_target.set(Some(DeleteTarget::Provider { id: provider_id.clone(), label: configuration.provider_type.clone() }))>"⌫"</button>
+                        </div>
+                    </div>
+                }
             }).collect_view()}
         </div>
         </section>

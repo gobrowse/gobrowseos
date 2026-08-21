@@ -114,6 +114,43 @@ pub struct SkillRevisionResponse {
     pub promoted: bool,
 }
 
+/// Delete a skill (soft: marks deleted). Refuses when referenced by a run
+/// in progress.
+pub async fn delete_skill(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<bool> = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM skills WHERE id=$1 AND profile_id=$2 AND status <> 'deleted')",
+    )
+    .bind(id)
+    .bind(user.profile_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owned != Some(true) {
+        return Err(AppError::NotFound);
+    }
+    sqlx::query("UPDATE skills SET status='deleted', updated_at=now() WHERE id=$1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "skill.deleted",
+        "skill",
+        Some(id.to_string()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_skills(
     State(state): State<AppState>,
     headers: HeaderMap,
