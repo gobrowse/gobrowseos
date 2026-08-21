@@ -534,7 +534,7 @@ fn AuthPanel(
             <div class="auth-thesis">
                 <div class="brand-mark">"G/OS"</div>
                 <p class="eyebrow">"Gobrowse OS / self-hosted agent environment"</p>
-                <h1>"Keep the work. Find the context. Inspect every action."</h1>
+                <h1>"Keep the work. Find the context. " <em>"Inspect every action."</em></h1>
                 <p>"The Library turns conversations, projects, discoveries, and operating history into a searchable index without surrendering control of your data."</p>
                 <div class="index-sample">
                     <span>"L-0001"</span>

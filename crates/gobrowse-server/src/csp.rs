@@ -91,7 +91,7 @@ pub fn build_csp_header(state: &AppState, active: Option<&crate::ActiveUiState>)
             format!("'self' {}", style_hashes.join(" "))
         };
         format!(
-            "default-src 'none'; script-src {script_src}; style-src {style_src}; img-src 'self' data:; connect-src {connect_src}; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+            "default-src 'none'; script-src {script_src}; style-src {style_src}; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src {connect_src}; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
         )
     } else {
         let mut script_src = vec!["'self'".to_string(), "'wasm-unsafe-eval'".to_string()];
@@ -99,7 +99,7 @@ pub fn build_csp_header(state: &AppState, active: Option<&crate::ActiveUiState>)
         let mut style_src = vec!["'self'".to_string()];
         style_src.extend(builtin.style_hashes.iter().cloned());
         format!(
-            "default-src 'self'; script-src {}; style-src {}; img-src 'self' data:; connect-src {connect_src}; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
+            "default-src 'self'; script-src {}; style-src {}; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src {connect_src}; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
             script_src.join(" "),
             style_src.join(" ")
         )
