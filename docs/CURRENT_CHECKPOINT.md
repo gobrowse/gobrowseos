@@ -38,6 +38,19 @@ DO_NOT_REDO
 - Do NOT make sandbox connection eager again.
 - Do NOT change schema version 23 without a new migration.
 
-DEPLOYMENT_STATE: m24-current image tagged :latest locally and running in compose (healthy). Test app localhost:8082 still on m23 (deploy m24 to prod next).
+DEPLOYMENT_STATE: M24 PRODUCTION DEPLOYED + ACCEPTED (2026-08-21).
+- Host: root@178.128.179.216, /opt/gobrowse-os, compose app+postgres (pgvector 0.8.1-pg17).
+- Image: gobrowse-os-app:m24 (b9e181a2aa6e, 152 MB), transferred via docker save|gzip|load; compose switched to m24.
+- Migrations: 21→23 applied with `docker compose run --rm app migrate`; /api/v1/version = schema_version 23.
+- Rollback preserved: DB dump backups/gobrowse-m24-pre-20260821-130148.dump (BACKUP_VERIFY_OK), image gobrowse-os-app:m21-final-rollback (cc8ef3648130), compose docker-compose.yml.pre-m24 (+ .pre-m24-curl-fix).
+- PROD VERIFICATION (all direct):
+  - /health/ready = 200; /api/v1/version schema 23; owner_required:false.
+  - Auth: bad login rejected (403/401); authenticated session → library search 200 (Test#1, VERIFIED/lexical), conversations 200, message POST 201 (user msg). Ephemeral test session removed after checks; sessions count restored.
+  - Chat run: no providers configured on prod (pre-existing, 0 providers) — user message accepted; no model run (documented, not a regression).
+  - gobrowse doctor: PostgreSQL/pgvector/embedding queue/static assets/vault/sandbox PASS ("ok"); Git FAIL = expected (git removed from minimal runtime in M24).
+  - Container healthy (healthcheck), 0 restarts, 0 log errors; UI assets /pkg/gobrowse-web.js + .wasm + css all 200.
+  - Disk: remote 9.0G free, local 7.8G free (≥5G budget).
+- HEALTHCHECK FIX APPLIED IN PROD: prod compose still used `curl` (removed from M24 image) → app was "unhealthy" despite /health/ready 200; switched to `test: ["CMD","gobrowse","health"]` (repo compose was already correct) → healthy. No code/image change; config-only.
+- TEST SESSION NOTE: real owner password not stored on host (no creds available); auth verified via minted DB session (sha256 token, auth_epoch 1) — cleanup confirmed (DELETE 1, sessions back to 5).
 
-NEXT_TASK: Deploy m24 image to prod (ssh root@178.128.179.216), then start M24b (Custom UI System, per roadmap) or the post-release backlog.
+NEXT_TASK: M24b (Custom UI System, per roadmap) — architect inspects real post-M24 repo, PLAN.md update, implement preserving M24 baseline. Historical audit lanes (docs/HISTORICAL_AUDIT.md) running in parallel.
