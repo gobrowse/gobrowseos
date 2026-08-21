@@ -60,9 +60,38 @@ use crate::{
     config::Settings,
     error::AppError,
     plugin_github::{GitHubMarketplace, GitHubReleaseSource},
-    sandbox_client::{SandboxClient, SandboxConfig},
+    sandbox_client::{SandboxClient, SandboxClientError, SandboxConfig},
     vault::Vault,
 };
+
+/// Lazily-connected sandbox client.
+///
+/// The [`SandboxConfig`] is captured at startup, but no validation or
+/// connection happens then, so a malformed or unreachable sandbox never fails
+/// server startup. The validated [`SandboxClient`] is built on first use (via
+/// [`SandboxHandle::get_or_connect`]) and cached on success; init failures are
+/// reported gracefully and retried on the next call. The actual daemon socket
+/// is opened lazily, per operation, by [`SandboxClient::send`].
+#[derive(Clone)]
+pub struct SandboxHandle {
+    pub config: SandboxConfig,
+    client: Arc<std::sync::OnceLock<SandboxClient>>,
+}
+
+impl SandboxHandle {
+    /// Returns a connected client, building and caching it on first use.
+    /// Propagates config validation errors without caching them.
+    pub fn get_or_connect(&self) -> Result<SandboxClient, SandboxClientError> {
+        if let Some(client) = self.client.get() {
+            return Ok(client.clone());
+        }
+        let client = SandboxClient::new(self.config.clone())?;
+        // Another caller may have initialized concurrently; ignore the
+        // (unlikely) duplicate-set error and return our freshly built client.
+        let _ = self.client.set(client.clone());
+        Ok(client)
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
@@ -71,10 +100,10 @@ pub struct AppState {
     pub passwords: PasswordRuntime,
     pub vault: Vault,
     pub run_cancellations: Arc<RwLock<HashMap<uuid::Uuid, (uuid::Uuid, CancellationToken)>>>,
-    /// Configured sandbox client. `None` when sandboxing is disabled or the
-    /// daemon socket/token are not configured. A down daemon never fails
-    /// startup: failures surface lazily at call time.
-    pub sandbox: Option<SandboxClient>,
+    /// Configured sandbox handle. `None` when sandboxing is disabled or the
+    /// daemon socket/token are not configured. The client connects lazily on
+    /// first use, so a down or misconfigured daemon never fails startup.
+    pub sandbox: Option<SandboxHandle>,
     /// GitHub release plugin source (honors test base-URL overrides).
     pub plugin_source: GitHubReleaseSource,
     /// GitHub marketplace adapter for `POST /plugins/search`.
@@ -96,17 +125,16 @@ impl AppState {
                 &settings.features.sandbox_socket_path,
                 &settings.features.sandbox_auth_token,
             ) {
-                (Some(socket_path), Some(auth_token)) => Some(
-                    SandboxClient::connect(SandboxConfig {
+                (Some(socket_path), Some(auth_token)) => Some(SandboxHandle {
+                    config: SandboxConfig {
                         socket_path: socket_path.clone(),
                         auth_token: auth_token.clone(),
                         timeout: Duration::from_secs(
                             settings.features.sandbox_socket_timeout_seconds,
                         ),
-                    })
-                    .await
-                    .map_err(|error| AppError::Internal(error.into()))?,
-                ),
+                    },
+                    client: Arc::new(std::sync::OnceLock::new()),
+                }),
                 _ => None,
             }
         } else {

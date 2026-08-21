@@ -1963,15 +1963,17 @@ fn sanitize_archive_path(name: &str) -> Result<PathBuf, String> {
 // Sandbox self-test
 // ---------------------------------------------------------------------------
 
-fn require_sandbox(state: &AppState) -> Result<&crate::sandbox_client::SandboxClient, AppError> {
-    let sandbox = state.sandbox.as_ref().ok_or_else(|| {
+fn require_sandbox(state: &AppState) -> Result<crate::sandbox_client::SandboxClient, AppError> {
+    let handle = state.sandbox.as_ref().ok_or_else(|| {
         AppError::Conflict(
             "this plugin declares executable components or a self_test, so installation requires \
              the sandbox, but features.sandbox with sandbox_socket_path and sandbox_auth_token are \
              not configured",
         )
     })?;
-    Ok(sandbox)
+    handle.get_or_connect().map_err(|_| {
+        AppError::Conflict("sandbox unavailable — daemon not reachable or not provisioned")
+    })
 }
 
 fn map_sandbox_error(error: SandboxClientError) -> AppError {
@@ -2013,7 +2015,7 @@ async fn run_plugin_self_test(
         .provision_workspace(plugin_id)
         .await
         .map_err(map_sandbox_error)?;
-    upload_artifact_to_sandbox(sandbox, plugin_id, artifact_dir).await?;
+    upload_artifact_to_sandbox(&sandbox, plugin_id, artifact_dir).await?;
 
     let Some(self_test) = &manifest.self_test else {
         return Ok(serde_json::Value::Null);

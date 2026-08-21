@@ -40,17 +40,12 @@ pub fn tool_definitions(sandbox_enabled: bool) -> Vec<ToolDefinition> {
     let mut definitions = vec![
         ToolDefinition {
             id: "library_search".into(),
-            description: "Search the profile Library for books matching a query. \
-                          Returns bounded summaries (id, kind, title, snippet, scope, trust). \
-                          Never returns full book content."
-                .into(),
+            description: "Search library books".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "q": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 1000
+                        "type": "string"
                     },
                     "workspace_id": {
                         "type": ["string", "null"],
@@ -63,27 +58,20 @@ pub fn tool_definitions(sandbox_enabled: bool) -> Vec<ToolDefinition> {
                         "default": 10
                     }
                 },
-                "required": ["q"],
-                "additionalProperties": false
+                "required": ["q"]
             }),
         },
         ToolDefinition {
             id: "library_add".into(),
-            description: "Create a NOTE in the Library. The note is user-authored and \
-                          scoped to the current workspace (or profile). Returns the new book id."
-                .into(),
+            description: "Add a NOTE book".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "title": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 512
+                        "type": "string"
                     },
                     "body": {
-                        "type": "string",
-                        "minLength": 1,
-                        "maxLength": 100000
+                        "type": "string"
                     },
                     "tags": {
                         "type": "array",
@@ -94,19 +82,12 @@ pub fn tool_definitions(sandbox_enabled: bool) -> Vec<ToolDefinition> {
                         "maxItems": 32
                     }
                 },
-                "required": ["title", "body"],
-                "additionalProperties": false
+                "required": ["title", "body"]
             }),
         },
         ToolDefinition {
             id: "library_load".into(),
-            description: "Load one Library book's full content on demand. For SOURCE books \
-                          returns the body (max 24,000 chars); SKILL returns the active revision \
-                          content; MCP returns discovered tool names and descriptions; PLUGIN \
-                          returns component names and descriptions. Pass 'component' (an MCP tool \
-                          name or PLUGIN component name) to resolve just that item's full schema. \
-                          Bounded: max 5 loads per run."
-                .into(),
+            description: "Load book content".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -115,12 +96,10 @@ pub fn tool_definitions(sandbox_enabled: bool) -> Vec<ToolDefinition> {
                         "format": "uuid"
                     },
                     "component": {
-                        "type": ["string", "null"],
-                        "maxLength": 200
+                        "type": ["string", "null"]
                     }
                 },
-                "required": ["book_id"],
-                "additionalProperties": false
+                "required": ["book_id"]
             }),
         },
     ];
@@ -143,16 +122,13 @@ fn sandbox_tool_definitions() -> Vec<ToolDefinition> {
                     "maxLength": 4096
                 }
             },
-            "required": ["path"],
-            "additionalProperties": false
+            "required": ["path"]
         })
     };
     vec![
         ToolDefinition {
             id: "sandbox_exec".into(),
-            description: "Execute a command inside the sandboxed workspace. Returns combined \
-                          output (max 64 KiB), the exit code, and the terminal state."
-                .into(),
+            description: "Run a command".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -164,7 +140,7 @@ fn sandbox_tool_definitions() -> Vec<ToolDefinition> {
                     },
                     "working_directory": {
                         "type": "string",
-                        "description": "workspace-relative directory; defaults to '.'",
+                        "description": "working directory",
                         "maxLength": 4096
                     },
                     "timeout_seconds": {
@@ -174,60 +150,49 @@ fn sandbox_tool_definitions() -> Vec<ToolDefinition> {
                         "default": 10
                     }
                 },
-                "required": ["command"],
-                "additionalProperties": false
+                "required": ["command"]
             }),
         },
         ToolDefinition {
             id: "sandbox_read_file".into(),
-            description: "Read a file from the sandboxed workspace. Returns base64 content \
-                          (max 256 KiB) and its SHA-256 digest."
-                .into(),
-            input_schema: path("workspace-relative file path"),
+            description: "Read a file".into(),
+            input_schema: path("file path"),
         },
         ToolDefinition {
             id: "sandbox_write_file".into(),
-            description: "Write (create or replace) a file in the sandboxed workspace. \
-                          Content is base64-encoded; max 256 KiB."
-                .into(),
+            description: "Write a file".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "maxLength": 4096},
                     "data_base64": {"type": "string", "maxLength": 349_528}
                 },
-                "required": ["path", "data_base64"],
-                "additionalProperties": false
+                "required": ["path", "data_base64"]
             }),
         },
         ToolDefinition {
             id: "sandbox_list_files".into(),
-            description: "List directory entries in the sandboxed workspace.".into(),
-            input_schema: path("workspace-relative directory path"),
+            description: "List directory".into(),
+            input_schema: path("directory path"),
         },
         ToolDefinition {
             id: "sandbox_stat".into(),
-            description:
-                "Get metadata (kind, size, mode, modified time) for a sandbox file or directory."
-                    .into(),
-            input_schema: path("workspace-relative file or directory path"),
+            description: "Stat a path".into(),
+            input_schema: path("file or directory"),
         },
         ToolDefinition {
             id: "sandbox_mkdir".into(),
-            description: "Create a directory in the sandboxed workspace.".into(),
-            input_schema: path("workspace-relative directory path"),
+            description: "Make directory".into(),
+            input_schema: path("directory path"),
         },
         ToolDefinition {
             id: "sandbox_remove".into(),
-            description: "Remove a file or empty directory from the sandboxed workspace.".into(),
-            input_schema: path("workspace-relative file or directory path"),
+            description: "Remove a path".into(),
+            input_schema: path("file or directory"),
         },
         ToolDefinition {
             id: "terminal_start".into(),
-            description: "Start an interactive PTY session in the sandboxed workspace. Returns \
-                          a terminal_id for terminal_input/terminal_read_output/terminal_resize/\
-                          terminal_interrupt/terminal_close."
-                .into(),
+            description: "Start a PTY".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -241,28 +206,24 @@ fn sandbox_tool_definitions() -> Vec<ToolDefinition> {
                     "cols": {"type": "integer", "minimum": 20, "maximum": 1000, "default": 80},
                     "rows": {"type": "integer", "minimum": 5, "maximum": 500, "default": 24}
                 },
-                "required": ["command"],
-                "additionalProperties": false
+                "required": ["command"]
             }),
         },
         ToolDefinition {
             id: "terminal_input".into(),
-            description: "Write bytes (base64) to a running terminal session.".into(),
+            description: "Write to terminal".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "terminal_id": {"type": "string", "format": "uuid"},
                     "data_base64": {"type": "string", "maxLength": 87_381}
                 },
-                "required": ["terminal_id", "data_base64"],
-                "additionalProperties": false
+                "required": ["terminal_id", "data_base64"]
             }),
         },
         ToolDefinition {
             id: "terminal_read_output".into(),
-            description: "Read new output from a terminal session since after_cursor. Returns \
-                          decoded text, the next cursor, and the session state."
-                .into(),
+            description: "Read terminal output".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -271,13 +232,12 @@ fn sandbox_tool_definitions() -> Vec<ToolDefinition> {
                     "max_bytes": {"type": "integer", "minimum": 1, "maximum": 262144, "default": 32768},
                     "wait_ms": {"type": "integer", "minimum": 0, "maximum": 30000, "default": 500}
                 },
-                "required": ["terminal_id"],
-                "additionalProperties": false
+                "required": ["terminal_id"]
             }),
         },
         ToolDefinition {
             id: "terminal_resize".into(),
-            description: "Resize a terminal session.".into(),
+            description: "Resize terminal".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -285,36 +245,34 @@ fn sandbox_tool_definitions() -> Vec<ToolDefinition> {
                     "cols": {"type": "integer", "minimum": 20, "maximum": 1000},
                     "rows": {"type": "integer", "minimum": 5, "maximum": 500}
                 },
-                "required": ["terminal_id", "cols", "rows"],
-                "additionalProperties": false
+                "required": ["terminal_id", "cols", "rows"]
             }),
         },
         ToolDefinition {
             id: "terminal_interrupt".into(),
-            description: "Send SIGINT to the terminal's foreground process.".into(),
+            description: "Interrupt terminal".into(),
             input_schema: terminal_id_schema(),
         },
         ToolDefinition {
             id: "terminal_close".into(),
-            description: "Terminate a terminal session.".into(),
+            description: "Close terminal".into(),
             input_schema: terminal_id_schema(),
         },
         ToolDefinition {
             id: "process_list".into(),
-            description: "List the processes running in a terminal session.".into(),
+            description: "List processes".into(),
             input_schema: terminal_id_schema(),
         },
         ToolDefinition {
             id: "process_kill".into(),
-            description: "Kill a process (pid) in a terminal session.".into(),
+            description: "Kill a process".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "terminal_id": {"type": "string", "format": "uuid"},
                     "pid": {"type": "integer", "minimum": 1}
                 },
-                "required": ["terminal_id", "pid"],
-                "additionalProperties": false
+                "required": ["terminal_id", "pid"]
             }),
         },
     ]
@@ -851,10 +809,11 @@ impl Tool for SandboxTool {
     }
 
     async fn execute(&self, context: &ToolContext, input: Value) -> Result<Value, ToolError> {
-        let client = self.state.sandbox.as_ref().ok_or(ToolError::Execution)?;
+        let handle = self.state.sandbox.as_ref().ok_or(ToolError::Execution)?;
+        let client = handle.get_or_connect().map_err(|_| ToolError::Execution)?;
         let workspace_id = context.workspace_id.ok_or(ToolError::Execution)?;
         execute_sandbox_op(
-            client,
+            &client,
             workspace_id,
             self.kind,
             &input,
@@ -1410,31 +1369,37 @@ mod tests {
     }
 
     #[test]
-    fn library_search_input_schema_validates_bounds() {
+    fn library_search_schema_drops_redundant_bounds() {
         let schema = &tool_definitions(false)[0].input_schema;
         let props = schema["properties"].as_object().unwrap();
-        assert_eq!(props["q"]["minLength"], 1);
-        assert_eq!(props["q"]["maxLength"], 1000);
+        // Redundant length bounds are now enforced server-side; the schema no
+        // longer carries them.
+        assert!(props["q"].get("minLength").is_none());
+        assert!(props["q"].get("maxLength").is_none());
+        // Numeric bounds are out of scope for the reduction and are retained.
         assert_eq!(props["limit"]["minimum"], 1);
         assert_eq!(props["limit"]["maximum"], 20);
     }
 
     #[test]
-    fn library_add_input_schema_rejects_extra_fields() {
+    fn library_add_schema_drops_redundant_bounds() {
         let schema = &tool_definitions(false)[1].input_schema;
-        assert_eq!(schema["additionalProperties"], false);
+        // additionalProperties is no longer emitted and length bounds are
+        // enforced server-side.
+        assert!(schema.get("additionalProperties").is_none());
         let props = schema["properties"].as_object().unwrap();
-        assert_eq!(props["title"]["maxLength"], 512);
-        assert_eq!(props["body"]["maxLength"], 100_000);
+        assert!(props["title"].get("maxLength").is_none());
+        assert!(props["body"].get("maxLength").is_none());
     }
 
     #[test]
-    fn library_load_schema_requires_book_id_and_bounds_component() {
+    fn library_load_schema_requires_book_id() {
         let schema = &tool_definitions(false)[2].input_schema;
-        assert_eq!(schema["additionalProperties"], false);
+        assert!(schema.get("additionalProperties").is_none());
         let props = schema["properties"].as_object().unwrap();
         assert_eq!(props["book_id"]["format"], "uuid");
-        assert_eq!(props["component"]["maxLength"], 200);
+        // component length bound is now enforced server-side.
+        assert!(props["component"].get("maxLength").is_none());
         assert!(
             schema["required"]
                 .as_array()

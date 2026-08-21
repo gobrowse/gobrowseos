@@ -371,7 +371,9 @@ pub fn select_model_for_task(
             "no task-specific routing configured for '{}'; \
              selected cheapest-capable model '{}' (cost_ranking={}) among {} equally-capable route(s).",
             format!("{:?}", task_class).to_lowercase(),
-            model_id, cost, fallback_chain.len()
+            model_id,
+            cost,
+            fallback_chain.len()
         );
         (model_id, reason)
     } else {

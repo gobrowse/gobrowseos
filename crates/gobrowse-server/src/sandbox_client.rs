@@ -72,10 +72,11 @@ pub struct SandboxClient {
 }
 
 impl SandboxClient {
-    /// Validates and stores the connection configuration. No socket is opened
-    /// eagerly: connections happen lazily per [`Self::send`], so a down daemon
-    /// never fails server startup.
-    pub async fn connect(config: SandboxConfig) -> Result<Self, SandboxClientError> {
+    /// Synchronously validates and stores the connection configuration. No
+    /// socket is opened eagerly: connections happen lazily per [`Self::send`],
+    /// so a down daemon never fails server startup. This is the synchronous
+    /// core used by the lazy sandbox connection path.
+    pub fn new(config: SandboxConfig) -> Result<Self, SandboxClientError> {
         if config.socket_path.as_os_str().is_empty() {
             return Err(SandboxClientError::ProtocolViolation(
                 "sandbox socket path must not be empty".into(),
@@ -91,6 +92,13 @@ impl SandboxClient {
             auth_token: config.auth_token,
             timeout: config.timeout,
         })
+    }
+
+    /// Validates and stores the connection configuration. No socket is opened
+    /// eagerly: connections happen lazily per [`Self::send`], so a down daemon
+    /// never fails server startup.
+    pub async fn connect(config: SandboxConfig) -> Result<Self, SandboxClientError> {
+        Self::new(config)
     }
 
     /// Sends one operation and returns the daemon's result, mapping

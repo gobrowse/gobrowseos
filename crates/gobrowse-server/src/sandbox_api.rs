@@ -199,7 +199,7 @@ pub async fn exec(
             )
             .await
             .map_err(sandbox_error_to_app)?;
-        drain_terminal(client, terminal_id, timeout).await
+        drain_terminal(&client, terminal_id, timeout).await
     })
     .await?;
     Ok(Json(outcome))
@@ -624,8 +624,11 @@ pub async fn kill_process(
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-fn sandbox_client(state: &AppState) -> Result<&SandboxClient, AppError> {
-    state.sandbox.as_ref().ok_or_else(|| {
+fn sandbox_client(state: &AppState) -> Result<SandboxClient, AppError> {
+    let handle = state.sandbox.as_ref().ok_or_else(|| {
+        AppError::ServiceUnavailable("sandbox unavailable — daemon not configured or not reachable")
+    })?;
+    handle.get_or_connect().map_err(|_| {
         AppError::ServiceUnavailable("sandbox unavailable — daemon not configured or not reachable")
     })
 }
