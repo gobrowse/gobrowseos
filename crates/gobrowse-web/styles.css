@@ -763,3 +763,60 @@ kbd { padding: 2px 6px; border: 1px solid var(--line); border-bottom-width: 2px;
 
 /* — a11y: ensure visible focus on dark nav — */
 .side-nav :focus-visible { outline-color: #fff; }
+
+/* — M25a Security: Archive Spine credential ledger — */
+.auth-divider { display: grid; place-items: center; position: relative; margin: 2px 0; }
+.auth-divider::before { content: ""; position: absolute; inset: 50% 0 auto; height: 1px; background: var(--line); }
+.auth-divider span { position: relative; padding: 0 10px; background: var(--surface); color: var(--slate); font: 600 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; }
+.auth-passkey { display: flex; align-items: center; justify-content: center; gap: 8px; width: 100%; border-radius: 999px; font-weight: 650; }
+.auth-passkey-icon { display: grid; place-items: center; width: 22px; height: 22px; border-radius: 999px; background: var(--ink); color: #fff; font-size: 13px; line-height: 1; }
+
+.security-grid { display: grid; gap: 18px; margin-top: 14px; }
+.security-section { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-lg); padding: 18px; box-shadow: var(--paper-shadow); }
+.security-section .section-heading { margin-bottom: 12px; }
+.security-section .section-heading h2 { font-size: 19px; }
+.security-empty { display: grid; grid-template-columns: 44px 1fr; gap: 0; border: 1px dashed var(--line); border-radius: var(--radius); overflow: hidden; background: var(--fog-2); margin: 8px 0; }
+.security-empty > span { display: grid; place-items: center; background: var(--ink); color: #fff; font-family: var(--mono); }
+.security-empty > p { padding: 14px; margin: 0; }
+
+.method-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin: 12px 0; }
+.method-card { position: relative; display: grid; gap: 8px; padding: 14px 14px 12px 16px; background: var(--surface); border: 1px solid var(--line); border-left-width: 4px; border-radius: var(--radius); box-shadow: var(--paper-shadow); overflow: hidden; }
+.method-card::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; }
+.method-card.spine-password { border-left-color: var(--indigo); }
+.method-card.spine-webauthn { border-left-color: var(--teal); }
+.method-card.spine-oidc { border-left-color: var(--amber); }
+.method-card.spine-password::before { background: var(--indigo); }
+.method-card.spine-webauthn::before { background: var(--teal); }
+.method-card.spine-oidc::before { background: var(--amber); }
+.method-card.is-primary { background: linear-gradient(90deg, rgb(21 104 94 / 5%), var(--surface) 36%); }
+.method-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.method-head .kind-badge.webauthn { background: var(--teal); border-color: var(--teal); color: #fff; }
+.method-head .kind-badge.password { background: var(--indigo); border-color: var(--indigo); color: #fff; }
+.method-head .kind-badge.oidc { background: var(--amber); border-color: var(--amber); color: #fff; }
+.method-label { font-size: 15px; letter-spacing: -0.015em; overflow-wrap: anywhere; }
+.method-meta { display: flex; gap: 10px; flex-wrap: wrap; color: var(--slate); font: 500 11px var(--mono); letter-spacing: 0.04em; }
+.method-actions { display: flex; align-items: center; gap: 10px; border-top: 1px solid var(--hair); padding-top: 10px; }
+
+.passkey-add { display: grid; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.passkey-label { display: grid; gap: 6px; color: var(--slate); font-size: 12px; font-weight: 600; max-width: 420px; }
+.passkey-label input { height: 38px; border: 1px solid var(--line); border-radius: 8px; padding: 0 11px; background: #fff; }
+
+.session-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 8px 0 10px; padding-bottom: 10px; border-bottom: 1px solid var(--hair); }
+.session-list { display: grid; gap: 8px; }
+.session-row { display: grid; grid-template-columns: 140px 1fr auto auto; gap: 10px; align-items: center; padding: 10px 12px; border: 1px solid var(--line); border-left-width: 4px; border-left-color: var(--line); border-radius: var(--radius); background: var(--surface); }
+.session-row.is-current { border-left-color: var(--teal); background: linear-gradient(90deg, rgb(21 104 94 / 7%), var(--surface) 42%); }
+.session-hash { font-size: 12px; }
+.session-when { display: grid; gap: 2px; min-width: 0; }
+.session-when .utility { font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-badges { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.security-footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--hair); }
+
+@media (max-width: 1050px) {
+  .method-grid { grid-template-columns: 1fr; }
+  .session-row { grid-template-columns: 110px 1fr auto; }
+  .session-row > button { grid-column: 1 / -1; justify-self: end; }
+}
+@media (max-width: 720px) {
+  .session-row { grid-template-columns: 1fr auto; }
+  .session-when { grid-column: 1 / -1; order: 3; }
+}

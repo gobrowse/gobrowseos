@@ -47,6 +47,7 @@ zeroize.workspace = true
 zip.workspace = true
 percent-encoding = "2.3.1"
 webauthn-rs = { version = "0.5.5", features = ["resident-key-support"] }
+openidconnect = { version = "4.0.1", features = ["reqwest"], optional = true }
 
 [dev-dependencies]
 http-body-util = "0.1.3"
@@ -56,3 +57,7 @@ tokio-tungstenite = "0.29.0"
 
 [lints]
 workspace = true
+
+[features]
+default = []
+oidc = ["dep:openidconnect"]

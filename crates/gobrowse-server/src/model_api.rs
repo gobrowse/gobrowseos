@@ -35,6 +35,7 @@ pub struct CreateChatModelRequest {
 #[derive(Serialize)]
 pub struct ChatModelResponse {
     pub id: String,
+    pub provider_id: String,
     pub display_name: String,
     pub provider_type: String,
     pub model_reference: String,
@@ -162,6 +163,7 @@ pub async fn create_chat_model(
         StatusCode::CREATED,
         Json(ChatModelResponse {
             id: model_id,
+            provider_id: provider_id.clone(),
             display_name: input.display_name.trim().into(),
             provider_type: input.provider_type,
             model_reference: input.model_reference.trim().into(),
@@ -184,7 +186,7 @@ pub async fn list_chat_models(
         "SELECT m.id,m.display_name,m.model_reference,m.context_window,m.output_limit,m.priority, \
          ARRAY(SELECT route.fallback_model_id FROM model_fallback_routes route \
                WHERE route.profile_id=p.profile_id AND route.primary_model_id=m.id ORDER BY route.position) AS fallback_model_ids, \
-         p.provider_type,p.secret_reference IS NOT NULL AS authenticated,profile.active_chat_model_id=m.id AS active \
+         p.id AS provider_id,p.provider_type,p.secret_reference IS NOT NULL AS authenticated,profile.active_chat_model_id=m.id AS active \
          FROM models m JOIN providers p ON p.id=m.provider_id JOIN profiles profile ON profile.id=p.profile_id \
          WHERE p.profile_id=$1 AND p.enabled AND m.enabled AND 'text'=ANY(m.capabilities) \
          ORDER BY active DESC,m.priority DESC,m.display_name",
@@ -196,6 +198,7 @@ pub async fn list_chat_models(
         rows.into_iter()
             .map(|row| ChatModelResponse {
                 id: row.get("id"),
+                provider_id: row.get("provider_id"),
                 display_name: row.get("display_name"),
                 provider_type: row.get("provider_type"),
                 model_reference: row.get("model_reference"),
@@ -247,6 +250,122 @@ pub struct TaskRouteResponse {
 }
 
 /// List all task routes for the current user's profile.
+/// Delete a provider and all its models (cascade). Refuses when the
+/// provider owns the active chat model or has embedding jobs in flight.
+pub async fn delete_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(provider_id): axum::extract::Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    require_admin(&user)?;
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<bool> =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM providers WHERE id=$1 AND profile_id=$2)")
+            .bind(&provider_id)
+            .bind(user.profile_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owned != Some(true) {
+        return Err(AppError::NotFound);
+    }
+    // Refuse when any model of this provider is the profile's active chat model.
+    let active: Option<String> =
+        sqlx::query_scalar("SELECT active_chat_model_id FROM profiles WHERE id=$1")
+            .bind(user.profile_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if let Some(active) = active {
+        let is_active: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM models WHERE provider_id=$1 AND id=$2)",
+        )
+        .bind(&provider_id)
+        .bind(&active)
+        .fetch_one(&mut *tx)
+        .await?;
+        if is_active {
+            return Err(AppError::Conflict(
+                "cannot delete a provider whose model is the active chat model",
+            ));
+        }
+    }
+    // Refuse when embedding jobs reference this provider's embedding model.
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM embedding_jobs job JOIN embedding_models em ON em.id=job.embedding_model_id          WHERE em.provider_id=$1 AND job.status IN ('queued','running')",
+    )
+    .bind(&provider_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    if jobs > 0 {
+        return Err(AppError::Conflict(
+            "cannot delete a provider with embedding jobs in progress",
+        ));
+    }
+    sqlx::query("DELETE FROM providers WHERE id=$1")
+        .bind(&provider_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "model.provider_deleted",
+        "provider",
+        Some(provider_id.clone()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Delete a single model from a provider.
+pub async fn delete_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(model_id): axum::extract::Path<String>,
+) -> Result<StatusCode, AppError> {
+    let user = require_user(&state, &headers).await?;
+    require_admin(&user)?;
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<bool> = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM models m JOIN providers p ON p.id=m.provider_id          WHERE m.id=$1 AND p.profile_id=$2)",
+    )
+    .bind(&model_id)
+    .bind(user.profile_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owned != Some(true) {
+        return Err(AppError::NotFound);
+    }
+    let active: Option<String> =
+        sqlx::query_scalar("SELECT active_chat_model_id FROM profiles WHERE id=$1")
+            .bind(user.profile_id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if active.as_deref() == Some(model_id.as_str()) {
+        return Err(AppError::Conflict(
+            "cannot delete the active chat model; activate another first",
+        ));
+    }
+    sqlx::query("DELETE FROM models WHERE id=$1")
+        .bind(&model_id)
+        .execute(&mut *tx)
+        .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "model.deleted",
+        "model",
+        Some(model_id.clone()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn list_task_routes(
     State(state): State<AppState>,
     headers: HeaderMap,

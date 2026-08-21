@@ -42,6 +42,7 @@ enum Page {
     Models,
     Diagnostics,
     UiPackages,
+    Security,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,6 +358,8 @@ struct CreateEmbeddingConfiguration<'a> {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatModelConfiguration {
     id: String,
+    #[serde(default)]
+    provider_id: String,
     display_name: String,
     provider_type: String,
     model_reference: String,
@@ -381,18 +384,51 @@ struct CreateChatModelConfiguration<'a> {
 }
 
 #[derive(Debug, Serialize)]
-struct StoreSecretPayload<'a> {
-    purpose: &'a str,
-    allowed_hosts: Vec<String>,
-    value: String,
+struct ProviderTestRequest<'a> {
+    base_url: &'a str,
+    #[serde(default)]
+    api_key: Option<&'a str>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ProviderTestResponse {
+    ok: bool,
+    detail: String,
+    models: Vec<CatalogModel>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeleteTarget {
+    Provider { id: String, label: String },
+    Model { id: String, label: String },
+}
+
+const WORKSPACE_STORAGE_KEY: &str = "gobrowse.selected-workspace";
+
+fn load_selected_workspace() -> Option<String> {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|s| s.get_item(WORKSPACE_STORAGE_KEY).ok().flatten())
+        .filter(|v| !v.trim().is_empty())
+}
+
+fn store_selected_workspace(value: &Option<String>) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        match value {
+            Some(id) if !id.trim().is_empty() => {
+                let _ = storage.set_item(WORKSPACE_STORAGE_KEY, id);
+            }
+            _ => {
+                let _ = storage.remove_item(WORKSPACE_STORAGE_KEY);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct SecretMeta {
     id: String,
 }
-
-#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 struct AutobiographyResponse {
     id: String,
@@ -488,6 +524,8 @@ fn AuthPanel(
     let name = RwSignal::new(String::new());
     let password = RwSignal::new(String::new());
     let pending = RwSignal::new(false);
+    let passkey_pending = RwSignal::new(false);
+    let passkey_error = RwSignal::new(None::<String>);
 
     let submit = move |_| {
         if pending.get_untracked() {
@@ -537,6 +575,62 @@ fn AuthPanel(
         });
     };
 
+    let passkey_login = move |_| {
+        if setup || passkey_pending.get_untracked() {
+            return;
+        }
+        passkey_pending.set(true);
+        passkey_error.set(None);
+        error.set(None);
+        spawn_local(async move {
+            let outcome: Result<(), String> = async {
+                let start_resp = Request::post("/api/v1/auth/methods/webauthn/login")
+                    .json(&serde_json::json!({}))
+                    .map_err(|_| "Could not start passkey login.".to_string())?
+                    .send()
+                    .await
+                    .map_err(|_| "Passkey service did not answer.".to_string())?;
+                if !start_resp.ok() {
+                    return Err(api_error(&start_resp).await);
+                }
+                let started: WebauthnLoginStart = start_resp
+                    .json()
+                    .await
+                    .map_err(|_| "Invalid passkey options.".to_string())?;
+                let opts = serde_json::to_value(started.request_options)
+                    .map_err(|_| "Invalid request options.".to_string())?;
+                let credential_js = webauthn_get_credential(opts)
+                    .await
+                    .map_err(|e| map_webauthn_error(&e))?;
+                let credential = js_credential_to_json(credential_js)?;
+                let complete = Request::post("/api/v1/auth/methods/webauthn/login/complete")
+                    .json(&serde_json::json!({
+                        "ceremony_id": started.ceremony_id,
+                        "credential": credential,
+                    }))
+                    .map_err(|_| "Could not encode credential.".to_string())?
+                    .send()
+                    .await
+                    .map_err(|_| "Passkey verification did not answer.".to_string())?;
+                if !complete.ok() {
+                    return Err(api_error(&complete).await);
+                }
+                let current: User = complete
+                    .json()
+                    .await
+                    .map_err(|_| "Invalid account response.".to_string())?;
+                user.set(Some(current));
+                auth.set(AuthStage::Ready);
+                Ok(())
+            }
+            .await;
+            if let Err(msg) = outcome {
+                passkey_error.set(Some(msg));
+            }
+            passkey_pending.set(false);
+        });
+    };
+
     view! {
         <section class="auth-layout">
             <div class="auth-thesis">
@@ -574,6 +668,16 @@ fn AuthPanel(
                 <button class="primary" type="submit" disabled=move || pending.get()>
                     {move || if pending.get() { "Working..." } else if setup { "Create owner" } else { "Sign in" }}
                 </button>
+                {(!setup).then(|| view! {
+                    <div class="auth-divider"><span>"or"</span></div>
+                    <button class="secondary auth-passkey" type="button"
+                        disabled=move || passkey_pending.get()
+                        on:click=passkey_login>
+                        <span class="auth-passkey-icon">"⌖"</span>
+                        {move || if passkey_pending.get() { "Waiting for authenticator..." } else { "Sign in with passkey" }}
+                    </button>
+                    {move || passkey_error.get().map(|m| view! { <p class="inline-error">{m}</p> })}
+                })}
                 <p class="form-note">"Credentials stay in Gobrowse OS. Models receive capability status, never passwords or provider secrets."</p>
             </form>
         </section>
@@ -616,6 +720,7 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                 <NavGroup title="ORGANIZE" items=vec![("Library", Page::Library), ("Workspaces", Page::Workspaces), ("Skills", Page::Skills), ("Autobiography", Page::Autobiography)] page />
                 <NavGroup title="DISPLAY" items=vec![("UI Packages", Page::UiPackages)] page />
                 <NavGroup title="CONNECT" items=if is_admin { vec![("MCP", Page::Mcp), ("Models", Page::Models)] } else { vec![("MCP", Page::Mcp)] } page />
+                <NavGroup title="ACCOUNT" items=vec![("Security", Page::Security)] page />
                 {is_admin.then(|| view! { <NavGroup title="INSPECT" items=vec![("Diagnostics", Page::Diagnostics)] page /> })}
             </nav>
             <section id="workspace" class="workspace" tabindex="-1">
@@ -648,6 +753,9 @@ fn OperatorShell(user: RwSignal<Option<User>>, auth: RwSignal<AuthStage>) -> imp
                 </div>
                 <div style:display=move || if page.get() == Page::UiPackages { "block" } else { "none" }>
                     <UiPackagesPage />
+                </div>
+                <div style:display=move || if page.get() == Page::Security { "block" } else { "none" }>
+                    <SecurityPage user=user />
                 </div>
                 <div style:display=move || if matches!(page.get(), Page::Tasks | Page::Agents) { "block" } else { "none" }>
                     {move || {
@@ -881,6 +989,12 @@ fn ChatPage(user_id: String) -> impl IntoView {
     }));
     let messages = RwSignal::new(Vec::<MessageSummary>::new());
     let chat_models = RwSignal::new(Vec::<ChatModelConfiguration>::new());
+    let workspaces = RwSignal::new(Vec::<WorkspaceSummary>::new());
+    let selected_workspace = RwSignal::new(load_selected_workspace());
+    Effect::new(move |_| {
+        store_selected_workspace(&selected_workspace.get());
+    });
+    load_workspaces(workspaces);
     let title = RwSignal::new(String::new());
     let draft = RwSignal::new(
         restored_submission
@@ -902,7 +1016,6 @@ fn ChatPage(user_id: String) -> impl IntoView {
     let pending_submission = RwSignal::new(restored_submission);
     let generation = RwSignal::new(0_u64);
     let status = RwSignal::new(String::new());
-    // Auto-scroll transcript when streamed/tool_calls/messages change — super quick feel.
     Effect::new(move |_| {
         let _ = streamed.get();
         let _ = tool_calls.get();
@@ -920,8 +1033,6 @@ fn ChatPage(user_id: String) -> impl IntoView {
             el.set_scroll_top(top);
         }
     });
-    // Mirror the open conversation so the unified Library page can offer
-    // "pin to current conversation" (kept across page switches).
     Effect::new(move |_| {
         let shared = active_conversation();
         match selected.get() {
@@ -974,12 +1085,14 @@ fn ChatPage(user_id: String) -> impl IntoView {
         if value.trim().is_empty() {
             return;
         }
+        let workspace_id = selected_workspace.get_untracked();
+        let workspace_id = workspace_id.as_deref().filter(|s| !s.trim().is_empty()).map(|s| s.to_owned());
         status.set("Creating conversation...".into());
         let lifecycle = Arc::clone(&create_lifecycle);
         spawn_local(async move {
             let request = Request::post("/api/v1/conversations").json(&CreateConversationRequest {
                 title: value.trim(),
-                workspace_id: None,
+                workspace_id: workspace_id.as_deref(),
             });
             match request {
                 Ok(request) => match request.send().await {
@@ -1323,6 +1436,41 @@ fn ChatPage(user_id: String) -> impl IntoView {
                 <span class="model-chip">{move || chat_models.get().into_iter().find(|model| model.active).map_or_else(|| "NO ACTIVE MODEL".into(), |model| format!("{} / {}", model.provider_type.to_uppercase(), model.model_reference))}</span>
                 {ContextInspector(ContextInspectorProps { active_run })}
             </div>
+        </div>
+        <div class="workspace-picker" role="region" aria-label="Workspace scope">
+            <label class="workspace-picker-label">
+                <span class="utility">"WORKSPACE"</span>
+                <select
+                    aria-label="Workspace"
+                    prop:value=move || selected_workspace.get().unwrap_or_default()
+                    on:change=move |event| {
+                        let value = event_target_value(&event);
+                        if value.trim().is_empty() {
+                            selected_workspace.set(None);
+                        } else {
+                            selected_workspace.set(Some(value));
+                        }
+                    }
+                >
+                    <option value="">"All workspaces"</option>
+                    {move || workspaces.get().into_iter().map(|ws| {
+                        let ws_id = ws.id.clone();
+                        let ws_title = ws.title.clone();
+                        view! { <option value=ws_id>{ws_title}</option> }
+                    }).collect_view()}
+                </select>
+            </label>
+            <span class="form-note">{move || {
+                if let Some(id) = selected_workspace.get() {
+                    if let Some(ws) = workspaces.get().into_iter().find(|w| w.id == id) {
+                        format!("Chatting in {} — new conversations will be scoped here.", ws.title)
+                    } else {
+                        "Workspace scope active — new conversations scoped to selection.".into()
+                    }
+                } else {
+                    "No workspace filter — conversations span all workspaces.".into()
+                }
+            }}</span>
         </div>
         {move || if let Some(conversation) = selected.get() {
             let conversation_id = conversation.id.clone();
@@ -6689,6 +6837,619 @@ fn UiPackagesPage() -> impl IntoView {
         })}
     }
 }
+// ---------------------------------------------------------------------------
+// M25a: Security — auth methods + passkey + sessions + step-up (Archive Spine)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+struct AuthMethod {
+    id: String,
+    method_type: String,
+    label: Option<String>,
+    is_primary: bool,
+    last_used_at: Option<String>,
+    created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MethodsResponse {
+    methods: Vec<AuthMethod>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct SessionRow {
+    hash: String,
+    current: bool,
+    created_at: String,
+    last_seen_at: String,
+    expires_at: String,
+    last_step_up_at: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsResponse {
+    sessions: Vec<SessionRow>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebauthnRegisterStart {
+    ceremony_id: String,
+    creation_options: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebauthnLoginStart {
+    ceremony_id: String,
+    request_options: serde_json::Value,
+}
+
+fn method_spine_class(method_type: &str) -> &'static str {
+    match method_type {
+        "webauthn" => "webauthn",
+        "oidc" => "oidc",
+        _ => "password",
+    }
+}
+
+fn human_method_label(method: &AuthMethod) -> String {
+    match method.method_type.as_str() {
+        "webauthn" => "Passkey".into(),
+        "password" => "Password".into(),
+        "oidc" => "SSO".into(),
+        other => other.into(),
+    }
+}
+
+fn short_hash(hash: &str) -> String {
+    if hash.len() <= 12 {
+        hash.to_owned()
+    } else {
+        format!("{}…{}", &hash[..8], &hash[hash.len() - 4..])
+    }
+}
+
+fn map_webauthn_error(value: &JsValue) -> String {
+    let name = js_sys::Reflect::get(value, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_default();
+    let msg = js_sys::Reflect::get(value, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|v| v.as_string())
+        .unwrap_or_else(|| format!("{value:?}"));
+    match name.as_str() {
+        "NotAllowedError" => "The authenticator was cancelled or timed out.".into(),
+        "InvalidStateError" => "This passkey is already registered.".into(),
+        "NotSupportedError" => "This device does not support passkeys.".into(),
+        "SecurityError" => "Passkeys require a secure context (HTTPS or localhost).".into(),
+        _ if msg.contains("already") => "This credential is already registered.".into(),
+        _ if msg.contains("verification failed") => msg,
+        _ => msg,
+    }
+}
+
+fn js_credential_to_json(value: JsValue) -> Result<serde_json::Value, String> {
+    let s = js_sys::JSON::stringify(&value)
+        .map_err(|_| "Invalid credential shape.".to_string())?
+        .as_string()
+        .ok_or_else(|| "Invalid credential string.".to_string())?;
+    serde_json::from_str(&s).map_err(|_| "Invalid credential JSON.".to_string())
+}
+
+// WebAuthn JS bridge — CSP-safe (compiled into the WASM JS glue, not eval).
+#[wasm_bindgen::prelude::wasm_bindgen(inline_js = r#"
+export function b64urlToBuf(b64url) {
+  let s = b64url.replace(/-/g,'+').replace(/_/g,'/');
+  while (s.length % 4) s += '=';
+  const bin = atob(s);
+  const buf = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) buf[i]=bin.charCodeAt(i);
+  return buf.buffer;
+}
+export function bufToB64url(buf) {
+  const bytes = new Uint8Array(buf);
+  let s='';
+  for (const b of bytes) s+=String.fromCharCode(b);
+  return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+}
+function transformCreate(o){
+  const pk = o.publicKey ? o.publicKey : o;
+  pk.challenge = b64urlToBuf(pk.challenge);
+  pk.user.id = b64urlToBuf(pk.user.id);
+  if(pk.excludeCredentials) for(const c of pk.excludeCredentials) c.id=b64urlToBuf(c.id);
+  return {publicKey: pk};
+}
+function transformGet(o){
+  const pk = o.publicKey ? o.publicKey : o;
+  pk.challenge = b64urlToBuf(pk.challenge);
+  if(pk.allowCredentials) for(const c of pk.allowCredentials) c.id=b64urlToBuf(c.id);
+  return {publicKey: pk};
+}
+export async function createPasskey(opts){
+  const c = await navigator.credentials.create(transformCreate(opts));
+  return {
+    id: c.id,
+    rawId: bufToB64url(c.rawId),
+    type: c.type,
+    response: {
+      clientDataJSON: bufToB64url(c.response.clientDataJSON),
+      attestationObject: bufToB64url(c.response.attestationObject)
+    }
+  };
+}
+export async function getPasskey(opts){
+  const c = await navigator.credentials.get(transformGet(opts));
+  return {
+    id: c.id,
+    rawId: bufToB64url(c.rawId),
+    type: c.type,
+    response: {
+      clientDataJSON: bufToB64url(c.response.clientDataJSON),
+      authenticatorData: bufToB64url(c.response.authenticatorData),
+      signature: bufToB64url(c.response.signature),
+      userHandle: c.response.userHandle ? bufToB64url(c.response.userHandle) : null
+    }
+  };
+}
+"#)]
+extern "C" {
+    #[wasm_bindgen(js_name = createPasskey)]
+    fn create_passkey_js(opts: JsValue) -> js_sys::Promise;
+    #[wasm_bindgen(js_name = getPasskey)]
+    fn get_passkey_js(opts: JsValue) -> js_sys::Promise;
+}
+
+async fn webauthn_create_credential(opts: serde_json::Value) -> Result<JsValue, JsValue> {
+    let s = serde_json::to_string(&opts).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let js_opts = js_sys::JSON::parse(&s)?;
+    JsFuture::from(create_passkey_js(js_opts)).await
+}
+
+async fn webauthn_get_credential(opts: serde_json::Value) -> Result<JsValue, JsValue> {
+    let s = serde_json::to_string(&opts).map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let js_opts = js_sys::JSON::parse(&s)?;
+    JsFuture::from(get_passkey_js(js_opts)).await
+}
+
+#[component]
+fn SecurityPage(user: RwSignal<Option<User>>) -> impl IntoView {
+    let methods = RwSignal::new(Vec::<AuthMethod>::new());
+    let sessions = RwSignal::new(Vec::<SessionRow>::new());
+    let methods_status = RwSignal::new(String::new());
+    let sessions_status = RwSignal::new(String::new());
+    let passkey_pending = RwSignal::new(false);
+    let passkey_error = RwSignal::new(None::<String>);
+    let passkey_ok = RwSignal::new(None::<String>);
+    let display_name = RwSignal::new(String::new());
+    let show_stepup = RwSignal::new(false);
+    let stepup_pw = RwSignal::new(String::new());
+    let stepup_pending = RwSignal::new(false);
+    let stepup_msg = RwSignal::new(None::<String>);
+    let stepup_err = RwSignal::new(None::<String>);
+    let lifecycle = Arc::new(AtomicBool::new(true));
+    {
+        let lifecycle = Arc::clone(&lifecycle);
+        on_cleanup(move || lifecycle.store(false, Ordering::Release));
+    }
+
+    let load_methods = {
+        let methods = methods;
+        let methods_status = methods_status;
+        let lifecycle = Arc::clone(&lifecycle);
+        move || {
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                methods_status.set("Reading credential ledger...".into());
+                match Request::get("/api/v1/auth/methods").send().await {
+                    Ok(resp) if resp.ok() => match resp.json::<MethodsResponse>().await {
+                        Ok(data) => {
+                            if lifecycle.load(Ordering::Acquire) {
+                                methods.set(data.methods);
+                                methods_status.set(String::new());
+                            }
+                        }
+                        Err(_) => methods_status.set("Credential response was not valid.".into()),
+                    },
+                    Ok(resp) => methods_status.set(api_error(&resp).await),
+                    Err(_) => methods_status.set("Auth service did not answer.".into()),
+                }
+            });
+        }
+    };
+
+    let load_sessions = {
+        let sessions = sessions;
+        let sessions_status = sessions_status;
+        let lifecycle = Arc::clone(&lifecycle);
+        move || {
+            let lifecycle = Arc::clone(&lifecycle);
+            spawn_local(async move {
+                sessions_status.set("Reading sessions...".into());
+                match Request::get("/api/v1/auth/sessions").send().await {
+                    Ok(resp) if resp.ok() => match resp.json::<SessionsResponse>().await {
+                        Ok(data) => {
+                            if lifecycle.load(Ordering::Acquire) {
+                                sessions.set(data.sessions);
+                                sessions_status.set(String::new());
+                            }
+                        }
+                        Err(_) => sessions_status.set("Session response was not valid.".into()),
+                    },
+                    Ok(resp) => sessions_status.set(api_error(&resp).await),
+                    Err(_) => sessions_status.set("Session service did not answer.".into()),
+                }
+            });
+        }
+    };
+
+    // initial load
+    {
+        let lm = load_methods.clone();
+        let ls = load_sessions.clone();
+        spawn_local(async move {
+            lm();
+            ls();
+        });
+    }
+
+    let refresh = {
+        let lm = load_methods.clone();
+        let ls = load_sessions.clone();
+        move |_| {
+            lm();
+            ls();
+        }
+    };
+
+    let add_passkey = {
+        let load_methods = load_methods.clone();
+        move |_| {
+            if passkey_pending.get_untracked() {
+                return;
+            }
+            passkey_pending.set(true);
+            passkey_error.set(None);
+            passkey_ok.set(None);
+            let display = display_name.get_untracked().trim().to_owned();
+            let load_methods = load_methods.clone();
+            spawn_local(async move {
+                let outcome: Result<String, String> = async {
+                    let body = if display.is_empty() {
+                        serde_json::json!({})
+                    } else {
+                        serde_json::json!({"display_name": display})
+                    };
+                    let start_resp = Request::post("/api/v1/auth/methods/webauthn/register")
+                        .json(&body)
+                        .map_err(|_| "Could not start registration.".to_string())?
+                        .send()
+                        .await
+                        .map_err(|_| "Passkey service did not answer.".to_string())?;
+                    if !start_resp.ok() {
+                        return Err(api_error(&start_resp).await);
+                    }
+                    let started: WebauthnRegisterStart = start_resp
+                        .json()
+                        .await
+                        .map_err(|_| "Invalid registration options.".to_string())?;
+                    let opts = serde_json::to_value(started.creation_options)
+                        .map_err(|_| "Invalid creation options.".to_string())?;
+                    let credential_js = webauthn_create_credential(opts)
+                        .await
+                        .map_err(|e| map_webauthn_error(&e))?;
+                    let credential = js_credential_to_json(credential_js)?;
+                    let complete = Request::post("/api/v1/auth/methods/webauthn/complete")
+                        .json(&serde_json::json!({
+                            "ceremony_id": started.ceremony_id,
+                            "credential": credential,
+                        }))
+                        .map_err(|_| "Could not encode credential.".to_string())?
+                        .send()
+                        .await
+                        .map_err(|_| "Verification did not answer.".to_string())?;
+                    if !complete.ok() {
+                        return Err(api_error(&complete).await);
+                    }
+                    Ok("Passkey added.".into())
+                }
+                .await;
+                match outcome {
+                    Ok(msg) => {
+                        passkey_ok.set(Some(msg));
+                        load_methods();
+                    }
+                    Err(e) => passkey_error.set(Some(e)),
+                }
+                passkey_pending.set(false);
+            });
+        }
+    };
+
+    let delete_method = {
+        let load_methods = load_methods.clone();
+        move |id: String| {
+            let load_methods = load_methods.clone();
+            spawn_local(async move {
+                match Request::delete(&format!("/api/v1/auth/methods/{id}"))
+                    .send()
+                    .await
+                {
+                    Ok(resp) if resp.ok() => load_methods(),
+                    Ok(resp) => {
+                        let msg = api_error(&resp).await;
+                        passkey_error.set(Some(msg));
+                    }
+                    Err(_) => passkey_error.set(Some("Delete did not answer.".into())),
+                }
+            });
+        }
+    };
+
+    let revoke_one = {
+        let load_sessions = load_sessions.clone();
+        move |hash: String| {
+            let load_sessions = load_sessions.clone();
+            spawn_local(async move {
+                let resp = Request::post(&format!("/api/v1/auth/sessions/{hash}/revoke"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.ok() => load_sessions(),
+                    Ok(r) => sessions_status.set(api_error(&r).await),
+                    Err(_) => sessions_status.set("Revoke did not answer.".into()),
+                }
+            });
+        }
+    };
+
+    let revoke_others = {
+        let load_sessions = load_sessions.clone();
+        move |_| {
+            let load_sessions = load_sessions.clone();
+            spawn_local(async move {
+                let resp = Request::post("/api/v1/auth/sessions/revoke").send().await;
+                match resp {
+                    Ok(r) if r.ok() => load_sessions(),
+                    Ok(r) => sessions_status.set(api_error(&r).await),
+                    Err(_) => sessions_status.set("Revoke did not answer.".into()),
+                }
+            });
+        }
+    };
+
+    view! {
+        <div class="page-heading">
+            <div>
+                <p class="utility">"IDENTITY / SECURITY"</p>
+                <h1>"Security"</h1>
+                <p class="form-note" style="max-width:720px">
+                    "Keys, sessions, and re-authentication — the credential ledger. Passkeys are resident credentials verified by " <code>"webauthn-rs"</code> " with RP ID from public origin. One method must remain."
+                </p>
+            </div>
+            <button class="secondary" on:click=refresh>"Refresh ledger"</button>
+        </div>
+
+        <section class="security-grid">
+            <section class="security-section">
+                <div class="section-heading">
+                    <div>
+                        <p class="utility">"CREDENTIALS"</p>
+                        <h2>"Auth methods"</h2>
+                    </div>
+                    <span class="utility">{move || format!("{} methods", methods.get().len())}</span>
+                </div>
+                {move || {
+                    let msg = methods_status.get();
+                    (!msg.is_empty()).then(|| view! { <p class="form-note">{msg.clone()}</p> })
+                }}
+                {move || {
+                    let list = methods.get();
+                    if list.is_empty() {
+                        view! {
+                            <div class="security-empty">
+                                <span class="index-spine">"—"</span>
+                                <p class="form-note">"No credentials yet. Add a passkey or keep your password."</p>
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! {
+                            <div class="method-grid">
+                                {list.into_iter().map(|m| {
+                                    let can_delete = methods.get().len() > 1;
+                                    let mid = m.id.clone();
+                                    let mid2 = m.id.clone();
+                                    let cls = method_spine_class(&m.method_type);
+                                    let label = human_method_label(&m);
+                                    let del = delete_method.clone();
+                                    let is_primary = m.is_primary;
+                                    let last = m.last_used_at.clone().unwrap_or_else(|| "never".into());
+                                    view! {
+                                        <article class=format!("method-card spine-{cls}")>
+                                            <div class="method-head">
+                                                <span class=format!("kind-badge {}", cls)>{label.clone()}</span>
+                                                {is_primary.then(|| view!{ <span class="state-badge active">"PRIMARY"</span> })}
+                                                <span class="mono-break" style="margin-left:auto;font-size:11px">{short_hash(&mid2)}</span>
+                                            </div>
+                                            <strong class="method-label">{m.label.clone().unwrap_or_else(|| label.clone())}</strong>
+                                            <div class="method-meta">
+                                                <span class="utility">"LAST USED · " {last}</span>
+                                                <span class="utility">"CREATED · " {m.created_at.clone()}</span>
+                                            </div>
+                                            <div class="method-actions">
+                                                <button class="secondary danger"
+                                                    disabled=!can_delete
+                                                    title=if can_delete { "Remove this method" } else { "Cannot remove the last method" }
+                                                    on:click=move |_| del(mid.clone())>
+                                                    "Remove"
+                                                </button>
+                                                {(!can_delete).then(|| view!{ <span class="form-note" style="font-size:12px">"Last method — add another before removing."</span> })}
+                                            </div>
+                                        </article>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+                <div class="passkey-add">
+                    <label class="passkey-label">"New passkey label (optional)"
+                        <input placeholder="e.g. MacBook Touch ID"
+                            prop:value=move || display_name.get()
+                            on:input=move |e| display_name.set(event_target_value(&e)) />
+                    </label>
+                    <button class="primary" disabled=move || passkey_pending.get() on:click=add_passkey>
+                        {move || if passkey_pending.get() { "Waiting for authenticator..." } else { "Add passkey" }}
+                    </button>
+                    {move || passkey_error.get().map(|e| view!{ <p class="inline-error">{e}</p> })}
+                    {move || passkey_ok.get().map(|o| view!{ <p class="test-success" style="padding:8px 10px;border:1px solid var(--teal);background:var(--teal-soft);border-radius:8px">{o}</p> })}
+                    <p class="form-note">"Your browser will prompt for Touch ID, Windows Hello, or a security key. Ceremony expires in 5 minutes."</p>
+                </div>
+            </section>
+
+            <section class="security-section">
+                <div class="section-heading">
+                    <div>
+                        <p class="utility">"SESSIONS"</p>
+                        <h2>"Active sessions"</h2>
+                    </div>
+                    <span class="utility">{move || format!("{} sessions", sessions.get().len())}</span>
+                </div>
+                {move || {
+                    let msg = sessions_status.get();
+                    (!msg.is_empty()).then(|| view!{ <p class="form-note">{msg.clone()}</p> })
+                }}
+                <div class="session-toolbar">
+                    <p class="form-note">"Revoking signs the device out immediately. Current session stays until you sign out."</p>
+                    <button class="secondary" disabled=move || sessions.get().len() <= 1 on:click=revoke_others>"Revoke others"</button>
+                </div>
+                {move || {
+                    let list = sessions.get();
+                    if list.is_empty() {
+                        view!{ <p class="form-note">"No active sessions."</p> }.into_any()
+                    } else {
+                        view!{
+                            <div class="session-list">
+                                {list.into_iter().map(|s| {
+                                    let hash = s.hash.clone();
+                                    let h2 = s.hash.clone();
+                                    let revoke = revoke_one.clone();
+                                    let current = s.current;
+                                    view!{
+                                        <div class=if current { "session-row is-current" } else { "session-row" }>
+                                            <span class="session-hash mono-break" title=hash.clone()>{short_hash(&hash)}</span>
+                                            <span class="session-when">
+                                                <span class="utility">"SEEN · " {s.last_seen_at.clone()}</span>
+                                                <span class="utility">"EXPIRES · " {s.expires_at.clone()}</span>
+                                            </span>
+                                            <span class="session-badges">
+                                                {current.then(|| view!{ <span class="state-badge active">"CURRENT"</span> })}
+                                                {s.last_step_up_at.clone().map(|t| {
+                                                    let title = t.clone();
+                                                    let label = t.clone();
+                                                    view!{ <span class="cap-chip" title=title>"step-up " {label}</span> }
+                                                })}
+                                            </span>
+                                            <button class="secondary" disabled=current
+                                                title=if current { "Current session — use Sign out" } else { "Revoke this session" }
+                                                on:click=move |_| revoke(h2.clone())>
+                                                "Revoke"
+                                            </button>
+                                        </div>
+                                    }
+                                }).collect_view()}
+                            </div>
+                        }.into_any()
+                    }
+                }}
+            </section>
+
+            <section class="security-section">
+                <div class="section-heading">
+                    <div>
+                        <p class="utility">"STEP-UP"</p>
+                        <h2>"Re-authenticate"</h2>
+                    </div>
+                    <button class="primary" on:click=move |_| { show_stepup.set(true); stepup_msg.set(None); stepup_err.set(None); }>"Re-authenticate"</button>
+                </div>
+                <p class="form-note">"Sensitive actions require a fresh password check. This marks the current session as step-up fresh for the next window."</p>
+                {move || stepup_msg.get().map(|m| view!{ <p class="test-success" style="padding:10px;border:1px solid var(--teal);background:var(--teal-soft);border-radius:8px">{m}</p> })}
+                {move || stepup_err.get().map(|e| view!{ <p class="inline-error">{e}</p> })}
+                <div class="security-footer">
+                    <span class="mono-break" style="font-size:11px;color:var(--slate)">"User: " {move || user.get().map(|u| format!("{} · {}", u.display_name, u.role)).unwrap_or_else(|| "—".into())}</span>
+                    <button class="secondary" on:click=move |_| {
+                        spawn_local(async move {
+                            let _ = Request::post("/api/v1/auth/logout").send().await;
+                            let _ = web_sys::window().and_then(|w| w.location().reload().ok());
+                        });
+                    }>"Sign out"</button>
+                </div>
+            </section>
+        </section>
+
+        {move || show_stepup.get().then(|| view!{
+            <div class="modal-backdrop" on:click=move |e| {
+                let target = e.target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok());
+                let current = e.current_target().and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok());
+                if target.is_some() && target == current { show_stepup.set(false); }
+            }>
+                <div class="modal" role="dialog" aria-modal="true" aria-label="Re-authenticate">
+                    <div class="modal-head">
+                        <h3>"Re-authenticate"</h3>
+                        <button class="secondary" on:click=move |_| show_stepup.set(false)>"Close"</button>
+                    </div>
+                    <label>"Password"
+                        <input type="password" autocomplete="current-password" placeholder="Enter your password"
+                            prop:value=move || stepup_pw.get()
+                            on:input=move |e| stepup_pw.set(event_target_value(&e)) />
+                    </label>
+                    {move || stepup_err.get().map(|e| view!{ <p class="inline-error">{e}</p> })}
+                    {move || stepup_msg.get().map(|m| view!{ <p class="test-success">{m}</p> })}
+                    <div class="stepper-actions">
+                        <button class="secondary" on:click=move |_| show_stepup.set(false)>"Cancel"</button>
+                        <button class="primary" disabled=move || stepup_pending.get() || stepup_pw.get().is_empty()
+                            on:click=move |_| {
+                                let pw = stepup_pw.get_untracked();
+                                if pw.is_empty() || stepup_pending.get_untracked() {
+                                    return;
+                                }
+                                stepup_pending.set(true);
+                                stepup_err.set(None);
+                                stepup_msg.set(None);
+                                spawn_local(async move {
+                                    let outcome = async {
+                                        let r = Request::post("/api/v1/auth/step-up")
+                                            .json(&serde_json::json!({"password": pw}))
+                                            .map_err(|_| "Could not encode request.".to_string())?
+                                            .send()
+                                            .await
+                                            .map_err(|_| "Service did not answer.".to_string())?;
+                                        if r.ok() {
+                                            Ok(())
+                                        } else {
+                                            Err(api_error(&r).await)
+                                        }
+                                    }
+                                    .await;
+                                    match outcome {
+                                        Ok(()) => {
+                                            stepup_msg.set(Some("Session is freshly authenticated.".into()));
+                                            stepup_pw.set(String::new());
+                                        }
+                                        Err(e) => stepup_err.set(Some(e)),
+                                    }
+                                    stepup_pending.set(false);
+                                });
+                            }>
+                            {move || if stepup_pending.get() { "Verifying..." } else { "Confirm" }}
+                        </button>
+                    </div>
+                    <p class="form-note">"This does not change your password — it only proves possession for sensitive actions."</p>
+                </div>
+            </div>
+        })}
+    }
+}
 
 #[component]
 fn EmptyOperationalPage(page: Page) -> impl IntoView {
@@ -6716,7 +7477,8 @@ fn EmptyOperationalPage(page: Page) -> impl IntoView {
         | Page::Diagnostics
         | Page::Workspaces
         | Page::Mcp
-        | Page::UiPackages => unreachable!(),
+        | Page::UiPackages
+        | Page::Security => unreachable!(),
     };
     view! {
         <div class="page-heading"><div><p class="utility">"OPERATOR INDEX"</p><h1>{label}</h1></div></div>

@@ -16,6 +16,8 @@ pub mod library_api;
 pub mod mcp_api;
 pub mod mcp_client;
 pub mod model_api;
+#[cfg(feature = "oidc")]
+pub mod oidc;
 pub mod outbound_http;
 pub mod plugin_api;
 pub mod plugin_github;
@@ -173,6 +175,9 @@ pub struct AppState {
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
     /// WebAuthn passkey manager (None when unconfigured).
     pub webauthn: Option<crate::webauthn::WebauthnManager>,
+    /// OIDC ceremony state (per-provider login flows; feature-gated).
+    #[cfg(feature = "oidc")]
+    pub oidc: crate::oidc::OidcManager,
 }
 
 impl AppState {
@@ -243,6 +248,8 @@ impl AppState {
             builtin_csp_hashes: Arc::new(builtin_csp_hashes),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new()),
             webauthn,
+            #[cfg(feature = "oidc")]
+            oidc: crate::oidc::OidcManager::new(),
         })
     }
 
@@ -429,6 +436,8 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/providers/catalog", get(usage_api::list_provider_catalog))
         .route("/providers/test", post(model_api::test_provider))
+        .route("/providers/{id}", delete(model_api::delete_provider))
+        .route("/models/{id}", delete(model_api::delete_model))
         .route("/usage/summary", get(usage_api::usage_summary))
         .route(
             "/conversations/{id}/runs",
@@ -601,6 +610,7 @@ pub fn router(state: AppState) -> Router {
         .route("/health/ready", get(api::ready))
         .route("/recovery", get(recovery_handler))
         .route("/recovery/{*path}", get(recovery_asset_handler))
+        .merge(oidc_router())
         .nest("/api/v1", api)
         .fallback(fallback_handler)
         .layer(DefaultBodyLimit::max(
@@ -821,5 +831,24 @@ mod tests {
             Method::GET,
             Method::POST | Method::PUT | Method::PATCH | Method::DELETE
         ));
+    }
+}
+
+/// OIDC auth routes (no-op without the `oidc` feature).
+fn oidc_router() -> axum::Router<AppState> {
+    #[cfg(feature = "oidc")]
+    {
+        use axum::routing::{get, post};
+        return axum::Router::new()
+            .route(
+                "/auth/oidc/providers",
+                get(crate::oidc::list_oidc_providers),
+            )
+            .route("/auth/oidc/start", post(crate::oidc::start_oidc))
+            .route("/auth/oidc/callback", get(crate::oidc::oidc_callback));
+    }
+    #[cfg(not(feature = "oidc"))]
+    {
+        axum::Router::new()
     }
 }

@@ -80,6 +80,16 @@ const fn default_max_connections() -> u32 {
     20
 }
 
+#[cfg(feature = "oidc")]
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct OidcProviderConfig {
+    pub label: String,
+    pub issuer: String,
+    pub client_id: String,
+    pub client_secret_ref: String,
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthSettings {
     pub session_idle_minutes: i64,
@@ -92,6 +102,9 @@ pub struct AuthSettings {
     pub login_throttle_max_attempts: u32,
     #[serde(default = "default_login_throttle_window_secs")]
     pub login_throttle_window_secs: i64,
+    #[serde(default)]
+    #[cfg(feature = "oidc")]
+    pub oidc_providers: Vec<OidcProviderConfig>,
 }
 
 const fn default_login_throttle_max_attempts() -> u32 {
@@ -112,6 +125,8 @@ impl Default for AuthSettings {
             max_parallel_hashes: 4,
             login_throttle_max_attempts: default_login_throttle_max_attempts(),
             login_throttle_window_secs: default_login_throttle_window_secs(),
+            #[cfg(feature = "oidc")]
+            oidc_providers: Vec::new(),
         }
     }
 }
