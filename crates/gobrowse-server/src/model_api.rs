@@ -666,10 +666,14 @@ pub async fn test_provider(
     let models_url = base
         .join("models")
         .map_err(|_| AppError::Validation("bad URL".into()))?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|_| AppError::Internal(anyhow::anyhow!("failed to build HTTP client")))?;
+    let client = crate::embedding::provider_http_client(
+        &base,
+        "openai_compatible",
+        false,
+        false,
+        Some(std::time::Duration::from_secs(10)),
+    )
+    .await?;
     let mut request = client.get(models_url);
     if let Some(key) = input.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
         request = request.bearer_auth(key.trim());

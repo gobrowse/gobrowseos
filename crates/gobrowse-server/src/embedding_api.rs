@@ -135,6 +135,9 @@ pub async fn delete_configuration(
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
     let mut tx = state.pool.begin().await?;
     let owned: Option<bool> = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM embedding_models em JOIN providers p ON p.id=em.provider_id          WHERE em.id=$1 AND p.profile_id=$2)",

@@ -304,6 +304,9 @@ pub async fn delete(
     Path(server_id): Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
 
     let mut tx = state.pool.begin().await?;
 

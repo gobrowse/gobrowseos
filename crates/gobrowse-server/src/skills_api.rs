@@ -122,6 +122,9 @@ pub async fn delete_skill(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
     let mut tx = state.pool.begin().await?;
     let owned: Option<bool> = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM skills WHERE id=$1 AND profile_id=$2 AND status <> 'deleted')",

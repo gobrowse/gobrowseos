@@ -2200,8 +2200,8 @@ fn row_to_run(row: &sqlx::postgres::PgRow) -> RunResponse {
 }
 
 fn risk_class_for_tool(name: &str) -> &'static str {
+    // Read-only tools: aligned with the RiskClass declared in run_tools.rs.
     match name {
-        // Read-only tools: aligned with the RiskClass declared in run_tools.rs.
         "library_search"
         | "library_load"
         | "sandbox_read_file"
@@ -2209,7 +2209,19 @@ fn risk_class_for_tool(name: &str) -> &'static str {
         | "sandbox_stat"
         | "terminal_read_output"
         | "process_list" => "read",
-        // Everything else mutates state (writes, lifecycle, process control).
+        // Sandbox/process/terminal mutators are EXECUTE-class (not plain
+        // writes): they can destroy state or spawn processes and must pass
+        // through the destructive/approval gate, never the write gate.
+        "sandbox_write_file"
+        | "sandbox_mkdir"
+        | "sandbox_remove"
+        | "sandbox_exec"
+        | "terminal_send_input"
+        | "terminal_resize"
+        | "terminal_interrupt"
+        | "process_start"
+        | "process_kill" => "execute",
+        // Everything else mutates state (writes, lifecycle).
         _ => "write",
     }
 }

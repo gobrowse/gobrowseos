@@ -667,7 +667,8 @@ pub async fn require_user(
         "SELECT u.id, u.primary_profile_id, u.email, u.display_name, u.role \
          FROM sessions s JOIN users u ON u.id = s.user_id \
          WHERE s.token_hash = $1 AND s.auth_epoch = u.auth_epoch AND u.disabled_at IS NULL \
-           AND s.expires_at > $2 AND s.absolute_expires_at > $2",
+           AND s.expires_at > $2 AND s.absolute_expires_at > $2 \
+           AND NOT EXISTS (SELECT 1 FROM session_revocations r WHERE r.token_hash = s.token_hash)",
     )
     .bind(&session_hash)
     .bind(now)

@@ -114,7 +114,8 @@ async fn handle_socket(
                     "SELECT EXISTS(SELECT 1 FROM sessions session JOIN users user_row ON user_row.id=session.user_id \
                      JOIN agent_runs run ON run.id=$2 JOIN conversations conversation ON conversation.id=run.conversation_id \
                      WHERE session.token_hash=$1 AND session.auth_epoch=user_row.auth_epoch AND session.expires_at>clock_timestamp() \
-                     AND session.absolute_expires_at>clock_timestamp() AND user_row.disabled_at IS NULL AND run.id=$2 AND ( \
+                     AND session.absolute_expires_at>clock_timestamp() AND user_row.disabled_at IS NULL \
+                     AND NOT EXISTS(SELECT 1 FROM session_revocations rv WHERE rv.token_hash=session.token_hash) AND run.id=$2 AND ( \
                      user_row.role IN ('OWNER','ADMIN') OR (conversation.workspace_id IS NULL AND conversation.created_by_user_id=$3) OR EXISTS( \
                      SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=conversation.workspace_id AND member.user_id=$3)))"
                 ).bind(&session_hash).bind(run_id).bind(user_id).fetch_one(&state.pool).await.unwrap_or(false);

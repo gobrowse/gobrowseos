@@ -1019,7 +1019,11 @@ pub async fn delete_package(
             .fetch_optional(&mut *tx)
             .await?;
     let (state_str, profile_id) = row.ok_or(AppError::NotFound)?;
-    if profile_id != user.profile_id && !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+    // Strict profile scoping: no cross-profile delete, even for OWNER/ADMIN.
+    if profile_id != user.profile_id {
+        return Err(AppError::NotFound);
+    }
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
         return Err(AppError::Forbidden);
     }
     if state_str == "active" {
