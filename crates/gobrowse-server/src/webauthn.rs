@@ -48,6 +48,25 @@ pub struct WebauthnManager {
     ceremonies: Arc<RwLock<CeremonyStore>>,
 }
 
+/// WebAuthn spec: the RP ID may differ from the effective origin host ONLY
+/// when the host is a subdomain of the RP ID (e.g. app.example.com under
+/// example.com). For IP origins or unrelated domains there is no valid
+/// pairing — the browser's `clientDataJSON.origin` would never match the
+/// verifier's expected origin, so every ceremony would fail.
+fn rp_id_matches_origin(rp_id: &str, public_origin: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(public_origin.trim_end_matches('/')) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let rp_id = rp_id.trim_end_matches('.');
+    host.eq_ignore_ascii_case(rp_id)
+        || host
+            .to_ascii_lowercase()
+            .ends_with(&format!(".{}", rp_id.to_ascii_lowercase()))
+}
+
 impl WebauthnManager {
     /// Build from a public origin (e.g. `https://host:port`).
     pub fn from_origin(rp_name: &str, public_origin: &str) -> Result<Self, AppError> {
@@ -86,25 +105,6 @@ impl WebauthnManager {
         } else {
             Self::from_origin("Gobrowse OS", origin)
         }
-    }
-
-    /// WebAuthn spec: the RP ID may differ from the effective origin host ONLY
-    /// when the host is a subdomain of the RP ID (e.g. app.example.com under
-    /// example.com). For IP origins or unrelated domains there is no valid
-    /// pairing — the browser's `clientDataJSON.origin` would never match the
-    /// verifier's expected origin, so every ceremony would fail.
-    fn rp_id_matches_origin(rp_id: &str, public_origin: &str) -> bool {
-        let Ok(parsed) = url::Url::parse(public_origin.trim_end_matches('/')) else {
-            return false;
-        };
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        let rp_id = rp_id.trim_end_matches('.');
-        host.eq_ignore_ascii_case(rp_id)
-            || host
-                .to_ascii_lowercase()
-                .ends_with(&format!(".{}", rp_id.to_ascii_lowercase()))
     }
 
     /// Build with an explicit RP ID override.
@@ -418,22 +418,48 @@ mod tests {
     #[test]
     fn rp_id_override_requires_subdomain_or_equal() {
         // Spec-valid pairings: host is a subdomain of the RP ID (or equal).
-        assert!(rp_id_matches_origin("example.com", "https://app.example.com:8080"));
+        assert!(rp_id_matches_origin(
+            "example.com",
+            "https://app.example.com:8080"
+        ));
         assert!(rp_id_matches_origin("example.com", "https://example.com"));
         // Invalid pairings: unrelated domain or IP origin.
-        assert!(!rp_id_matches_origin("gobrowse.example.com", "http://178.128.179.216:8080"));
-        assert!(!rp_id_matches_origin("other.com", "https://app.example.com"));
+        assert!(!rp_id_matches_origin(
+            "gobrowse.example.com",
+            "http://178.128.179.216:8080"
+        ));
+        assert!(!rp_id_matches_origin(
+            "other.com",
+            "https://app.example.com"
+        ));
     }
 
     #[test]
     fn from_settings_degrades_on_invalid_rp_id_pairing() {
-        use crate::config::Settings;
-        let mut settings = Settings::default();
-        settings.http.public_origin = url::Url::parse("http://178.128.179.216:8080").unwrap();
+        use crate::config::{
+            AuthSettings, DatabaseSettings, FeatureSettings, HttpSettings, ObservabilitySettings,
+            Settings, VaultSettings,
+        };
+        let settings = Settings {
+            http: HttpSettings {
+                public_origin: "http://178.128.179.216:8080".parse().unwrap(),
+                ..HttpSettings::default()
+            },
+            database: DatabaseSettings {
+                url: secrecy::SecretString::from("postgres://unused".to_owned()),
+                max_connections: 1,
+            },
+            auth: AuthSettings {
+                webauthn_rp_id: Some("gobrowse.example.com".into()),
+                ..AuthSettings::default()
+            },
+            vault: VaultSettings::default(),
+            features: FeatureSettings::default(),
+            observability: ObservabilitySettings::default(),
+        };
         // IP origin + unrelated RP ID: must fall through to from_origin and
         // fail (manager None -> friendly degradation), never fabricate an
         // origin the browser cannot match.
-        settings.auth.webauthn_rp_id = Some("gobrowse.example.com".into());
         assert!(
             WebauthnManager::from_settings(&settings).is_err(),
             "IP origin with unrelated RP ID must degrade, not fabricate"

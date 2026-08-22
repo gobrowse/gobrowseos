@@ -789,5 +789,11 @@ async fn vault_mutations_require_step_up() {
         "fresh step-up vault create must succeed"
     );
 
+    // Cleanup: remove the secret + session to keep the shared test DB isolated.
+    sqlx::query("DELETE FROM secret_references WHERE profile_id = $1")
+        .bind(profile_a)
+        .execute(&pool)
+        .await
+        .expect("cleanup secrets");
     cleanup_session(&pool, owner_id, profile_a).await;
 }
