@@ -24,6 +24,7 @@ use uuid::Uuid;
 use crate::{
     AppState,
     auth::{audit, require_user},
+    authorize::{self, Action, Actor, AuthorizationContext, Decision, Resource, RiskClass},
     chat, conversation_api, embedding,
     error::AppError,
     router::classify_task,
@@ -731,6 +732,7 @@ async fn execute_inner(
         requested_by,
         limits.context_window.saturating_sub(limits.output_limit),
         &token_metrics,
+        &state.auth_policy_cache,
     )
     .await
     .map_err(|_| {
@@ -1011,6 +1013,68 @@ async fn execute_inner(
             append_event_owned(&state.pool, run_id, lease, "tool.call", tool_event)
                 .await
                 .map_err(database_failure)?;
+
+            // M25b: centralized authorization check before tool execution.
+            {
+                let risk = risk_class_for_tool(name);
+                let risk_class = RiskClass::from_tool_risk(risk);
+                let actor = Actor::Agent {
+                    run_id,
+                    agent_permissions: vec![],
+                };
+                let action = Action::Execute { risk: risk_class };
+                let resource = if risk == "system" {
+                    Resource::System
+                } else {
+                    Resource::Sandbox
+                };
+                let auth_ctx = AuthorizationContext {
+                    profile_id,
+                    user_id: Some(requested_by),
+                };
+                let decision = authorize::authorize(
+                    &state.pool,
+                    &state.auth_policy_cache,
+                    &actor,
+                    &action,
+                    &resource,
+                    &auth_ctx,
+                )
+                .await
+                .map_err(|_| ("authorization", "authorization check failed"))?;
+                if decision == Decision::Ask || decision == Decision::Deny {
+                    let reason = if decision == Decision::Ask {
+                        "approval required"
+                    } else {
+                        "denied by authorization policy"
+                    };
+                    let deny_event = serde_json::json!({
+                        "tool_call_id": call_id,
+                        "tool_name": name,
+                        "authorization_decision": format!("{decision:?}"),
+                        "authorization_reason": reason,
+                    });
+                    append_event_owned(
+                        &state.pool,
+                        run_id,
+                        lease,
+                        "tool.authorization_denied",
+                        deny_event,
+                    )
+                    .await
+                    .map_err(database_failure)?;
+                    tool_results.push(ContentPart::ToolResult {
+                        call_id: call_id.clone(),
+                        output: serde_json::json!({
+                            "error": format!(
+                                "Tool '{name}' was {reason} by the authorization engine (decision: {decision:?})."
+                            )
+                        }),
+                        is_error: true,
+                    });
+                    continue;
+                }
+            }
 
             let result = match name.as_str() {
                 "library_search" => {
@@ -1294,6 +1358,7 @@ async fn build_messages(
     user_id: Uuid,
     budget: u32,
     metrics: &std::sync::Arc<std::sync::Mutex<RunTokenMetrics>>,
+    auth_policy_cache: &authorize::AuthPolicyCache,
 ) -> Result<(Vec<NeutralMessage>, serde_json::Value), AppError> {
     let policy_tokens = estimate_tokens(SYSTEM_POLICY);
     if policy_tokens >= budget {
@@ -1434,6 +1499,28 @@ async fn build_messages(
     // Process library search results
     for row in library_rows {
         let id: Uuid = row.get("id");
+
+        // M25b: centralized authorization check for context retrieval.
+        let auth_ctx = AuthorizationContext {
+            profile_id,
+            user_id: Some(user_id),
+        };
+        let auth_decision = authorize::authorize(
+            pool,
+            auth_policy_cache,
+            &Actor::Agent {
+                run_id: Uuid::nil(), // context build doesn't have run_id; system-level check
+                agent_permissions: vec![],
+            },
+            &Action::ContextRetrieve,
+            &Resource::Book(id),
+            &auth_ctx,
+        )
+        .await?;
+        if auth_decision == Decision::Deny {
+            continue; // omit unauthorized books silently
+        }
+
         let title: String = row.get("title");
         let kind: Option<String> = row.get("kind");
         let snippet: String = row.get("snippet");
@@ -1466,6 +1553,28 @@ async fn build_messages(
     // Process pinned books
     for row in pinned_rows {
         let id: Uuid = row.get("id");
+
+        // M25b: centralized authorization check for context retrieval.
+        let auth_ctx = AuthorizationContext {
+            profile_id,
+            user_id: Some(user_id),
+        };
+        let auth_decision = authorize::authorize(
+            pool,
+            auth_policy_cache,
+            &Actor::Agent {
+                run_id: Uuid::nil(),
+                agent_permissions: vec![],
+            },
+            &Action::ContextRetrieve,
+            &Resource::Book(id),
+            &auth_ctx,
+        )
+        .await?;
+        if auth_decision == Decision::Deny {
+            continue;
+        }
+
         let title: String = row.get("title");
         let body: String = row.get("body");
         let content = format!("Book: {title}\n{body}");
@@ -2521,10 +2630,18 @@ mod concurrency_tests {
                 .execute(&pool).await.expect("insert context book");
         }
         let metrics = std::sync::Arc::new(std::sync::Mutex::new(RunTokenMetrics::default()));
-        let (messages, _) =
-            build_messages(&pool, profile_id, conversation_id, user_id, 4096, &metrics)
-                .await
-                .expect("build context");
+        let policy_cache = authorize::new_policy_cache();
+        let (messages, _) = build_messages(
+            &pool,
+            profile_id,
+            conversation_id,
+            user_id,
+            4096,
+            &metrics,
+            &policy_cache,
+        )
+        .await
+        .expect("build context");
         let rendered = messages
             .iter()
             .map(|message| content_text(&message.content))

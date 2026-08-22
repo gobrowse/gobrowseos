@@ -1,5 +1,6 @@
 pub mod api;
 pub mod auth;
+pub mod authorize;
 pub mod autobiography_api;
 pub mod autobiography_update;
 pub mod capabilities_api;
@@ -173,6 +174,8 @@ pub struct AppState {
     pub builtin_csp_hashes: Arc<crate::csp::BuiltinCspHashes>,
     /// In-memory sliding-window rate limiter (per-IP, global).
     pub rate_limiter: Arc<crate::rate_limiter::RateLimiter>,
+    /// Authorization policy cache (M25b). Cleared on policy mutation.
+    pub auth_policy_cache: authorize::AuthPolicyCache,
     /// WebAuthn passkey manager (None when unconfigured).
     pub webauthn: Option<crate::webauthn::WebauthnManager>,
     /// OIDC ceremony state (per-provider login flows; feature-gated).
@@ -247,6 +250,7 @@ impl AppState {
             active_ui: Arc::new(RwLock::new(active_ui_state)),
             builtin_csp_hashes: Arc::new(builtin_csp_hashes),
             rate_limiter: Arc::new(crate::rate_limiter::RateLimiter::new()),
+            auth_policy_cache: authorize::new_policy_cache(),
             webauthn,
             #[cfg(feature = "oidc")]
             oidc: crate::oidc::OidcManager::new(),
@@ -860,4 +864,3 @@ mod tests {
         ));
     }
 }
-

@@ -209,7 +209,7 @@ async fn schema_24_migration_applies() {
             .fetch_one(&pool)
             .await
             .expect("schema_version");
-    assert_eq!(version, 25, "schema should be 25 after M25a");
+    assert_eq!(version, 26, "schema should be 26 after M25b");
 }
 
 #[tokio::test]
@@ -576,7 +576,7 @@ async fn full_lifecycle_list_get_activate_rollback_delete_and_csp() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(ver, 25);
+    assert_eq!(ver, 26);
 }
 
 #[tokio::test]
@@ -595,7 +595,7 @@ async fn capabilities_and_recovery_accessible_without_auth() {
     let (status, body) = request_json(&app, Method::GET, "/api/v1/capabilities", "", None).await;
     assert_eq!(status, StatusCode::OK, "capabilities: {body}");
     assert_eq!(body["api_version"], "v1");
-    assert_eq!(body["schema_version"], 25);
+    assert_eq!(body["schema_version"], 26);
     assert!(
         body["tools"]
             .as_array()
