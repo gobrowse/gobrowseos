@@ -121,13 +121,10 @@ impl WebauthnManager {
         let origin = public_origin.trim_end_matches('/');
         let parsed = url::Url::parse(origin)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("invalid public origin: {e}")))?;
-        // Rebuild the origin URL using the RP ID as the host so the
-        // builder sees a matching (rp_id, origin) pair.
-        let mut rp_origin = parsed;
-        rp_origin
-            .set_host(Some(rp_id))
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("invalid rp_id host: {e}")))?;
-        let core = WebauthnBuilder::new(rp_id, &rp_origin)
+        // Pass the REAL public origin; webauthn-rs validates that rp_id is a
+        // suffix-domain of the origin itself. The verifier then checks the
+        // origin the browser actually sends (no fabricated origin).
+        let core = WebauthnBuilder::new(rp_id, &parsed)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("webauthn config: {e}")))?
             .rp_name(rp_name)
             .build()
