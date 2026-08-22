@@ -206,7 +206,6 @@ pub async fn list_secrets(
 ) -> Result<Json<Vec<SecretMetadata>>, AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
-    crate::auth::require_step_up(&state, &user, 600).await?;
     let rows = sqlx::query(
         "SELECT id,purpose,allowed_hosts,backend,key_version,created_at,updated_at FROM secret_references \
          WHERE profile_id=$1 AND backend='encrypted_database' ORDER BY created_at DESC",

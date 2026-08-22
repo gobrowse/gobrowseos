@@ -720,3 +720,74 @@ async fn vault_router_enforces_auth_roles_metadata_and_profile_scope() {
     cleanup_session(&pool, owner_id, profile_a).await;
     cleanup_session(&pool, other_owner_id, profile_b).await;
 }
+
+#[tokio::test]
+async fn vault_mutations_require_step_up() {
+    let Some(database_url) = std::env::var("GOBROWSE_TEST_DATABASE_URL").ok() else {
+        eprintln!("GOBROWSE_TEST_DATABASE_URL is unset; skipping step-up test");
+        return;
+    };
+    let _lock = common::acquire_test_lock(&database_url).await;
+    let pool = test_pool().await.expect("test pool after lock");
+    let (profile_a, owner_id, owner_cookie) = create_authed_session(&pool, "OWNER").await;
+
+    let mut settings = settings_with_origin("http://localhost:8080", &database_url);
+    settings.vault.master_key_base64 = Some(SecretString::from(STANDARD.encode([42_u8; 32])));
+    let state = AppState::new(pool.clone(), settings)
+        .await
+        .expect("create app state");
+    let app = router(state);
+    let origin = Some("http://localhost:8080");
+
+    // Stale step-up: clear last_step_up_at, expect 428 on a vault mutation.
+    sqlx::query("UPDATE sessions SET last_step_up_at = NULL WHERE user_id = $1")
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .expect("clear step-up");
+    let body = serde_json::to_vec(&json!({
+        "purpose": "mcp_oauth_access_token",
+        "allowed_hosts": ["api.example.com"],
+        "value": "stale-secret"
+    }))
+    .expect("serialize");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        origin,
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_REQUIRED,
+        "vault mutation without fresh step-up must be 428"
+    );
+
+    // Fresh step-up: restore last_step_up_at, expect success.
+    sqlx::query("UPDATE sessions SET last_step_up_at = now() WHERE user_id = $1")
+        .bind(owner_id)
+        .execute(&pool)
+        .await
+        .expect("restore step-up");
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/vault/secrets",
+        Some(&owner_cookie),
+        origin,
+        None,
+        Some(&body),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "fresh step-up vault create must succeed"
+    );
+
+    cleanup_session(&pool, owner_id, profile_a).await;
+}
