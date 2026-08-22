@@ -1983,18 +1983,6 @@ struct WorkspaceSummary {
 }
 
 #[derive(Debug, Serialize)]
-struct UpdateWorkspaceBody {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    description: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    network_policy: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    model_preference: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
 struct CreateWorkspaceBody {
     title: String,
     #[serde(default)]
@@ -2743,6 +2731,67 @@ fn WorkspacesPage() -> impl IntoView {
         });
     };
 
+    // Workspace editing: PATCH /api/v1/workspaces/{id}
+    let editing = RwSignal::new(None::<WorkspaceSummary>);
+    let edit_title = RwSignal::new(String::new());
+    let edit_description = RwSignal::new(String::new());
+    let edit_policy = RwSignal::new(String::new());
+    let edit_model = RwSignal::new(String::new());
+    let edit_status = RwSignal::new(String::new());
+    let open_edit = move |ws: WorkspaceSummary| {
+        edit_title.set(ws.title.clone());
+        edit_description.set(ws.description.clone());
+        edit_policy.set(ws.network_policy.clone());
+        edit_model.set(ws.model_preference.clone().unwrap_or_default());
+        edit_status.set(String::new());
+        editing.set(Some(ws));
+    };
+    let save_edit = move |_| {
+        let Some(ws) = editing.get_untracked() else {
+            return;
+        };
+        let payload = serde_json::json!({
+            "title": edit_title.get_untracked(),
+            "description": edit_description.get_untracked(),
+            "network_policy": edit_policy.get_untracked(),
+            "model_preference": if edit_model.get_untracked().trim().is_empty() { None } else { Some(edit_model.get_untracked()) },
+        });
+        let id = ws.id.clone();
+        spawn_local(async move {
+            let request = gloo_net::http::Request::patch(&format!("/api/v1/workspaces/{id}"))
+                .header("Content-Type", "application/json")
+                .json(&payload);
+            match request {
+                Ok(request) => match request.send().await {
+                    Ok(resp) if resp.ok() => {
+                        // refresh the list
+                        if let Ok(resp) = gloo_net::http::Request::get("/api/v1/workspaces")
+                            .send()
+                            .await
+                        {
+                            if let Ok(list) = resp.json::<Vec<WorkspaceSummary>>().await {
+                                workspaces.set(list);
+                            }
+                        }
+                        edit_status.set("Saved.".into());
+                        editing.set(None);
+                    }
+                    Ok(resp) => {
+                        let text = resp.text().await.unwrap_or_default();
+                        let detail = serde_json::from_str::<serde_json::Value>(&text)
+                            .ok()
+                            .and_then(|v| v["detail"].as_str().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "Update failed.".into());
+                        edit_status.set(detail);
+                    }
+                    Err(_) => edit_status.set("Could not reach server.".into()),
+                },
+                Err(_) => edit_status.set("Request could not be encoded.".into()),
+            }
+        });
+    };
+    let close_edit = move |_| editing.set(None);
+
     view! {
         <div class="page-heading">
             <div><p class="utility">"GLOBAL CONTEXT / WORKSPACES"</p><h1>"Workspaces"</h1></div>
@@ -2757,17 +2806,54 @@ fn WorkspacesPage() -> impl IntoView {
         </form>
         <p class="form-note">{move || status.get()}</p>
         <div class="index-table" role="table">
-            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"DESCRIPTION"</span><span>"NETWORK POLICY"</span></div>
+            <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"DESCRIPTION"</span><span>"NETWORK POLICY"</span><span></span></div>
             {move || workspaces.get().into_iter().map(|ws| {
+                let ws_clone = ws.clone();
                 let short_id = ws.id.chars().take(8).collect::<String>();
                 view! { <div class="index-row" role="row">
                     <span class="spine-cell">{short_id}</span>
-                    <strong>{ws.title}</strong>
-                    <span>{ws.description}</span>
+                    <strong>{ws.title.clone()}</strong>
+                    <span>{ws.description.clone()}</span>
                     <span>{ws.network_policy.to_uppercase()}</span>
+                    <button type="button" class="icon-button" aria-label="Edit workspace"
+                        on:click=move |_| open_edit(ws_clone.clone())>"✎"</button>
                 </div> }
             }).collect_view()}
         </div>
+        // Edit modal
+        {move || editing.get().map(|_ws| {
+            view! {
+                <div class="modal-backdrop" on:click=move |_| editing.set(None)>
+                    <div class="modal" on:click=|ev| ev.stop_propagation()>
+                        <div class="modal-head"><h2>"Edit workspace"</h2><button class="icon-button" on:click=close_edit>"✕"</button></div>
+                        <div class="modal-body">
+                            <label>"Title"</label>
+                            <input prop:value=move || edit_title.get()
+                                on:input=move |event| edit_title.set(event_target_value(&event)) />
+                            <label>"Description"</label>
+                            <textarea rows="2" prop:value=move || edit_description.get()
+                                on:input=move |event| edit_description.set(event_target_value(&event))></textarea>
+                            <label>"Network policy"</label>
+                            <select prop:value=move || edit_policy.get()
+                                on:change=move |event| edit_policy.set(event_target_value(&event))>
+                                <option value="NONE">"NONE — no egress"</option>
+                                <option value="RESTRICTED">"RESTRICTED — allowlisted hosts"</option>
+                                <option value="FULL">"FULL — unrestricted"</option>
+                            </select>
+                            <p class="form-note">"Controls sandbox/terminal network access for this workspace."</p>
+                            <label>"Model preference (optional)"</label>
+                            <input placeholder="model-reference" prop:value=move || edit_model.get()
+                                on:input=move |event| edit_model.set(event_target_value(&event)) />
+                            <p class="form-note">{move || edit_status.get()}</p>
+                        </div>
+                        <div class="modal-foot">
+                            <button type="button" class="secondary" on:click=close_edit>"Cancel"</button>
+                            <button type="button" class="primary" on:click=save_edit>"Save"</button>
+                        </div>
+                    </div>
+                </div>
+            }
+        })}
     }
 }
 
