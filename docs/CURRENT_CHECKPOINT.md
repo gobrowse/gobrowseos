@@ -22,6 +22,7 @@ VERIFIED (exact — M24b evidence)
 ---
 
 ## 2026-08-21 Product-Audit Deploy (m25-final)
-- Deployed: gobrowse-os-app:m25-final @ 178.128.179.216 (schema 26)
+- Deployed: gobrowse-os-app:m25-hotfix @ 178.128.179.216 (schema 26, commit c7bf437)
+- WARNING: m25-final is the KNOWN-BROKEN image (workspace SELECT crash loop, exit 139) — do NOT roll back to it
 - Fixes: 8 delete flows, workspace PATCH+edit modal, session revocation, destructive tool risk, step-up on vault, SSRF guard, cross-profile UI close, webauthn RP-ID spec pairing, dup workspace picker, PRODUCT_AUDIT.md
 - Gates: nextest 596/596, clippy clean, fmt clean
