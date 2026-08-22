@@ -834,9 +834,28 @@ pub async fn require_user_or_run(
     require_user(state, headers).await
 }
 
+pub async fn require_step_up(
+    state: &AppState,
+    user: &AuthenticatedUser,
+    step_up_max_age_secs: i64,
+) -> Result<(), AppError> {
+    // Sensitive operations require recent step-up re-authentication. The
+    // frontend prompts for the password (POST /auth/step-up) when this fails.
+    let Some(hash) = user.session_hash.as_deref() else {
+        return Err(AppError::PreconditionRequired);
+    };
+    let fresh =
+        crate::session_manager::step_up_fresh(&state.pool, hash, step_up_max_age_secs).await?;
+    if !fresh {
+        return Err(AppError::PreconditionRequired);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::auth::{session_token, validate_identity};
+    use axum::http::{HeaderMap, HeaderValue, header};
 
     #[test]
     fn identity_validation_rejects_weak_inputs() {

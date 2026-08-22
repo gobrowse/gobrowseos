@@ -53,6 +53,7 @@ pub async fn create_secret(
 ) -> Result<(StatusCode, Json<SecretMetadata>), AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
+    crate::auth::require_step_up(&state, &user, 600).await?;
     let allowed_hosts = if input.purpose.starts_with("mcp_") {
         vault::validate_secret_metadata(&input.purpose, &input.allowed_hosts)?
     } else {
@@ -120,6 +121,7 @@ pub async fn replace_secret(
 ) -> Result<Json<SecretMetadata>, AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
+    crate::auth::require_step_up(&state, &user, 600).await?;
     let mut tx = state.pool.begin().await?;
     let row = sqlx::query(
         "SELECT purpose,allowed_hosts,created_at FROM secret_references \
@@ -204,6 +206,7 @@ pub async fn list_secrets(
 ) -> Result<Json<Vec<SecretMetadata>>, AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
+    crate::auth::require_step_up(&state, &user, 600).await?;
     let rows = sqlx::query(
         "SELECT id,purpose,allowed_hosts,backend,key_version,created_at,updated_at FROM secret_references \
          WHERE profile_id=$1 AND backend='encrypted_database' ORDER BY created_at DESC",
@@ -233,6 +236,7 @@ pub async fn delete_secret(
 ) -> Result<StatusCode, AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
+    crate::auth::require_step_up(&state, &user, 600).await?;
     let mut tx = state.pool.begin().await?;
     let result = sqlx::query("DELETE FROM secret_references WHERE id=$1 AND profile_id=$2")
         .bind(&id)
@@ -262,6 +266,7 @@ pub async fn rotate_secrets(
 ) -> Result<Json<RotationResponse>, AppError> {
     let user = require_user(&state, &headers).await?;
     require_vault_admin(&user)?;
+    crate::auth::require_step_up(&state, &user, 600).await?;
     let mut tx = state.pool.begin().await?;
     let rotated = state.vault.rotate_profile(&mut tx, user.profile_id).await?;
     audit(

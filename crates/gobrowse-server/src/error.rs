@@ -22,6 +22,8 @@ pub enum AppError {
     Validation(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(&'static str),
+    #[error("re-authentication required")]
+    PreconditionRequired,
     #[error("too many requests")]
     RateLimited,
     #[error("database operation failed")]
@@ -46,6 +48,11 @@ impl IntoResponse for AppError {
             Self::ServiceUnavailable(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "service_unavailable",
+                self.to_string(),
+            ),
+            Self::PreconditionRequired => (
+                StatusCode::PRECONDITION_REQUIRED,
+                "reauthentication_required",
                 self.to_string(),
             ),
             Self::RateLimited => (

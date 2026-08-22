@@ -85,8 +85,8 @@ async fn create_authed_session(pool: &PgPool, role: &str) -> (Uuid, Uuid, String
 
     let now = time::OffsetDateTime::now_utc();
     sqlx::query(
-        "INSERT INTO sessions (token_hash, user_id, auth_epoch, expires_at, absolute_expires_at) \
-         VALUES ($1, $2, 1, $3, $4)",
+        "INSERT INTO sessions (token_hash, user_id, auth_epoch, expires_at, absolute_expires_at, last_step_up_at) \
+         VALUES ($1, $2, 1, $3, $4, now())",
     )
     .bind(Sha256::digest(token.as_bytes()).to_vec())
     .bind(user_id)
@@ -115,8 +115,8 @@ async fn create_session_for_profile(pool: &PgPool, profile_id: Uuid, role: &str)
 
     let now = time::OffsetDateTime::now_utc();
     sqlx::query(
-        "INSERT INTO sessions (token_hash, user_id, auth_epoch, expires_at, absolute_expires_at) \
-         VALUES ($1, $2, 1, $3, $4)",
+        "INSERT INTO sessions (token_hash, user_id, auth_epoch, expires_at, absolute_expires_at, last_step_up_at) \
+         VALUES ($1, $2, 1, $3, $4, now())",
     )
     .bind(Sha256::digest(token.as_bytes()).to_vec())
     .bind(user_id)
