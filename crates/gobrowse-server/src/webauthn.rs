@@ -54,7 +54,13 @@ impl WebauthnManager {
         let origin = public_origin.trim_end_matches('/');
         let rp_origin = url::Url::parse(origin)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("invalid public origin: {e}")))?;
-        let rp_id = rp_origin.domain().unwrap_or(origin).to_string();
+        // IP origins (e.g. http://178.128.179.216:8080) have no `.domain()`;
+        // fall back to the bare host (host_str handles both names and IPs).
+        let rp_id = rp_origin
+            .domain()
+            .or_else(|| rp_origin.host_str())
+            .unwrap_or(origin)
+            .to_string();
         let core = WebauthnBuilder::new(&rp_id, &rp_origin)
             .map_err(|e| AppError::Internal(anyhow::anyhow!("webauthn config: {e}")))?
             .rp_name(rp_name)
@@ -323,4 +329,28 @@ pub async fn complete_login(
     .await?;
     tx.commit().await?;
     Ok(([(axum::http::header::SET_COOKIE, cookie)], Json(user)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_origin_rejects_ip_addresses() {
+        // WebAuthn spec: RP ID must be a registrable domain; IP origins are
+        // invalid. `from_origin` must return Err (the app then degrades to
+        // "WebAuthn unavailable" — password auth remains).
+        let result = WebauthnManager::from_origin("Gobrowse OS", "http://178.128.179.216:8080");
+        assert!(
+            result.is_err(),
+            "IP origins are not valid WebAuthn RP IDs and must be rejected"
+        );
+    }
+
+    #[test]
+    fn from_origin_accepts_hostnames() {
+        let manager = WebauthnManager::from_origin("Gobrowse OS", "https://gobrowse.example.com")
+            .expect("hostname origin should build");
+        let _ = manager;
+    }
 }

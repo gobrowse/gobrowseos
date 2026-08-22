@@ -1487,41 +1487,7 @@ fn ChatPage(user_id: String) -> impl IntoView {
                 }
             }}</span>
         </div>
-        <div class="workspace-picker" role="region" aria-label="Workspace scope">
-            <label class="workspace-picker-label">
-                <span class="utility">"WORKSPACE"</span>
-                <select
-                    aria-label="Workspace"
-                    prop:value=move || selected_workspace.get().unwrap_or_default()
-                    on:change=move |event| {
-                        let value = event_target_value(&event);
-                        if value.trim().is_empty() {
-                            selected_workspace.set(None);
-                        } else {
-                            selected_workspace.set(Some(value));
-                        }
-                    }
-                >
-                    <option value="">"All workspaces"</option>
-                    {move || workspaces.get().into_iter().map(|ws| {
-                        let ws_id = ws.id.clone();
-                        let ws_title = ws.title.clone();
-                        view! { <option value=ws_id>{ws_title}</option> }
-                    }).collect_view()}
-                </select>
-            </label>
-            <span class="form-note">{move || {
-                if let Some(id) = selected_workspace.get() {
-                    if let Some(ws) = workspaces.get().into_iter().find(|w| w.id == id) {
-                        format!("Chatting in {} — new conversations will be scoped here.", ws.title)
-                    } else {
-                        "Workspace scope active — new conversations scoped to selection.".into()
-                    }
-                } else {
-                    "No workspace filter — conversations span all workspaces.".into()
-                }
-            }}</span>
-        </div>
+
         {move || if let Some(conversation) = selected.get() {
             let conversation_id = conversation.id.clone();
             let send = send.clone();
@@ -2010,8 +1976,22 @@ struct WorkspaceSummary {
     title: String,
     description: String,
     network_policy: String,
+    #[serde(default)]
+    model_preference: Option<String>,
     created_at: String,
     updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct UpdateWorkspaceBody {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    network_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_preference: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

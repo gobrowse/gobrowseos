@@ -361,7 +361,10 @@ pub fn router(state: AppState) -> Router {
             "/workspaces",
             get(api::list_workspaces).post(api::create_workspace),
         )
-        .route("/workspaces/{id}", delete(api::delete_workspace))
+        .route(
+            "/workspaces/{id}",
+            delete(api::delete_workspace).patch(api::update_workspace),
+        )
         .route(
             "/conversations",
             get(conversation_api::list_conversations).post(conversation_api::create_conversation),

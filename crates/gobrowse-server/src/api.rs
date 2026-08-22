@@ -57,12 +57,25 @@ pub struct CreateWorkspaceRequest {
     pub description: String,
 }
 
+#[derive(Deserialize)]
+pub struct UpdateWorkspaceRequest {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub network_policy: Option<String>,
+    #[serde(default)]
+    pub model_preference: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct WorkspaceResponse {
     pub id: Uuid,
     pub title: String,
     pub description: String,
     pub network_policy: String,
+    pub model_preference: Option<String>,
     pub created_at: OffsetDateTime,
     pub updated_at: OffsetDateTime,
 }
@@ -125,6 +138,7 @@ pub async fn create_workspace(
         title: title.into(),
         description: input.description,
         network_policy: "RESTRICTED".into(),
+        model_preference: None,
         created_at: now,
         updated_at: now,
     }))
@@ -132,6 +146,90 @@ pub async fn create_workspace(
 
 /// Delete a workspace. Refuses while worktrees or workspace-scoped
 /// conversations exist (409 with a hint). OWNER/ADMIN only.
+/// Update workspace fields (title/description/network_policy/model_preference).
+/// OWNER/ADMIN only. Network policy validated against the schema CHECK.
+pub async fn update_workspace(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<Uuid>,
+    Json(input): Json<UpdateWorkspaceRequest>,
+) -> Result<Json<WorkspaceResponse>, AppError> {
+    let user = require_user(&state, &headers).await?;
+    if !matches!(user.role.as_str(), "OWNER" | "ADMIN") {
+        return Err(AppError::Forbidden);
+    }
+    let mut tx = state.pool.begin().await?;
+    let owned: Option<bool> =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM workspaces WHERE id=$1 AND profile_id=$2)")
+            .bind(id)
+            .bind(user.profile_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if owned != Some(true) {
+        return Err(AppError::NotFound);
+    }
+    let mut title = input.title;
+    let mut description = input.description;
+    let mut model_preference = input.model_preference;
+    let network_policy = input.network_policy;
+    if title.as_deref().is_some_and(|t| t.trim().is_empty()) {
+        return Err(AppError::Validation("title cannot be empty".into()));
+    }
+    if let Some(policy) = &network_policy
+        && !matches!(policy.as_str(), "NONE" | "RESTRICTED" | "FULL")
+    {
+        return Err(AppError::Validation(
+            "network_policy must be NONE, RESTRICTED, or FULL".into(),
+        ));
+    }
+    // Coalesce: only update provided fields.
+    title = title
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+    description = description
+        .map(|d| d.trim().to_string())
+        .filter(|d| !d.is_empty());
+    model_preference = model_preference
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    sqlx::query(
+        "UPDATE workspaces SET          title = COALESCE($2, title),          description = COALESCE($3, description),          network_policy = COALESCE($4, network_policy),          model_preference = COALESCE($5, model_preference),          updated_at = now()          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(&title)
+    .bind(&description)
+    .bind(&network_policy)
+    .bind(&model_preference)
+    .execute(&mut *tx)
+    .await?;
+    let row = sqlx::query(
+        "SELECT id, title, description, network_policy, model_preference,          created_at, updated_at FROM workspaces WHERE id=$1",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+    audit(
+        &mut tx,
+        Some(user.id),
+        Some(user.profile_id),
+        "workspace.updated",
+        "workspace",
+        Some(id.to_string()),
+        "success",
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Json(WorkspaceResponse {
+        id: row.get("id"),
+        title: row.get("title"),
+        description: row.get("description"),
+        network_policy: row.get("network_policy"),
+        model_preference: row.get("model_preference"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }))
+}
+
 pub async fn delete_workspace(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -208,6 +306,7 @@ pub async fn list_workspaces(
                 title: row.get("title"),
                 description: row.get("description"),
                 network_policy: row.get("network_policy"),
+                model_preference: row.get("model_preference"),
                 created_at: row.get("created_at"),
                 updated_at: row.get("updated_at"),
             })
