@@ -78,11 +78,33 @@ impl WebauthnManager {
     /// still comes from `public_origin`).  Otherwise auto-derive from the
     /// origin domain (current behaviour).
     pub fn from_settings(settings: &crate::config::Settings) -> Result<Self, AppError> {
-        if let Some(rp_id) = &settings.auth.webauthn_rp_id {
-            Self::from_origin_with_rp_id("Gobrowse OS", settings.http.public_origin.as_str(), rp_id)
+        let origin = settings.http.public_origin.as_str();
+        if let Some(rp_id) = &settings.auth.webauthn_rp_id
+            && rp_id_matches_origin(rp_id, origin)
+        {
+            Self::from_origin_with_rp_id("Gobrowse OS", origin, rp_id)
         } else {
-            Self::from_origin("Gobrowse OS", settings.http.public_origin.as_str())
+            Self::from_origin("Gobrowse OS", origin)
         }
+    }
+
+    /// WebAuthn spec: the RP ID may differ from the effective origin host ONLY
+    /// when the host is a subdomain of the RP ID (e.g. app.example.com under
+    /// example.com). For IP origins or unrelated domains there is no valid
+    /// pairing — the browser's `clientDataJSON.origin` would never match the
+    /// verifier's expected origin, so every ceremony would fail.
+    fn rp_id_matches_origin(rp_id: &str, public_origin: &str) -> bool {
+        let Ok(parsed) = url::Url::parse(public_origin.trim_end_matches('/')) else {
+            return false;
+        };
+        let Some(host) = parsed.host_str() else {
+            return false;
+        };
+        let rp_id = rp_id.trim_end_matches('.');
+        host.eq_ignore_ascii_case(rp_id)
+            || host
+                .to_ascii_lowercase()
+                .ends_with(&format!(".{}", rp_id.to_ascii_lowercase()))
     }
 
     /// Build with an explicit RP ID override.
@@ -394,16 +416,27 @@ mod tests {
     }
 
     #[test]
-    fn from_origin_with_rp_id_allows_ip_origin() {
-        // When an explicit RP ID (a valid domain) is provided, the manager
-        // must build successfully even when the public origin is an IP
-        // address — this is the fix for IP-only deployments.
-        let manager = WebauthnManager::from_origin_with_rp_id(
-            "Gobrowse OS",
-            "http://178.128.179.216:8080",
-            "gobrowse.example.com",
-        )
-        .expect("explicit RP ID override must succeed with IP origin");
-        let _ = manager;
+    fn rp_id_override_requires_subdomain_or_equal() {
+        // Spec-valid pairings: host is a subdomain of the RP ID (or equal).
+        assert!(rp_id_matches_origin("example.com", "https://app.example.com:8080"));
+        assert!(rp_id_matches_origin("example.com", "https://example.com"));
+        // Invalid pairings: unrelated domain or IP origin.
+        assert!(!rp_id_matches_origin("gobrowse.example.com", "http://178.128.179.216:8080"));
+        assert!(!rp_id_matches_origin("other.com", "https://app.example.com"));
+    }
+
+    #[test]
+    fn from_settings_degrades_on_invalid_rp_id_pairing() {
+        use crate::config::Settings;
+        let mut settings = Settings::default();
+        settings.http.public_origin = url::Url::parse("http://178.128.179.216:8080").unwrap();
+        // IP origin + unrelated RP ID: must fall through to from_origin and
+        // fail (manager None -> friendly degradation), never fabricate an
+        // origin the browser cannot match.
+        settings.auth.webauthn_rp_id = Some("gobrowse.example.com".into());
+        assert!(
+            WebauthnManager::from_settings(&settings).is_err(),
+            "IP origin with unrelated RP ID must degrade, not fabricate"
+        );
     }
 }
