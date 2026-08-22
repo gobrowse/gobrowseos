@@ -412,6 +412,11 @@ struct ProviderTestResponse {
 enum DeleteTarget {
     Provider { id: String, label: String },
     Model { id: String, label: String },
+    EmbeddingConfig { id: String, label: String },
+    Workspace { id: String, label: String },
+    Book { id: String, label: String },
+    Skill { id: String, label: String },
+    UiPackage { id: String, label: String },
 }
 
 const WORKSPACE_STORAGE_KEY: &str = "gobrowse.selected-workspace";
@@ -2791,6 +2796,47 @@ fn WorkspacesPage() -> impl IntoView {
         });
     };
     let close_edit = move |_| editing.set(None);
+    let delete_target = RwSignal::new(None::<DeleteTarget>);
+    let do_delete_workspace = {
+        let workspaces = workspaces;
+        let status = status;
+        std::sync::Arc::new(move |id: String| {
+            spawn_local(async move {
+                let resp = Request::delete(&format!("/api/v1/workspaces/{id}"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status() == 204 => {
+                        status.set("Workspace deleted.".into());
+                        if let Ok(list_resp) = Request::get("/api/v1/workspaces").send().await
+                            && let Ok(list) = list_resp.json::<Vec<WorkspaceSummary>>().await
+                        {
+                            workspaces.set(list);
+                        }
+                    }
+                    Ok(r) if r.status() == 409 => {
+                        let msg = api_error(&r).await;
+                        status.set(format!("Cannot delete workspace: {msg}"));
+                    }
+                    Ok(r) if r.status() == 403 => {
+                        status.set("Owner/admin role required to delete workspaces.".into());
+                    }
+                    Ok(r) => {
+                        let msg = api_error(&r).await;
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                            || msg.to_lowercase().contains("owner")
+                        {
+                            status.set("Owner/admin role required to delete workspaces.".into());
+                        } else {
+                            status.set(format!("Delete failed: {msg}"));
+                        }
+                    }
+                    Err(_) => status.set("Workspace service did not answer.".into()),
+                }
+            });
+        })
+    };
 
     view! {
         <div class="page-heading">
@@ -2809,14 +2855,20 @@ fn WorkspacesPage() -> impl IntoView {
             <div class="index-row header" role="row"><span>"ID"</span><span>"TITLE"</span><span>"DESCRIPTION"</span><span>"NETWORK POLICY"</span><span></span></div>
             {move || workspaces.get().into_iter().map(|ws| {
                 let ws_clone = ws.clone();
+                let ws_label = ws.title.clone();
+                let ws_id = ws.id.clone();
                 let short_id = ws.id.chars().take(8).collect::<String>();
                 view! { <div class="index-row" role="row">
                     <span class="spine-cell">{short_id}</span>
                     <strong>{ws.title.clone()}</strong>
                     <span>{ws.description.clone()}</span>
                     <span>{ws.network_policy.to_uppercase()}</span>
-                    <button type="button" class="icon-button" aria-label="Edit workspace"
-                        on:click=move |_| open_edit(ws_clone.clone())>"✎"</button>
+                    <div style="display:flex;gap:6px;justify-content:flex-end">
+                        <button type="button" class="icon-button" aria-label="Edit workspace"
+                            on:click=move |_| open_edit(ws_clone.clone())>"✎"</button>
+                        <button type="button" class="icon-button danger" title="Delete workspace" aria-label=format!("Delete workspace {}", ws_label.clone())
+                            on:click=move |_| delete_target.set(Some(DeleteTarget::Workspace { id: ws_id.clone(), label: ws_label.clone() }))>"🗑"</button>
+                    </div>
                 </div> }
             }).collect_view()}
         </div>
@@ -2854,6 +2906,33 @@ fn WorkspacesPage() -> impl IntoView {
                 </div>
             }
         })}
+        {move || {
+            let dp = std::sync::Arc::clone(&do_delete_workspace);
+            delete_target.get().clone().map(|target| {
+                let (title, body) = match target.clone() {
+                    DeleteTarget::Workspace { id, label } => (format!("Delete workspace {label}?"), format!("This will permanently delete the workspace. If it has worktrees or conversations it will be refused (409). Id: {}", &id[..8.min(id.len())])),
+                    _ => (String::new(), String::new()),
+                };
+                let confirm_target = target.clone();
+                let dp_inner = std::sync::Arc::clone(&dp);
+                view! {
+                    <div class="modal-backdrop" role="dialog" aria-modal="true">
+                        <div class="modal delete-confirm">
+                            <div class="modal-head"><h3>{title.clone()}</h3><button class="text-button" on:click=move |_| delete_target.set(None)>"✕"</button></div>
+                            <p class="form-note">{body.clone()}</p>
+                            <p class="error-note" style="font-size:13px">"This cannot be undone."</p>
+                            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+                                <button class="secondary" on:click=move |_| delete_target.set(None)>"Cancel"</button>
+                                <button class="primary danger" on:click=move |_| {
+                                    if let DeleteTarget::Workspace { id, .. } = confirm_target.clone() { dp_inner(id); }
+                                    delete_target.set(None);
+                                }>"Delete"</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            })
+        }}
     }
 }
 
@@ -3356,6 +3435,82 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
     let close_mcp_edit = move |_| {
         mcp_edit_id.set(None);
         mcp_edit_status.set(String::new());
+    };
+    let delete_target_lib = RwSignal::new(None::<DeleteTarget>);
+    let do_delete_book = {
+        let all_books = all_books;
+        let status = status;
+        let loaded = loaded;
+        std::sync::Arc::new(move |id: String| {
+            spawn_local(async move {
+                let resp = Request::delete(&format!("/api/v1/library/books/{id}"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status() == 204 => {
+                        status.set("Book deleted.".into());
+                        load_library_list(all_books, status, None);
+                        loaded.set(None);
+                    }
+                    Ok(r) if r.status() == 409 => {
+                        let msg = api_error(&r).await;
+                        status.set(format!("Cannot delete book: {msg}"));
+                    }
+                    Ok(r) if r.status() == 403 => {
+                        status.set("Owner/admin role required to delete books.".into());
+                    }
+                    Ok(r) => {
+                        let msg = api_error(&r).await;
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                            || msg.to_lowercase().contains("owner")
+                        {
+                            status.set("Owner/admin role required to delete books.".into());
+                        } else {
+                            status.set(format!("Delete failed: {msg}"));
+                        }
+                    }
+                    Err(_) => status.set("Library service did not answer.".into()),
+                }
+            });
+        })
+    };
+    let do_delete_skill = {
+        let all_books = all_books;
+        let status = status;
+        let loaded = loaded;
+        std::sync::Arc::new(move |id: String| {
+            spawn_local(async move {
+                let resp = Request::delete(&format!("/api/v1/skills/{id}"))
+                    .send()
+                    .await;
+                match resp {
+                    Ok(r) if r.status() == 204 => {
+                        status.set("Skill deleted.".into());
+                        load_library_list(all_books, status, None);
+                        loaded.set(None);
+                    }
+                    Ok(r) if r.status() == 409 => {
+                        let msg = api_error(&r).await;
+                        status.set(format!("Cannot delete skill: {msg}"));
+                    }
+                    Ok(r) if r.status() == 403 => {
+                        status.set("Owner/admin role required to delete skills.".into());
+                    }
+                    Ok(r) => {
+                        let msg = api_error(&r).await;
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                        {
+                            status.set("Owner/admin role required to delete skills.".into());
+                        } else {
+                            status.set(format!("Delete failed: {msg}"));
+                        }
+                    }
+                    Err(_) => status.set("Skills service did not answer.".into()),
+                }
+            });
+        })
     };
 
     // ---- plugin install stepper ----
@@ -3916,6 +4071,19 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                                                 });
                                             }
                                         }>"Edit"</button>
+                                        <button class="icon-button danger" type="button" title="Delete book" aria-label=format!("Delete book {}", book.title.clone())
+                                            on:click={
+                                                let id = book.id.clone();
+                                                let title = book.title.clone();
+                                                let kind = book.kind.clone();
+                                                move |_| {
+                                                    if kind.as_deref() == Some("SKILL") {
+                                                        delete_target_lib.set(Some(DeleteTarget::Skill { id: id.clone(), label: title.clone() }));
+                                                    } else {
+                                                        delete_target_lib.set(Some(DeleteTarget::Book { id: id.clone(), label: title.clone() }));
+                                                    }
+                                                }
+                                            }>"🗑"</button>
                                     </div>
                                 </article>
                             })
@@ -3959,6 +4127,19 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                                                 });
                                             }
                                         }>"Edit"</button>
+                                        <button class="icon-button danger" type="button" title="Delete book" aria-label=format!("Delete book {}", book.title.clone())
+                                            on:click={
+                                                let id = book.id.clone();
+                                                let title = book.title.clone();
+                                                let kind = book.kind.clone();
+                                                move |_| {
+                                                    if kind.as_deref() == Some("SKILL") {
+                                                        delete_target_lib.set(Some(DeleteTarget::Skill { id: id.clone(), label: title.clone() }));
+                                                    } else {
+                                                        delete_target_lib.set(Some(DeleteTarget::Book { id: id.clone(), label: title.clone() }));
+                                                    }
+                                                }
+                                            }>"🗑"</button>
                                     </div>
                                 </article>
                             })
@@ -3988,8 +4169,18 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                                             <button class="secondary" type="button" on:click=move |_| open_mcp_edit(b.clone())>"Edit MCP"</button>
                                             <button class="secondary danger" type="button" on:click=move |_| delete_mcp(sid.clone())>"Delete MCP"</button>
                                         }.into_any()
+                                    } else if book.kind.as_deref() == Some("SKILL") {
+                                        let sid = book.skill_id.clone().unwrap_or_else(|| book.book_id.clone());
+                                        let stitle = book.title.clone();
+                                        view! {
+                                            <button class="secondary danger" type="button" title="Delete skill" on:click=move |_| delete_target_lib.set(Some(DeleteTarget::Skill { id: sid.clone(), label: stitle.clone() }))>"Delete skill"</button>
+                                        }.into_any()
                                     } else {
-                                        view! { <span></span> }.into_any()
+                                        let bid = book.book_id.clone();
+                                        let btitle = book.title.clone();
+                                        view! {
+                                            <button class="secondary danger" type="button" title="Delete book" on:click=move |_| delete_target_lib.set(Some(DeleteTarget::Book { id: bid.clone(), label: btitle.clone() }))>"Delete book"</button>
+                                        }.into_any()
                                     }}
                                     <button class="text-button" on:click=close>"Close"</button>
                                 </div>
@@ -4039,6 +4230,40 @@ fn LibraryPage(initial_kind: Option<&'static str>, page: RwSignal<Page>) -> impl
                 </div>
             }.into_any()
         })}
+        {move || {
+            let db = std::sync::Arc::clone(&do_delete_book);
+            let ds = std::sync::Arc::clone(&do_delete_skill);
+            delete_target_lib.get().clone().map(|target| {
+                let (title, body, is_skill) = match target.clone() {
+                    DeleteTarget::Book { id, label } => (format!("Delete \"{label}\"?"), format!("This will permanently delete the book. Managed books (SKILL/PLUGIN/MCP) may be refused (409). Id: {}", &id[..8.min(id.len())]), false),
+                    DeleteTarget::Skill { id, label } => (format!("Delete skill \"{label}\"?"), format!("This will soft-delete the skill and its book. Id: {}", &id[..8.min(id.len())]), true),
+                    _ => (String::new(), String::new(), false),
+                };
+                let confirm_target = target.clone();
+                let db_inner = std::sync::Arc::clone(&db);
+                let ds_inner = std::sync::Arc::clone(&ds);
+                view! {
+                    <div class="modal-backdrop" role="dialog" aria-modal="true">
+                        <div class="modal delete-confirm">
+                            <div class="modal-head"><h3>{title.clone()}</h3><button class="text-button" on:click=move |_| delete_target_lib.set(None)>"✕"</button></div>
+                            <p class="form-note">{body.clone()}</p>
+                            <p class="error-note" style="font-size:13px">{if is_skill { "Skill revisions will be archived; the book will be removed." } else { "This cannot be undone." }}</p>
+                            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+                                <button class="secondary" on:click=move |_| delete_target_lib.set(None)>"Cancel"</button>
+                                <button class="primary danger" on:click=move |_| {
+                                    match confirm_target.clone() {
+                                        DeleteTarget::Book { id, .. } => db_inner(id),
+                                        DeleteTarget::Skill { id, .. } => ds_inner(id),
+                                        _ => {}
+                                    }
+                                    delete_target_lib.set(None);
+                                }>"Delete"</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            })
+        }}
         {move || stepper.get().map(|state| {
             let state = state.clone();
             let close = close_stepper;
@@ -5924,10 +6149,23 @@ fn ModelsPage() -> impl IntoView {
                         chat_status.set(format!("Cannot delete provider: {msg}"));
                         status.set(format!("Cannot delete provider: {msg}"));
                     }
+                    Ok(resp) if resp.status() == 403 => {
+                        chat_status.set("Owner/admin role required to delete providers.".into());
+                        status.set("Owner/admin role required to delete providers.".into());
+                    }
                     Ok(resp) => {
                         let msg = api_error(&resp).await;
-                        chat_status.set(format!("Delete failed: {msg}"));
-                        status.set(format!("Delete failed: {msg}"));
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                            || msg.to_lowercase().contains("owner")
+                        {
+                            chat_status
+                                .set("Owner/admin role required to delete providers.".into());
+                            status.set("Owner/admin role required to delete providers.".into());
+                        } else {
+                            chat_status.set(format!("Delete failed: {msg}"));
+                            status.set(format!("Delete failed: {msg}"));
+                        }
                     }
                     Err(_) => {
                         chat_status.set("Provider service did not answer.".into());
@@ -5956,38 +6194,62 @@ fn ModelsPage() -> impl IntoView {
                         let msg = api_error(&resp).await;
                         chat_status.set(format!("Cannot delete model: {msg}"));
                     }
+                    Ok(resp) if resp.status() == 403 => {
+                        chat_status.set("Owner/admin role required to delete models.".into());
+                    }
                     Ok(resp) => {
                         let msg = api_error(&resp).await;
-                        chat_status.set(format!("Delete failed: {msg}"));
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                            || msg.to_lowercase().contains("owner")
+                        {
+                            chat_status.set("Owner/admin role required to delete models.".into());
+                        } else {
+                            chat_status.set(format!("Delete failed: {msg}"));
+                        }
                     }
                     Err(_) => chat_status.set("Model service did not answer.".into()),
                 }
             });
         })
     };
-    #[allow(unused)]
-    let delete_embedding_provider = {
+    let delete_embedding_config = {
         let status = status;
         let configurations = configurations;
         std::sync::Arc::new(move |id: String| {
             spawn_local(async move {
-                let response = Request::delete(&format!("/api/v1/providers/{id}"))
+                let response = Request::delete(&format!("/api/v1/embeddings/configurations/{id}"))
                     .send()
                     .await;
                 match response {
                     Ok(resp) if resp.status() == 204 => {
-                        status.set("Provider deleted.".into());
+                        status.set("Embedding configuration deleted.".into());
                         load_configurations(configurations, status);
                     }
                     Ok(resp) if resp.status() == 409 => {
                         let msg = api_error(&resp).await;
-                        status.set(format!("Cannot delete provider: {msg}"));
+                        status.set(format!("Cannot delete embedding configuration: {msg}"));
+                    }
+                    Ok(resp) if resp.status() == 403 => {
+                        status.set(
+                            "Owner/admin role required to delete embedding configurations.".into(),
+                        );
                     }
                     Ok(resp) => {
                         let msg = api_error(&resp).await;
-                        status.set(format!("Delete failed: {msg}"));
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                            || msg.to_lowercase().contains("owner")
+                        {
+                            status.set(
+                                "Owner/admin role required to delete embedding configurations."
+                                    .into(),
+                            );
+                        } else {
+                            status.set(format!("Delete failed: {msg}"));
+                        }
                     }
-                    Err(_) => status.set("Provider service did not answer.".into()),
+                    Err(_) => status.set("Embedding service did not answer.".into()),
                 }
             });
         })
@@ -6284,26 +6546,32 @@ fn ModelsPage() -> impl IntoView {
             {move || {
                 let dp = std::sync::Arc::clone(&delete_provider);
                 let dm = std::sync::Arc::clone(&delete_model);
+                let de = std::sync::Arc::clone(&delete_embedding_config);
                 delete_target.get().clone().map(|target| {
                 let (title, body, is_provider) = match target.clone() {
                     DeleteTarget::Provider { id, label } => (format!("Delete provider {label}?"), format!("This will permanently delete the provider and ALL its models. This cannot be undone. Provider id: {}", &id[..8.min(id.len())]), true),
                     DeleteTarget::Model { id, label } => (format!("Delete model {label}?"), format!("This will permanently delete the model. If it is the active route, the delete will be refused (409). Id: {}", &id[..8.min(id.len())]), false),
+                    DeleteTarget::EmbeddingConfig { id, label } => (format!("Delete embedding config {label}?"), format!("This will permanently delete the embedding configuration. Active configs or those with jobs will be refused (409). Id: {}", &id[..8.min(id.len())]), false),
+                    _ => (String::new(), String::new(), false),
                 };
                 let confirm_target = target.clone();
                 let dp_inner = std::sync::Arc::clone(&dp);
                 let dm_inner = std::sync::Arc::clone(&dm);
+                let de_inner = std::sync::Arc::clone(&de);
                 view! {
                     <div class="modal-backdrop" role="dialog" aria-modal="true">
                         <div class="modal delete-confirm">
                             <div class="modal-head"><h3>{title.clone()}</h3><button class="text-button" on:click=move |_| delete_target.set(None)>"✕"</button></div>
                             <p class="form-note">{body.clone()}</p>
-                            <p class="error-note" style="font-size:13px">{if is_provider { "All models under this provider will be removed." } else { "The model record will be removed." }}</p>
+                            <p class="error-note" style="font-size:13px">{if is_provider { "All models under this provider will be removed." } else { "The record will be removed." }}</p>
                             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
                                 <button class="secondary" on:click=move |_| delete_target.set(None)>"Cancel"</button>
                                 <button class="primary danger" on:click=move |_| {
                                     match confirm_target.clone() {
                                         DeleteTarget::Provider { id, .. } => dp_inner(id),
                                         DeleteTarget::Model { id, .. } => dm_inner(id),
+                                        DeleteTarget::EmbeddingConfig { id, .. } => de_inner(id),
+                                        _ => {}
                                     }
                                     delete_target.set(None);
                                 }>"Delete"</button>
@@ -6325,14 +6593,15 @@ fn ModelsPage() -> impl IntoView {
         <div class="index-table">
             <div class="index-row header"><span>"STATE"</span><span>"MODEL"</span><span>"PROVIDER"</span><span>"ACTIONS"</span></div>
             {move || configurations.get().into_iter().map(|configuration| {
-                let provider_id = configuration.provider_id.clone();
+                let cfg_id = configuration.id.clone();
+                let cfg_label = format!("{} / {}", configuration.display_name, configuration.model_reference);
                 view! {
                     <div class="index-row">
                         <span class="spine-cell">{if configuration.active { "ACTIVE" } else { "READY" }}</span>
                         <strong>{format!("{} / {}", configuration.display_name, configuration.model_reference)}</strong>
                         <span>{format!("{} · {}", configuration.provider_type, &configuration.id[..8.min(configuration.id.len())])}</span>
                         <div style="display:flex;gap:6px">
-                            <button class="icon-button danger" type="button" title="Delete provider" aria-label=format!("Delete provider {}", configuration.provider_type) on:click=move |_| delete_target.set(Some(DeleteTarget::Provider { id: provider_id.clone(), label: configuration.provider_type.clone() }))>"⌫"</button>
+                            <button class="icon-button danger" type="button" title="Delete embedding configuration" aria-label=format!("Delete embedding configuration {}", cfg_label.clone()) on:click=move |_| delete_target.set(Some(DeleteTarget::EmbeddingConfig { id: cfg_id.clone(), label: cfg_label.clone() }))>"🗑"</button>
                         </div>
                     </div>
                 }
@@ -6657,6 +6926,7 @@ fn UiPackagesPage() -> impl IntoView {
     let installing = RwSignal::new(false);
     let expanded = RwSignal::new(Option::<String>::None);
     let confirm_activate = RwSignal::new(Option::<String>::None);
+    let delete_target_ui = RwSignal::new(None::<DeleteTarget>);
 
     let load = {
         let lifecycle = Arc::clone(&lifecycle);
@@ -7011,11 +7281,36 @@ fn UiPackagesPage() -> impl IntoView {
                             _ => {}
                         }
                     }
+                    Ok(r) if r.status() == 409 => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        let msg = api_error(&r).await;
+                        error.set(Some(format!("Cannot delete package: {msg}")));
+                    }
+                    Ok(r) if r.status() == 403 => {
+                        if !lifecycle_is_active(&lifecycle) {
+                            return;
+                        }
+                        error.set(Some(
+                            "Owner/admin role required to delete UI packages.".into(),
+                        ));
+                    }
                     Ok(r) => {
                         if !lifecycle_is_active(&lifecycle) {
                             return;
                         }
-                        error.set(Some(format!("Delete rejected: {}", api_error(&r).await)));
+                        let msg = api_error(&r).await;
+                        if msg.to_lowercase().contains("forbidden")
+                            || msg.to_lowercase().contains("admin")
+                            || msg.to_lowercase().contains("owner")
+                        {
+                            error.set(Some(
+                                "Owner/admin role required to delete UI packages.".into(),
+                            ));
+                        } else {
+                            error.set(Some(format!("Delete rejected: {msg}")));
+                        }
                     }
                     Err(_) => {
                         if !lifecycle_is_active(&lifecycle) {
@@ -7137,7 +7432,6 @@ fn UiPackagesPage() -> impl IntoView {
                     <div class="ui-package-grid">
                         {packages.get().into_iter().map(|pkg| {
                             let open_detail = open_detail.clone();
-                            let delete_pkg = delete_pkg.clone();
                             let pid = pkg.id.clone();
                             let pid2 = pkg.id.clone();
                             let pid3 = pkg.id.clone();
@@ -7177,7 +7471,7 @@ fn UiPackagesPage() -> impl IntoView {
                                                 }
                                             }
                                         }>{if is_active { "Active" } else { "Activate" }}</button>
-                                        <button class="secondary danger" disabled=is_active on:click=move |_| delete_pkg(pid3.clone())>"Delete"</button>
+                                        <button class="secondary danger" disabled=is_active title="Delete package" aria-label=format!("Delete package {}", pkg.name.clone()) on:click=move |_| delete_target_ui.set(Some(DeleteTarget::UiPackage { id: pid3.clone(), label: pkg.name.clone() }))>"Delete"</button>
                                     </div>
                                     {confirm_id.then(|| view! {
                                         <div class="ui-confirm">
@@ -7217,6 +7511,33 @@ fn UiPackagesPage() -> impl IntoView {
                 }.into_any()
             }}
         </section>
+        {move || {
+            let dp = std::sync::Arc::clone(&delete_pkg);
+            delete_target_ui.get().clone().map(|target| {
+                let (title, body) = match target.clone() {
+                    DeleteTarget::UiPackage { id, label } => (format!("Delete \"{label}\"?"), format!("This will permanently delete UI package {label}. Active/last packages will be refused (409). Id: {}", &id[..8.min(id.len())])),
+                    _ => (String::new(), String::new()),
+                };
+                let confirm_target = target.clone();
+                let dp_inner = std::sync::Arc::clone(&dp);
+                view! {
+                    <div class="modal-backdrop" role="dialog" aria-modal="true">
+                        <div class="modal delete-confirm">
+                            <div class="modal-head"><h3>{title.clone()}</h3><button class="text-button" on:click=move |_| delete_target_ui.set(None)>"✕"</button></div>
+                            <p class="form-note">{body.clone()}</p>
+                            <p class="error-note" style="font-size:13px">"This cannot be undone."</p>
+                            <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:12px">
+                                <button class="secondary" on:click=move |_| delete_target_ui.set(None)>"Cancel"</button>
+                                <button class="primary danger" on:click=move |_| {
+                                    if let DeleteTarget::UiPackage { id, .. } = confirm_target.clone() { dp_inner(id); }
+                                    delete_target_ui.set(None);
+                                }>"Delete"</button>
+                            </div>
+                        </div>
+                    </div>
+                }
+            })
+        }}
         {move || detail.get().clone().map(|d| view! {
             <section class="model-section">
                 <div class="section-heading"><div><p class="utility">"DETAIL"</p><h2>{d.name.clone()}</h2></div><button class="text-button" on:click=move |_| detail.set(None)>"Close"</button></div>
