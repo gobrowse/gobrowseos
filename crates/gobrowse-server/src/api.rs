@@ -289,7 +289,7 @@ pub async fn list_workspaces(
 ) -> Result<Json<Vec<WorkspaceResponse>>, AppError> {
     let user = require_user(&state, &headers).await?;
     let rows = sqlx::query(
-        "SELECT id, title, description, network_policy, created_at, updated_at \
+        "SELECT id, title, description, network_policy, model_preference, created_at, updated_at \
          FROM workspaces workspace WHERE profile_id=$1 AND ($3 IN ('OWNER','ADMIN') OR EXISTS( \
          SELECT 1 FROM workspace_memberships member WHERE member.workspace_id=workspace.id AND member.user_id=$2)) \
          ORDER BY updated_at DESC LIMIT 200",
