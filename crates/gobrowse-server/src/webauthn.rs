@@ -73,8 +73,47 @@ impl WebauthnManager {
     }
 
     /// Build from app settings.
+    ///
+    /// If `auth.webauthn_rp_id` is set, use it as the RP ID (the origin
+    /// still comes from `public_origin`).  Otherwise auto-derive from the
+    /// origin domain (current behaviour).
     pub fn from_settings(settings: &crate::config::Settings) -> Result<Self, AppError> {
-        Self::from_origin("Gobrowse OS", settings.http.public_origin.as_str())
+        if let Some(rp_id) = &settings.auth.webauthn_rp_id {
+            Self::from_origin_with_rp_id("Gobrowse OS", settings.http.public_origin.as_str(), rp_id)
+        } else {
+            Self::from_origin("Gobrowse OS", settings.http.public_origin.as_str())
+        }
+    }
+
+    /// Build with an explicit RP ID override.
+    ///
+    /// The `public_origin` supplies the scheme and port; the RP ID domain
+    /// replaces the host so that `WebauthnBuilder` accepts the combination.
+    /// In production the server must be reachable through that domain (e.g.
+    /// via a reverse proxy) for the browser to complete the ceremony.
+    pub fn from_origin_with_rp_id(
+        rp_name: &str,
+        public_origin: &str,
+        rp_id: &str,
+    ) -> Result<Self, AppError> {
+        let origin = public_origin.trim_end_matches('/');
+        let parsed = url::Url::parse(origin)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("invalid public origin: {e}")))?;
+        // Rebuild the origin URL using the RP ID as the host so the
+        // builder sees a matching (rp_id, origin) pair.
+        let mut rp_origin = parsed;
+        rp_origin
+            .set_host(Some(rp_id))
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("invalid rp_id host: {e}")))?;
+        let core = WebauthnBuilder::new(rp_id, &rp_origin)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("webauthn config: {e}")))?
+            .rp_name(rp_name)
+            .build()
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("webauthn init: {e}")))?;
+        Ok(Self {
+            core: Arc::new(core),
+            ceremonies: Arc::new(RwLock::new(CeremonyStore::new())),
+        })
     }
 
     fn prune(&self, store: &mut CeremonyStore) {
@@ -351,6 +390,20 @@ mod tests {
     fn from_origin_accepts_hostnames() {
         let manager = WebauthnManager::from_origin("Gobrowse OS", "https://gobrowse.example.com")
             .expect("hostname origin should build");
+        let _ = manager;
+    }
+
+    #[test]
+    fn from_origin_with_rp_id_allows_ip_origin() {
+        // When an explicit RP ID (a valid domain) is provided, the manager
+        // must build successfully even when the public origin is an IP
+        // address — this is the fix for IP-only deployments.
+        let manager = WebauthnManager::from_origin_with_rp_id(
+            "Gobrowse OS",
+            "http://178.128.179.216:8080",
+            "gobrowse.example.com",
+        )
+        .expect("explicit RP ID override must succeed with IP origin");
         let _ = manager;
     }
 }

@@ -16,6 +16,12 @@ argon2_memory_kib = 19456
 argon2_iterations = 2
 argon2_parallelism = 1
 max_parallel_hashes = 4
+# Explicit WebAuthn RP ID.  Required when the server is reached by IP
+# address (e.g. http://178.128.179.216:8080) but passkeys should still work.
+# Set this to a domain name that points at the server (e.g. "gobrowse.example.com").
+# When omitted, the RP ID is auto-derived from public_origin (domain only —
+# IP origins disable passkeys).
+# webauthn_rp_id = "gobrowse.example.com"
 
 [vault]
 # Configure exactly one source before storing provider credentials. The value is

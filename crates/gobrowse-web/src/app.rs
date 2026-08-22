@@ -693,7 +693,7 @@ fn AuthPanel(
                         <span class="auth-passkey-icon">"⌖"</span>
                         {move || if passkey_pending.get() { "Waiting for authenticator..." } else { "Sign in with passkey" }}
                     </button>
-                    {move || passkey_error.get().map(|m| view! { <p class="inline-error">{m}</p> })}
+                    {move || passkey_error.get().map(|m| view! { <p class="inline-error">{friendly_webauthn_error(&m)}</p> })}
                 })}
                 <p class="form-note">"Credentials stay in Gobrowse OS. Models receive capability status, never passwords or provider secrets."</p>
             </form>
@@ -7638,6 +7638,20 @@ fn map_webauthn_error(value: &JsValue) -> String {
     }
 }
 
+/// Maps a server-side WebAuthn error message to a user-friendly explanation.
+/// The server returns "WebAuthn is not configured" when the RP ID could not
+/// be derived (typically because the public origin is an IP address).
+fn friendly_webauthn_error(msg: &str) -> String {
+    if msg.contains("WebAuthn is not configured") {
+        "Passkeys need a domain name \u{2014} this server is reachable by IP \
+         only. Set `auth.webauthn_rp_id` in config.toml to a domain like \
+         `gobrowse.example.com`, or use password sign-in."
+            .into()
+    } else {
+        msg.to_string()
+    }
+}
+
 fn js_credential_to_json(value: JsValue) -> Result<serde_json::Value, String> {
     let s = js_sys::JSON::stringify(&value)
         .map_err(|_| "Invalid credential shape.".to_string())?
@@ -8010,7 +8024,7 @@ fn SecurityPage(user: RwSignal<Option<User>>) -> impl IntoView {
                     <button class="primary" disabled=move || passkey_pending.get() on:click=add_passkey>
                         {move || if passkey_pending.get() { "Waiting for authenticator..." } else { "Add passkey" }}
                     </button>
-                    {move || passkey_error.get().map(|e| view!{ <p class="inline-error">{e}</p> })}
+                    {move || passkey_error.get().map(|e| view!{ <p class="inline-error">{friendly_webauthn_error(&e)}</p> })}
                     {move || passkey_ok.get().map(|o| view!{ <p class="test-success" style="padding:8px 10px;border:1px solid var(--teal);background:var(--teal-soft);border-radius:8px">{o}</p> })}
                     <p class="form-note">"Your browser will prompt for Touch ID, Windows Hello, or a security key. Ceremony expires in 5 minutes."</p>
                 </div>

@@ -102,6 +102,13 @@ pub struct AuthSettings {
     pub login_throttle_max_attempts: u32,
     #[serde(default = "default_login_throttle_window_secs")]
     pub login_throttle_window_secs: i64,
+    /// Explicit WebAuthn RP ID override (e.g. `gobrowse.example.com`).
+    /// When set, passkeys are enabled even if the server is reached by IP.
+    /// When unset and the public origin host is a domain, the RP ID is
+    /// auto-derived from the origin.  When unset and the host is an IP,
+    /// WebAuthn stays disabled (password auth remains).
+    #[serde(default)]
+    pub webauthn_rp_id: Option<String>,
     #[serde(default)]
     #[cfg(feature = "oidc")]
     pub oidc_providers: Vec<OidcProviderConfig>,
@@ -125,6 +132,7 @@ impl Default for AuthSettings {
             max_parallel_hashes: 4,
             login_throttle_max_attempts: default_login_throttle_max_attempts(),
             login_throttle_window_secs: default_login_throttle_window_secs(),
+            webauthn_rp_id: None,
             #[cfg(feature = "oidc")]
             oidc_providers: Vec::new(),
         }
